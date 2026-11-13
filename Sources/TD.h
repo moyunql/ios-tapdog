@@ -140,6 +140,17 @@ CGPoint TDPasteMenuOffset(void);
 void TDPasteSetHoldMs(double holdMs);
 double TDPasteHoldMs(void);
 
+/// 锚点＝长按哪儿才算按住输入框。
+///   0 = 上次注入落点（脚本里点评论框那一下）
+///   1 = 屏幕底部输入框（默认）：x 居中，y = 屏高 + 偏移 y（默认 -280）
+/// 为什么默认不用「上次落点」：点的是底部那条「写下你的评论」，键盘一弹
+/// 输入框就被顶到上面去了，那个点已经落在键盘上。
+NSInteger TDPasteAnchorKind(void);
+void TDPasteSetAnchorKind(NSInteger k);
+NSString *TDPasteAnchorDesc(void);
+CGPoint TDPasteAnchorOffset(void);
+void TDPasteSetAnchorOffset(CGFloat ax, CGFloat ay);
+
 /// 上一次注入点下去的位置 —— 粘贴拿它当「输入框在哪儿」的锚点
 CGPoint TDLastTapPoint(void);
 BOOL TDLastTapPointReady(void);

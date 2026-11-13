@@ -96,6 +96,9 @@ static NSString * const kPasteMethodKey = @"tdPasteMethod";
 static NSString * const kPasteMenuDXKey = @"tdPasteMenuDX";
 static NSString * const kPasteMenuDYKey = @"tdPasteMenuDY";
 static NSString * const kPasteHoldKey   = @"tdPasteHoldMs";
+static NSString * const kPasteAnchorKey = @"tdPasteAnchorKind";
+static NSString * const kPasteAnchorAX  = @"tdPasteAnchorAX";
+static NSString * const kPasteAnchorAY  = @"tdPasteAnchorAY";
 static NSString * const kPasteTplName   = @"tpl_paste.png";
 
 NSInteger TDPasteMethod(void) {
@@ -142,6 +145,58 @@ void TDPasteSetHoldMs(double holdMs) {
     [[NSUserDefaults standardUserDefaults] setDouble:MAX(400.0, holdMs) forKey:kPasteHoldKey];
 }
 
+// ---------------------------------------------------------------------------
+// 锚点：到底「长按哪儿」才算按住输入框
+//
+// 一开始想用「脚本里点评论框那一下」当锚点，实际跑不通：点的是底部那条
+// 「写下你的评论」，键盘一弹，输入框整个被顶到上面去了，原来那个点已经变成
+// 键盘区域。所以默认改成「屏幕底部往上固定距离」这个估算值，并且可调。
+//
+//   0 = 上次注入落点（脚本里点的那一下）
+//   1 = 屏幕底部输入框（默认）：x 居中，y = 屏幕高 + ay，ay 默认 -280
+// ---------------------------------------------------------------------------
+
+static BOOL TDPastePointValid(CGPoint p) {
+    CGSize sb = [UIScreen mainScreen].bounds.size;
+    return p.x > 1 && p.y > 1 && p.x < sb.width - 1 && p.y < sb.height - 1;
+}
+
+NSInteger TDPasteAnchorKind(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if ([d objectForKey:kPasteAnchorKey] == nil) return 1;
+    return [d integerForKey:kPasteAnchorKey] == 0 ? 0 : 1;
+}
+
+void TDPasteSetAnchorKind(NSInteger k) {
+    [[NSUserDefaults standardUserDefaults] setInteger:(k == 0 ? 0 : 1) forKey:kPasteAnchorKey];
+}
+
+NSString *TDPasteAnchorDesc(void) {
+    return TDPasteAnchorKind() == 0 ? @"上次落点" : @"底部输入框";
+}
+
+CGPoint TDPasteAnchorOffset(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if ([d objectForKey:kPasteAnchorAY] == nil) return CGPointMake(0, -280);
+    return CGPointMake((CGFloat)[d doubleForKey:kPasteAnchorAX],
+                       (CGFloat)[d doubleForKey:kPasteAnchorAY]);
+}
+
+void TDPasteSetAnchorOffset(CGFloat ax, CGFloat ay) {
+    // 夹一下：太靠下会落进键盘里，太靠上就不是输入框了
+    if (ay > -20) ay = -20;
+    if (ay < -700) ay = -700;
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setDouble:ax forKey:kPasteAnchorAX];
+    [d setDouble:ay forKey:kPasteAnchorAY];
+}
+
+static CGPoint TDPasteBottomAnchor(void) {
+    CGSize sb = [UIScreen mainScreen].bounds.size;
+    CGPoint off = TDPasteAnchorOffset();
+    return CGPointMake(sb.width / 2.0 + off.x, sb.height + off.y);
+}
+
 static void TDPasteWriteClipboard(NSString *text) {
     void (^put)(void) = ^{
         [UIPasteboard generalPasteboard].string = text;
@@ -150,18 +205,24 @@ static void TDPasteWriteClipboard(NSString *text) {
     else dispatch_sync(dispatch_get_main_queue(), put);
 }
 
-/// 在 anchor（输入框里的大致位置）粘贴一条文本。
+/// 在 anchor 处粘贴一条文本。anchor 只是「上次落点」的候选，
+/// 真正用哪个由「锚点」设置决定（见上面那段注释）。
 void TDPasteTextAt(NSString *text, CGPoint anchor) {
     if (text.length == 0) return;
 
     TDPasteWriteClipboard(text);
 
     NSInteger method = TDPasteMethod();
-    CGSize sb = [UIScreen mainScreen].bounds.size;
-    BOOL ok = anchor.x > 1 && anchor.y > 1 && anchor.x < sb.width - 1 && anchor.y < sb.height - 1;
-    if (method != 0 && !ok) {
-        TDLog(@"粘贴：没记住输入框落点（先把评论框点开）→ 退回 Cmd+V");
-        method = 0;
+    CGPoint a = anchor;
+
+    if (method != 0) {
+        if (TDPasteAnchorKind() == 1 || !TDPastePointValid(a)) {
+            a = TDPasteBottomAnchor();
+        }
+        if (!TDPastePointValid(a)) {
+            TDLog(@"粘贴：锚点不对（%.0f,%.0f）→ 退回 Cmd+V", a.x, a.y);
+            method = 0;
+        }
     }
 
     usleep(150 * 1000);     // 等剪贴板同步出去，太急会贴到旧内容
@@ -173,9 +234,10 @@ void TDPasteTextAt(NSString *text, CGPoint anchor) {
 
     // 长按和点菜单都会改「上次落点」，跑完要还回去 ——
     // 否则一条脚本里连着两次粘贴，第二次会按上次菜单的位置去长按。
-    CGPoint keep = anchor;
+    BOOL hadKeep = TDLastTapPointReady();
+    CGPoint keep = TDLastTapPoint();
 
-    TDlongPress(anchor.x, anchor.y, MAX(0.5, TDPasteHoldMs() / 1000.0));
+    TDlongPress(a.x, a.y, MAX(0.5, TDPasteHoldMs() / 1000.0));
     usleep(700 * 1000);     // 等编辑菜单浮出来
 
     if (method == 2) {
@@ -188,7 +250,7 @@ void TDPasteTextAt(NSString *text, CGPoint anchor) {
                 TDtap(m.point.x, m.point.y);
                 TDLog(@"粘贴：识图点到「粘贴」（%.2f）", m.score);
                 usleep(150 * 1000);
-                TDSetLastTapPoint(keep);
+                if (hadKeep) TDSetLastTapPoint(keep);
                 return;
             }
             TDLog(@"粘贴：菜单里没认出「粘贴」→ 按偏移点（菜单偏移可调）");
@@ -198,11 +260,11 @@ void TDPasteTextAt(NSString *text, CGPoint anchor) {
     }
 
     CGPoint off = TDPasteMenuOffset();
-    TDtap(anchor.x + off.x, anchor.y + off.y);
-    TDLog(@"粘贴：长按 (%.0f,%.0f) → 点菜单 (%.0f,%.0f)",
-          anchor.x, anchor.y, anchor.x + off.x, anchor.y + off.y);
+    TDtap(a.x + off.x, a.y + off.y);
+    TDLog(@"粘贴：长按 (%.0f,%.0f)［%@］→ 点菜单 (%.0f,%.0f)",
+          a.x, a.y, TDPasteAnchorDesc(), a.x + off.x, a.y + off.y);
     usleep(150 * 1000);
-    TDSetLastTapPoint(keep);
+    if (hadKeep) TDSetLastTapPoint(keep);
 }
 
 void TDPasteText(NSString *text) {

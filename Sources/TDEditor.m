@@ -1783,6 +1783,7 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
     UILabel *_hint;
     UIButton *_tryBtn;
     UIButton *_modeBtn;
+    UIButton *_anchorBtn;
 }
 
 - (void)viewDidLoad {
@@ -1838,6 +1839,21 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
         [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(onOffset:)]];
     [self.view addSubview:_modeBtn];
     [self refreshModeBtn];
+
+    // 锚点：长按哪儿才算按住输入框（默认「屏幕底部输入框」，因为点完评论键盘一弹，
+    // 原来那个点已经是键盘了）。点一下切「上次落点」，长按调偏移。
+    _anchorBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_anchorBtn setTitleColor:ED_TEXT forState:UIControlStateNormal];
+    _anchorBtn.titleLabel.font = [UIFont systemFontOfSize:12];
+    _anchorBtn.backgroundColor = ED_CARD;
+    _anchorBtn.layer.cornerRadius = 10;
+    _anchorBtn.layer.borderWidth = 1;
+    _anchorBtn.layer.borderColor = ED_LINE.CGColor;
+    [_anchorBtn addTarget:self action:@selector(onCycleAnchor) forControlEvents:UIControlEventTouchUpInside];
+    [_anchorBtn addGestureRecognizer:
+        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(onAnchorOffset:)]];
+    [self.view addSubview:_anchorBtn];
+    [self refreshAnchorBtn];
 }
 
 - (void)viewDidLayoutSubviews {
@@ -1852,10 +1868,12 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
     _hint.frame = CGRectMake(16, top, w - 32, 34);
     CGFloat tvTop = CGRectGetMaxY(_hint.frame) + 6;
     CGFloat barH = 46;
-    _tv.frame = CGRectMake(14, tvTop, w - 28, bottom - barH - 14 - tvTop);
+    CGFloat anchH = 34;
+    _tv.frame = CGRectMake(14, tvTop, w - 28, bottom - barH - anchH - 16 - tvTop);
 
     _tryBtn.frame = CGRectMake(14, bottom - barH - 4, 140, barH);
     _modeBtn.frame = CGRectMake(162, bottom - barH - 4, w - 176, barH);
+    _anchorBtn.frame = CGRectMake(14, bottom - barH - anchH - 10, w - 28, anchH);
 }
 
 - (void)refreshModeBtn {
@@ -1874,6 +1892,57 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
     TDSetPasteMethod(v);
     [self refreshModeBtn];
     TDLog(@"粘贴方式切到：%@", TDPasteMethodDesc());
+}
+
+- (void)refreshAnchorBtn {
+    CGPoint off = TDPasteAnchorOffset();
+    CGSize sb = [UIScreen mainScreen].bounds.size;
+    NSString *tail = TDPasteAnchorKind() == 1
+        ? [NSString stringWithFormat:@" → y=%.0f", sb.height + off.y]
+        : @"";
+    [_anchorBtn setTitle:[NSString stringWithFormat:@"锚点：%@%@（点切换 · 长按调位置）",
+                          TDPasteAnchorDesc(), tail]
+               forState:UIControlStateNormal];
+}
+
+- (void)onCycleAnchor {
+    TDPasteSetAnchorKind(TDPasteAnchorKind() == 1 ? 0 : 1);
+    [self refreshAnchorBtn];
+    TDLog(@"粘贴锚点切到：%@", TDPasteAnchorDesc());
+}
+
+/// 长按「锚点」：调「底部输入框」这个估算点的偏移
+- (void)onAnchorOffset:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    CGPoint off = TDPasteAnchorOffset();
+    CGSize sb = [UIScreen mainScreen].bounds.size;
+
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"锚点偏移"
+                         message:[NSString stringWithFormat:
+                                  @"「底部输入框」这个锚点 = 屏幕中心 x，y = 屏高 + ay。\n"
+                                  @"现在 ay=%.0f，也就是长按在 y≈%.0f。\n\n"
+                                  @"按完长按没弹出「粘贴」菜单、或者点进了键盘，就把 ay 往大调（-280 → -260 → -240）。",
+                                  off.y, sb.height + off.y]
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"ax（左右，正数往右）";
+        tf.text = [NSString stringWithFormat:@"%.0f", off.x];
+        tf.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
+    }];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"ay（负数，越大越靠下）";
+        tf.text = [NSString stringWithFormat:@"%.0f", off.y];
+        tf.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction *x) {
+        TDPasteSetAnchorOffset((CGFloat)[a.textFields[0].text doubleValue],
+                               (CGFloat)[a.textFields[1].text doubleValue]);
+        [self refreshAnchorBtn];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 /// 长按「粘贴方式」：调编辑菜单的落点偏移（相对长按位置）
@@ -1954,11 +2023,11 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
                  message:[NSString stringWithFormat:@"「%@」\n\n先切到抖音、点开输入框再来试，否则字没地方落。", show]];
         return;
     }
-    if (!TDLastTapPointReady()) {
+    if (TDPasteAnchorKind() == 0 && !TDLastTapPointReady()) {
         [self alertTitle:@"还没有可用的落点"
-                 message:@"长按菜单这种方式要知道输入框在哪儿。\n\n"
-                          "先在抖音里跑一次脚本（哪怕只跑一步「点评论框」），"
-                          "落点就记住了，再来试就有地方落。"];
+                 message:@"锚点现在是「上次落点」，但这台机器还没注入过任何点。\n\n"
+                          "要么先在抖音里跑一次脚本（哪怕只跑一步「点评论框」），"
+                          "要么把这个按钮点一下切成「底部输入框」。"];
         return;
     }
 
