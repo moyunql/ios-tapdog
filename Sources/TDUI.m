@@ -435,6 +435,7 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
 
 @interface TDFloatVC : UIViewController
 @property (nonatomic, copy) void (^onTap)(void);
+- (void)setRunning:(BOOL)run;
 @end
 
 @implementation TDFloatVC {
