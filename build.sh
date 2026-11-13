@@ -27,7 +27,6 @@ libs=(
   -framework Foundation
   -framework CoreGraphics
   -framework QuartzCore
-  -framework IOSurface
   -framework AVFoundation
   -framework CoreFoundation
   -Wl,-undefined,dynamic_lookup
