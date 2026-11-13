@@ -19,6 +19,8 @@ void TDgesture(NSArray<NSValue *> *points, NSTimeInterval sec);
 /// 只有杀掉 App 才好 —— 这个函数就是用来现场救的。
 void TDReleaseStuckTouch(void);
 BOOL TDHasStuckTouch(void);
+/// 盲扫 identity 1..64 发抬起，清掉可能残留的幽灵手指（启动时用）
+void TDReleaseAllTouches(void);
 
 #pragma mark - 截屏
 
@@ -182,6 +184,20 @@ BOOL TDInjectBKSDigitizerInfoOn(void);
 /// 新写法是干净的 tap。只有在新写法完全点不动时才切回来验证链路。
 BOOL TDInjectHandLegacy(void);
 void TDSetInjectHandLegacy(BOOL on);
+
+/// 父事件的 eventMask 是否写死成 kIOHIDDigitizerEventTouch（社区参考写法是写死的）
+BOOL TDInjectParentMaskConst(void);
+void TDSetInjectParentMaskConst(BOOL on);
+/// down 与 up 之间是否补一帧静止 move
+BOOL TDInjectStillMoveOn(void);
+void TDSetInjectStillMove(BOOL on);
+
+/// 事件构造组合：bit0 senderID(0 不设 / 1 硬编码)、bit1 父坐标(0 与子同点 / 1 回退 0,0)、
+/// bit2 父 mask(0 透传 / 1 写死 Touch)、bit3 静止 move(0 有 / 1 无)。共 16 组。
+void TDApplyInjectCombo(NSInteger combo);
+NSString *TDInjectComboDesc(NSInteger combo);
+NSInteger TDInjectComboCount(void);
+
 void TDInjectResetToSafeDefaults(void);
 uint64_t TDProbedSenderID(void);
 NSString *TDInjectVariantDesc(void);

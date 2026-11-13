@@ -289,9 +289,48 @@ void TDSetInjectHandLegacy(BOOL on) {
     [[NSUserDefaults standardUserDefaults] setBool:on forKey:kHandLegacyKey];
 }
 
+static NSString * const kParentMaskConstKey = @"tdParentMaskConst";
+static NSString * const kStillMoveKey       = @"tdStillMove";
+
+BOOL TDInjectParentMaskConst(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kParentMaskConstKey];
+}
+void TDSetInjectParentMaskConst(BOOL on) {
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:kParentMaskConstKey];
+}
+BOOL TDInjectStillMoveOn(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if ([d objectForKey:kStillMoveKey] == nil) return YES;   // 默认补一帧
+    return [d boolForKey:kStillMoveKey];
+}
+void TDSetInjectStillMove(BOOL on) {
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:kStillMoveKey];
+}
+
+NSInteger TDInjectComboCount(void) { return 16; }
+
+void TDApplyInjectCombo(NSInteger c) {
+    TDSetInjectVariant((c & 1) ? TDInjectVariantHardSender : TDInjectVariantNoSender);
+    TDSetInjectHandLegacy((c & 2) ? YES : NO);
+    TDSetInjectParentMaskConst((c & 4) ? YES : NO);
+    TDSetInjectStillMove((c & 8) ? NO : YES);
+    // 扫描只动这四个维度，BKS / IsBuiltIn 先关掉，避免互相干扰
+    TDSetInjectBKSDigitizerInfo(NO);
+    TDSetInjectBuiltIn(NO);
+}
+
+NSString *TDInjectComboDesc(NSInteger c) {
+    return [NSString stringWithFormat:@"%@ · 父坐标%@ · 父mask%@ · %@",
+            (c & 1) ? @"硬senderID" : @"不设senderID",
+            (c & 2) ? @"0,0" : @"同点",
+            (c & 4) ? @"写死Touch" : @"透传",
+            (c & 8) ? @"无move帧" : @"有move帧"];
+}
+
 static IOHIDEventRef TDCreateHand(uint32_t mask, uint64_t ts, CGPoint e, BOOL touch,
                                   uint32_t identity) {
     BOOL legacy = TDInjectHandLegacy();
+    uint32_t handMask = (legacy || TDInjectParentMaskConst()) ? kIOHIDDigitizerEventTouch : mask;
     // 注意 range / touch 这两个参数在这里**必须恒为 1/true**。
     // hand 是「这只手」，tap 期间手一直在屏幕上；只有 finger 子事件才在 up 时离开。
     // 之前跟着 touch 一起变 0，结果是 up 事件不被系统接受 —— 手指永远释放不掉，
@@ -300,7 +339,7 @@ static IOHIDEventRef TDCreateHand(uint32_t mask, uint64_t ts, CGPoint e, BOOL to
                                                        ts,
                                                        kIOHIDDigitizerTransducerTypeHand,
                                                        0, identity,
-                                                       legacy ? kIOHIDDigitizerEventTouch : mask,
+                                                       legacy ? kIOHIDDigitizerEventTouch : handMask,
                                                        0,
                                                        legacy ? 0.0 : (IOHIDFloat)e.x,
                                                        legacy ? 0.0 : (IOHIDFloat)e.y,
@@ -416,13 +455,26 @@ void TDReleaseStuckTouch(void) {
 
 BOOL TDHasStuckTouch(void) { return gActiveIdentity != 0; }
 
+// 盲扫一次抬起：把可能残留的「幽灵手指」全部收回来。
+// 上一版 up 被系统丢掉时，那根手指会一直按着，整机连真人点按都失灵；
+// 重启 App 时不知道当时用的是哪个 identity，只能一个个试。
+void TDReleaseAllTouches(void) {
+    CGSize s = [UIScreen mainScreen].bounds.size;
+    CGFloat cx = s.width / 2, cy = s.height / 2;
+    for (uint32_t i = 1; i <= 64; i++) {
+        TDEmit(kMaskUp, NO, cx, cy, i);
+        usleep(3000);
+    }
+    gActiveIdentity = 0;
+}
+
 void TDtap(CGFloat x, CGFloat y) {
     uint32_t ident = TDNextIdentity();
     TDEmit(kMaskDown, YES, x, y, ident);
     // 一帧静止 move：真实触摸在按住期间 HID 也会持续上报位置，
     // 完全不给 move 帧时部分版本认不出这是一次 tap。
     usleep(30000);
-    TDEmit(kMaskMove, YES, x, y, ident);
+    if (TDInjectStillMoveOn()) TDEmit(kMaskMove, YES, x, y, ident);
     usleep(50000);
     TDEmit(kMaskUp, NO, x, y, ident);
     TDShowFeedback(x, y);

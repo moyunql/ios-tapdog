@@ -90,6 +90,13 @@ extern UIViewController *TDCreateMainVC(void);
     // 注入参数回到安全默认（BKS 那一步可能崩，每次启动先关掉，不连环崩）
     TDInjectResetToSafeDefaults();
 
+    // 上次如果留下幽灵手指（up 丢了），整机连真人点按都会失灵。
+    // 启动后盲扫一遍抬起，把手指收回来 —— 这样用户不用重启手机。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        TDReleaseAllTouches();
+    });
+
     [TDKeepAlive start];
     [TDEngine shared].jetsamStatus = TDBypassJetsam();
     TDFloatInstall();

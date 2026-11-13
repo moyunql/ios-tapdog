@@ -21,11 +21,27 @@
 @interface TDSelfTestVC : UIViewController
 @end
 
+@interface TDSelfTestVC ()
+- (void)hit;
+- (void)fire;
+- (void)startScan;
+- (void)scanStep;
+- (void)finishScan;
+@end
+
 @implementation TDSelfTestVC {
     UIView *_target;
     UILabel *_hits;
     UILabel *_tip;
+    UILabel *_scanLog;
+    UIButton *_scanBtn;
     NSInteger _count;
+    // 自动扫描：一组一组试注入构造，哪组命中由程序自己判断，不靠人眼看
+    NSInteger _scanIdx;
+    NSInteger _prevCount;
+    NSMutableArray<NSNumber *> *_scanHits;
+    NSTimer *_scanTimer;
+    BOOL _fbWasOn;
 }
 
 - (void)viewDidLoad {
@@ -82,6 +98,26 @@
     _tip.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:_tip];
 
+    // 自动扫描：16 组构造依次注入，命中与否由程序判定
+    _scanBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_scanBtn setTitle:@"自动扫描 16 种注入构造" forState:UIControlStateNormal];
+    [_scanBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    _scanBtn.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    _scanBtn.backgroundColor = [UIColor colorWithRed:0.36 green:0.30 blue:0.62 alpha:1];
+    _scanBtn.layer.cornerRadius = 12;
+    _scanBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [_scanBtn addTarget:self action:@selector(startScan) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_scanBtn];
+
+    _scanLog = [[UILabel alloc] initWithFrame:CGRectZero];
+    _scanLog.text = @"";
+    _scanLog.textColor = TD_DIM;
+    _scanLog.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+    _scanLog.numberOfLines = 0;
+    _scanLog.textAlignment = NSTextAlignmentLeft;
+    _scanLog.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:_scanLog];
+
     [NSLayoutConstraint activateConstraints:@[
         [_hits.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
         [_hits.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:24],
@@ -99,7 +135,95 @@
         [_tip.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:28],
         [_tip.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-28],
         [_tip.bottomAnchor constraintEqualToAnchor:go.topAnchor constant:-18],
+
+        [_scanBtn.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:24],
+        [_scanBtn.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-24],
+        [_scanBtn.topAnchor constraintEqualToAnchor:go.bottomAnchor constant:10],
+        [_scanBtn.heightAnchor constraintEqualToConstant:46],
+
+        [_scanLog.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:20],
+        [_scanLog.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-20],
+        [_scanLog.topAnchor constraintEqualToAnchor:_target.bottomAnchor constant:16],
+        [_scanLog.bottomAnchor constraintEqualToAnchor:_tip.topAnchor constant:-8],
     ]];
+}
+
+#pragma mark - 自动扫描
+
+- (void)startScan {
+    if (_scanTimer) return;
+    _scanIdx = 0;
+    _prevCount = _count;
+    _scanHits = [NSMutableArray array];
+    _scanLog.text = @"";
+    _scanBtn.enabled = NO;
+    _scanBtn.alpha = 0.5;
+    [_scanBtn setTitle:@"扫描中…（约 15 秒）" forState:UIControlStateNormal];
+    // 扫描期间关掉红圈反馈：每 0.85 秒动一次托管窗口，会干扰注入序列
+    _fbWasOn = TDInjectFeedbackEnabled();
+    TDSetInjectFeedbackEnabled(NO);
+    [self scanStep];
+}
+
+- (void)scanStep {
+    _scanTimer = nil;
+
+    // 先结算上一组的结果
+    if (_scanIdx > 0) {
+        BOOL ok = (_count - _prevCount) > 0;
+        [_scanHits addObject:@(ok)];
+        NSString *line = [NSString stringWithFormat:@"%2ld %@  %@",
+                          (long)_scanIdx, TDInjectComboDesc(_scanIdx - 1), ok ? @"✓ 命中" : @"✗"];
+        _scanLog.text = _scanLog.text.length ? [_scanLog.text stringByAppendingFormat:@"\n%@", line] : line;
+    }
+
+    if (_scanIdx >= TDInjectComboCount()) {
+        [self finishScan];
+        return;
+    }
+
+    TDApplyInjectCombo(_scanIdx);
+    TDReleaseStuckTouch();
+
+    CGPoint c = [_target.superview convertPoint:_target.center toView:nil];
+    _prevCount = _count;
+    _tip.text = [NSString stringWithFormat:@"第 %ld/%ld 组：%@",
+                 (long)(_scanIdx + 1), (long)TDInjectComboCount(), TDInjectComboDesc(_scanIdx)];
+    TDtap(c.x, c.y);
+    _scanIdx++;
+
+    __weak typeof(self) ws = self;
+    _scanTimer = [NSTimer scheduledTimerWithTimeInterval:0.85 repeats:NO block:^(NSTimer *t) {
+        [ws scanStep];
+    }];
+}
+
+- (void)finishScan {
+    if (_scanTimer) { [_scanTimer invalidate]; _scanTimer = nil; }
+    TDSetInjectFeedbackEnabled(_fbWasOn);
+    _scanBtn.enabled = YES;
+    _scanBtn.alpha = 1;
+    [_scanBtn setTitle:@"再扫一遍" forState:UIControlStateNormal];
+
+    NSInteger best = -1;
+    for (NSInteger i = 0; i < (NSInteger)_scanHits.count; i++) {
+        if (_scanHits[i].boolValue) { best = i; break; }
+    }
+    if (best >= 0) {
+        TDApplyInjectCombo(best);
+        _tip.textColor = TD_GREEN;
+        _tip.text = [NSString stringWithFormat:@"第 %ld 组能点动：%@（已自动设为当前构造）",
+                     (long)(best + 1), TDInjectComboDesc(best)];
+    } else {
+        _tip.textColor = TD_RED;
+        _tip.text = @"16 组全部没命中：注入事件到不了本机窗口，问题在事件构造/权限，不在坐标。";
+    }
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    if (_scanTimer) { [_scanTimer invalidate]; _scanTimer = nil; }
+    if (_scanBtn && !_scanBtn.enabled) TDSetInjectFeedbackEnabled(_fbWasOn);
 }
 
 - (void)hit {
@@ -459,6 +583,7 @@ static NSString *TDCalibModeName(NSInteger m) {
     if (ip.row == 0) {
         BOOL had = TDHasStuckTouch();
         TDReleaseStuckTouch();
+        TDReleaseAllTouches();
         UIAlertController *a = [UIAlertController
             alertControllerWithTitle:@"释放触摸"
                              message:(had ? @"已把卡住的那根手指抬起来，现在手点应该恢复正常。"
