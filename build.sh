@@ -55,17 +55,28 @@ pathlib.Path("build/ent.plist").write_text(plain, encoding="utf-8")
 print("entitlements 去注释完成，%d -> %d 字节" % (len(src), len(plain)))
 PY
 
-echo "-- 先试 ldid --"
-if "$LDID" -S build/ent.plist "$APP/TapDog" 2>build/ldid.err; then
-  echo "ldid 签名成功"
-else
-  echo "ldid 失败（$(cat build/ldid.err)），回退 codesign 临时签名"
+echo "-- 用 ldid 签名（假签名，TrollStore 走 CoreTrust 时内核会采纳私有 entitlement）--"
+# 注意：ldid 的 -S 只认「紧贴着写」的路径（-S/path/ent.plist）；
+# 写成 -S ent.plist 会把 plist 当成待签名二进制去解析，触发 ldid.cpp:852 _assert(false)。
+if ! "$LDID" -S"$PWD/build/ent.plist" "$APP/TapDog" 2>build/ldid.err; then
+  echo "!! ldid 失败：$(cat build/ldid.err)"
+  echo "!! 回退 codesign（注意：ad-hoc 签名下私有 entitlement 可能被内核丢弃）"
   codesign --force --sign - --entitlements build/ent.plist "$APP/TapDog"
-  echo "codesign 签名成功"
 fi
 
 echo "== 校验签名里的权限 =="
-codesign -d --entitlements :- "$APP/TapDog" 2>/dev/null | grep -E "hid.client.event-dispatch|platform-application|accessibility-window-hosting" || true
+if "$LDID" -e "$APP/TapDog" > build/ent.out 2>/dev/null; then
+  grep -E "hid.client.event-dispatch|platform-application|accessibility-window-hosting" build/ent.out || true
+else
+  codesign -d --entitlements :- "$APP/TapDog" 2>/dev/null | grep -E "hid.client.event-dispatch|platform-application" || true
+fi
+
+# 硬性校验：拿不到 hid.client.event-dispatch 就没必要发包了
+if ! grep -q "com.apple.private.hid.client.event-dispatch" build/ent.out 2>/dev/null; then
+  echo "!! 错误：签名里没有 HID 注入权限，构建中止"
+  exit 1
+fi
+echo "权限校验通过（HID 注入已嵌入）"
 
 echo "== 打包 ipa =="
 ( cd build && zip -qry TapDog.ipa Payload )
