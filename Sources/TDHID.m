@@ -997,7 +997,7 @@ extern int csops(pid_t pid, unsigned int ops, void *addr, size_t size);
 #define TD_CS_RESTRICT         0x00000800
 #define TD_CS_PLATFORM_BINARY  0x04000000
 
-static NSString *TDCodeSignReport(void) {
+NSString *TDCodeSignReport(void) {
     uint32_t flags = 0;
     int r = csops(getpid(), TD_CS_OPS_STATUS, &flags, sizeof(flags));
     if (r != 0) {
