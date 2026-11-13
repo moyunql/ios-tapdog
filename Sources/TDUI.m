@@ -15,6 +15,7 @@
 #define TD_ACCENT  [UIColor colorWithRed:0.231 green:0.541 blue:0.980 alpha:1]
 #define TD_RED     [UIColor colorWithRed:0.902 green:0.263 blue:0.263 alpha:1]
 #define TD_GREEN   [UIColor colorWithRed:0.235 green:0.749 blue:0.478 alpha:1]
+#define TD_YELLOW  [UIColor colorWithRed:0.960 green:0.710 blue:0.290 alpha:1]
 
 #pragma mark - 任意触摸捕获层
 
@@ -37,6 +38,7 @@
 @property (nonatomic) CGPoint lastScreen;    // 窗口坐标（＝屏幕坐标，全屏无偏移）
 @property (nonatomic) CGPoint minPoint;      // 本次采样范围
 @property (nonatomic) CGPoint maxPoint;
+@property (nonatomic) NSTimeInterval lastTouchTime;   // CACurrentMediaTime，用来量「距上次物理触摸多久」
 @end
 
 @implementation TDTouchCatcher
@@ -63,6 +65,7 @@
     if (!t) return;
     CGPoint p = [t locationInView:self];
     self.hits += 1;
+    self.lastTouchTime = CACurrentMediaTime();
     self.lastPoint = p;
     self.lastScreen = [t locationInView:nil];
     if (isnan(self.minPoint.x)) {
@@ -104,9 +107,13 @@
 - (void)startScan;
 - (void)scanStep;
 - (void)finishScan;
-- (void)startProbe;
-- (void)probeStep;
-- (void)finishProbe;
+- (void)startPhysics;
+- (void)physicsStep;
+- (void)finishPhysics;
+- (void)physicsCooldownTick;
+- (void)startStress;
+- (void)stressStep;
+- (void)finishStress;
 @end
 
 @implementation TDSelfTestVC {
@@ -128,13 +135,25 @@
     NSMutableArray<NSNumber *> *_scanEcho;
     NSTimer *_scanTimer;
     NSTimer *_sampleTimer;
-    // 坐标空间探针：同一目标点，三种量纲各打一次，看落点对不对
-    NSInteger _probeIdx;
-    NSTimer *_probeTimer;
-    NSInteger _probeSavedCoord;
-    NSInteger _probeBaseHits;
-    CGPoint _probeAsked;
-    NSMutableArray<NSString *> *_probeLines;
+    // 参数探针：冷启动下换压力/半径连打几发，看是不是参数把它们挡在门外
+    NSInteger _physIdx;
+    NSTimer *_probeTimer;          // 冷却倒计时 / 逐步推进共用
+    NSTimer *_physStepTimer;
+    NSInteger _physBaseHits;
+    CGPoint _physAsked;
+    NSInteger _physLanded;
+    NSInteger _physCool;
+    NSInteger _coolBaseHits;
+    NSMutableString *_physLines;
+    NSString *_physHead;
+    // 连发续航测试：解锁一次之后能自己点多久
+    UIButton *_stressBtn;
+    NSInteger _stressIdx;
+    NSTimer *_stressTimer;
+    NSInteger _stressBaseHits;
+    NSInteger _stressLanded;
+    NSMutableString *_stressMarks;
+    NSString *_stressHead;
     BOOL _fbWasOn;
     BOOL _reWasOn;
     BOOL _scanRunning;
@@ -221,9 +240,9 @@
 
     // 自动扫描：14 组构造依次注入，命中与否由程序判定
     _scanBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_scanBtn setTitle:@"扫描 14 组" forState:UIControlStateNormal];
+    [_scanBtn setTitle:@"扫 14 组" forState:UIControlStateNormal];
     [_scanBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    _scanBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    _scanBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
     _scanBtn.backgroundColor = [UIColor colorWithRed:0.36 green:0.30 blue:0.62 alpha:1];
     _scanBtn.layer.cornerRadius = 12;
     _scanBtn.translatesAutoresizingMaskIntoConstraints = NO;
@@ -233,14 +252,29 @@
     // 坐标空间探针：只改量纲，别的都不动。
     // 这是唯一能把「坐标算错」和「事件被拒」分开的实验。
     _probeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_probeBtn setTitle:@"坐标探针" forState:UIControlStateNormal];
+    [_probeBtn setTitle:@"参数探针" forState:UIControlStateNormal];
     [_probeBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    _probeBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    _probeBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
     _probeBtn.backgroundColor = [UIColor colorWithRed:0.16 green:0.44 blue:0.46 alpha:1];
     _probeBtn.layer.cornerRadius = 12;
     _probeBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    [_probeBtn addTarget:self action:@selector(startProbe) forControlEvents:UIControlEventTouchUpInside];
+    [_probeBtn addTarget:self action:@selector(startPhysics) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:_probeBtn];
+
+    // 连发续航测试。
+    // 现场发现：扫 14 组时先用真手点一下屏幕，之后 2/5/6/7/8 全中，
+    // 而且不碰屏幕它自己还能连着中 4 组 —— 说明 senderID 绑在「当前 HID 会话」上，
+    // 会话是物理触摸建立的，会失效也会（可能）被后续注入续命。
+    // 这个测试就是量它：一次性连打 20 发，看第几发开始丢。
+    _stressBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_stressBtn setTitle:@"连发 20" forState:UIControlStateNormal];
+    [_stressBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    _stressBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    _stressBtn.backgroundColor = [UIColor colorWithRed:0.47 green:0.35 blue:0.16 alpha:1];
+    _stressBtn.layer.cornerRadius = 12;
+    _stressBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [_stressBtn addTarget:self action:@selector(startStress) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_stressBtn];
 
     _scanLog = [[UILabel alloc] initWithFrame:CGRectZero];
     _scanLog.text = @"";
@@ -283,10 +317,15 @@
         [_scanBtn.topAnchor constraintEqualToAnchor:go.bottomAnchor constant:10],
         [_scanBtn.heightAnchor constraintEqualToConstant:44],
 
+        [_stressBtn.leadingAnchor constraintEqualToAnchor:_scanBtn.trailingAnchor constant:8],
+        [_stressBtn.topAnchor constraintEqualToAnchor:go.bottomAnchor constant:10],
+        [_stressBtn.heightAnchor constraintEqualToConstant:44],
+        [_stressBtn.widthAnchor constraintEqualToAnchor:_scanBtn.widthAnchor],
+
         [_probeBtn.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-24],
         [_probeBtn.topAnchor constraintEqualToAnchor:go.bottomAnchor constant:10],
         [_probeBtn.heightAnchor constraintEqualToConstant:44],
-        [_probeBtn.leadingAnchor constraintEqualToAnchor:_scanBtn.trailingAnchor constant:10],
+        [_probeBtn.leadingAnchor constraintEqualToAnchor:_stressBtn.trailingAnchor constant:8],
         [_probeBtn.widthAnchor constraintEqualToAnchor:_scanBtn.widthAnchor],
 
         [_scanLog.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:20],
@@ -437,118 +476,265 @@
     [super viewWillDisappear:animated];
     if (_scanTimer) { [_scanTimer invalidate]; _scanTimer = nil; }
     if (_probeTimer) { [_probeTimer invalidate]; _probeTimer = nil; }
+    if (_physStepTimer) { [_physStepTimer invalidate]; _physStepTimer = nil; }
+    if (_stressTimer) { [_stressTimer invalidate]; _stressTimer = nil; }
     if (_sampleTimer) { [_sampleTimer invalidate]; _sampleTimer = nil; }
     if (_scanBtn && !_scanBtn.enabled) TDSetInjectFeedbackEnabled(_fbWasOn);
 }
 
-#pragma mark - 坐标空间探针
+#pragma mark - 参数探针（冷启动 + 压力 / 半径）
 
-static NSString *TDCoordModeName(NSInteger m) {
-    switch (m) {
-        case TDCoordModeNormalized: return @"归一化";
-        case TDCoordModePixel:      return @"像素  ";
-        default:                    return @"点    ";
-    }
-}
+// 现场留下来的问题：先用手点一下屏幕，注入才生效。
+// 两种解释：
+//   A「会话」—— senderID 必须属于当前 HID 会话，会话由物理触摸建立（AutoTap 的
+//     senderBelongsToCurrentSession: 就是这么校验的）；
+//   B「参数」—— 我们发的压力恒 0、半径 0.04，系统完全可以把这种接触点当噪声
+//     丢在过滤阶段；物理触摸把某条通路「点亮」之后才不再丢。
+//
+// 这两个假设可以分开验证：**冷启动直接打**。
+// 按按钮后先干等 10 秒（期间碰到屏幕就重新计时），让会话彻底冷掉，
+// 再依次换参数打。某一组在冷状态下就能中，压力就是钥匙。
+//
+// 最后一发故意复测回现状参数（p=0）：前几发中、最后一发不中 → 起作用的是参数；
+// 最后一发也中 → 起作用的是「前面那几发把会话点亮了」。
+typedef struct {
+    const char *name;
+    IOHIDFloat  pressure, radius, quality, density;
+} TDPhysCase;
 
-// 同一目标点，只改量纲，连打三次。
-// 判读方法（落点栏会直接写出来）：
-//   某一档 Δ≈0        → 量纲就是它，之前打不中纯粹是坐标算错
-//   三档全「无触摸」   → 量纲不是问题，事件根本没进来（转去看签名的 platform 标志）
-//   三档都落在同一个错位置 → 坐标没被采纳，系统用的还是父事件/上次的坐标
-- (void)startProbe {
-    if (_probeTimer || _scanTimer) return;
-    _probeIdx = 0;
-    _probeLines = [NSMutableArray array];
-    _probeSavedCoord = TDCoordModeCurrent();
+static const TDPhysCase kPhysCases[] = {
+    {"现状 p0.00 r0.04 ", 0.00f, 0.04f, 0.0f, 0.0f},
+    {"压力 p0.50 r0.50 ", 0.50f, 0.50f, 0.0f, 0.0f},
+    {"压力 p1.00 r1.60 ", 1.00f, 1.60f, 0.0f, 0.0f},
+    {"压力+质量 p0.80  ", 0.80f, 0.80f, 1.0f, 1.0f},
+    {"复测 p0.00（对照）", 0.00f, 0.04f, 0.0f, 0.0f},
+};
+static const NSInteger kPhysCaseCount = (NSInteger)(sizeof(kPhysCases) / sizeof(kPhysCases[0]));
+
+- (void)startPhysics {
+    if (_probeTimer || _physStepTimer || _stressTimer || _scanTimer) return;
+    _physIdx = 0;
+    _physLanded = 0;
+    _physLines = [NSMutableString string];
     _fbWasOn = TDInjectFeedbackEnabled();
     TDSetInjectFeedbackEnabled(NO);
     _reWasOn = TDUseRealEvents();
     TDSetUseRealEvents(NO);
 
     NSInteger plan = TDBestInjectPlan();
-    if (plan < 0) plan = 0;
+    if (plan < 0) plan = 1;
     TDApplyInjectPlan(plan);
+    _physHead = [NSString stringWithFormat:@"参数探针 · 构造 #%ld %@",
+                 (long)(plan + 1), TDInjectPlanDesc(plan)];
 
-    _scanLog.text = [NSString stringWithFormat:@"坐标探针 · 构造 #%ld %@\n目标点用「屏幕点」写，三档只换算量纲\n",
-                     (long)(plan + 1), TDInjectPlanDesc(plan)];
+    _physCool = 10;
+    _coolBaseHits = _catcher.hits;
+    _scanLog.text = [NSString stringWithFormat:@"%@\n冷启动中：手离开屏幕，10 秒后开始打\n", _physHead];
     _probeBtn.enabled = NO;
     _scanBtn.enabled = NO;
+    _stressBtn.enabled = NO;
     _probeBtn.alpha = 0.5;
-    [_probeBtn setTitle:@"探针中…" forState:UIControlStateNormal];
-    [self probeStep];
-}
-
-- (void)probeStep {
-    _probeTimer = nil;
-
-    if (_probeIdx > 0) {
-        NSInteger mode = _probeIdx - 1;
-        BOOL arrived = (_catcher.hits - _probeBaseHits) > 0;
-        NSString *res;
-        if (!arrived) {
-            res = @"无触摸 ← 事件没进本进程";
-        } else {
-            CGPoint g = _catcher.lastPoint;
-            CGPoint w = _probeAsked;
-            res = [NSString stringWithFormat:@"落点 (%.0f,%.0f) Δ(%+.0f,%+.0f) %@",
-                   g.x, g.y, g.x - w.x, g.y - w.y,
-                   (fabs(g.x - w.x) < 12 && fabs(g.y - w.y) < 12) ? @"✓对" : @"✗偏"];
-        }
-        NSString *line = [NSString stringWithFormat:@"%@ 请求(%.0f,%.0f) → %@",
-                          TDCoordModeName(mode), _probeAsked.x, _probeAsked.y, res];
-        [_probeLines addObject:line];
-        _scanLog.text = [_scanLog.text stringByAppendingFormat:@"%@\n", line];
-    }
-
-    if (_probeIdx >= 3) {
-        [self finishProbe];
-        return;
-    }
-
-    TDReleaseStuckTouch();
-    TDSetCoordMode(_probeIdx);
-    // 目标中心换算成屏幕点，三档都从同一个屏幕点出发
-    CGPoint c = [_target.superview convertPoint:_target.center toView:nil];
-    _probeAsked = c;
-    _probeBaseHits = _catcher.hits;
-    TDtap(c.x, c.y);
-    _probeIdx++;
+    [_probeBtn setTitle:@"冷却中…" forState:UIControlStateNormal];
 
     __weak typeof(self) ws = self;
-    _probeTimer = [NSTimer scheduledTimerWithTimeInterval:0.9 repeats:NO block:^(NSTimer *t) {
-        [ws probeStep];
+    _probeTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+        [ws physicsCooldownTick];
     }];
 }
 
-- (void)finishProbe {
+- (void)physicsCooldownTick {
+    // 冷却期间碰了屏幕就重新计时，否则「冷」这个前提不成立
+    if (_catcher.hits != _coolBaseHits) {
+        _coolBaseHits = _catcher.hits;
+        _physCool = 10;
+    }
+    _physCool--;
+    if (_physCool > 0) {
+        _scanLog.text = [NSString stringWithFormat:@"%@\n冷启动中：%ld 秒后开始（碰屏幕会重新计时）",
+                         _physHead, (long)_physCool];
+        return;
+    }
+    [_probeTimer invalidate];
+    _probeTimer = nil;
+    _scanLog.text = [NSString stringWithFormat:@"%@\n开始\n", _physHead];
+    [self physicsStep];
+}
+
+- (void)physicsStep {
+    _physStepTimer = nil;
+
+    if (_physIdx > 0) {
+        NSInteger k = _physIdx - 1;
+        BOOL arrived = (_catcher.hits - _physBaseHits) > 0;
+        NSString *mark;
+        if (arrived) {
+            CGPoint g = _catcher.lastPoint;
+            mark = [NSString stringWithFormat:@"✓ 落(%.0f,%.0f)", g.x, g.y];
+            _physLanded++;
+        } else {
+            mark = @"✗ 无触摸";
+        }
+        [_physLines appendFormat:@"%@ → %@\n",
+            [NSString stringWithUTF8String:kPhysCases[k].name], mark];
+        _scanLog.text = [NSString stringWithFormat:@"%@\n%@", _physHead, _physLines];
+    }
+
+    if (_physIdx >= kPhysCaseCount) {
+        [self finishPhysics];
+        return;
+    }
+
+    const TDPhysCase *c0 = &kPhysCases[_physIdx];
+    TDSetInjectTouchPhysics(c0->pressure, c0->radius, c0->quality, c0->density);
+
+    CGPoint c = [_target.superview convertPoint:_target.center toView:nil];
+    _physAsked = c;
+    _physBaseHits = _catcher.hits;
+    TDtap(c.x, c.y);
+    _physIdx++;
+
+    __weak typeof(self) ws = self;
+    _physStepTimer = [NSTimer scheduledTimerWithTimeInterval:1.1 repeats:NO block:^(NSTimer *t) {
+        [ws physicsStep];
+    }];
+}
+
+- (void)finishPhysics {
+    if (_physStepTimer) { [_physStepTimer invalidate]; _physStepTimer = nil; }
     if (_probeTimer) { [_probeTimer invalidate]; _probeTimer = nil; }
-    TDSetCoordMode(_probeSavedCoord);
+    TDSetInjectTouchPhysics(0.0f, 0.04f, 0.0f, 0.0f);   // 先恢复现状，别把没验证的参数带上线
     TDSetInjectFeedbackEnabled(_fbWasOn);
     TDSetUseRealEvents(_reWasOn);
     _probeBtn.enabled = YES;
     _scanBtn.enabled = YES;
+    _stressBtn.enabled = YES;
     _probeBtn.alpha = 1;
-    [_probeBtn setTitle:@"坐标探针" forState:UIControlStateNormal];
+    [_probeBtn setTitle:@"参数探针" forState:UIControlStateNormal];
 
-    NSInteger good = -1;
-    BOOL anyArrived = NO;
-    for (NSInteger i = 0; i < (NSInteger)_probeLines.count; i++) {
-        if ([_probeLines[i] containsString:@"✓对"] && good < 0) good = i;
-        if (![_probeLines[i] containsString:@"无触摸"]) anyArrived = YES;
+    NSString *line0 = [_physLines componentsSeparatedByString:@"\n"].firstObject ?: @"";
+    BOOL coldOK    = [line0 containsString:@"✓"];
+    NSArray<NSString *> *rows = [_physLines componentsSeparatedByString:@"\n"];
+    BOOL lastOK    = rows.count >= kPhysCaseCount && [rows[kPhysCaseCount - 1] containsString:@"✓"];
+    BOOL midOK     = NO;
+    for (NSInteger i = 1; i < kPhysCaseCount - 1 && i < (NSInteger)rows.count; i++) {
+        if ([rows[i] containsString:@"✓"]) midOK = YES;
     }
-    if (good >= 0) {
+
+    if (coldOK) {
         _tip.textColor = TD_GREEN;
-        _tip.text = [NSString stringWithFormat:@"量纲 = %@（已恢复原设置，去注入页改成它）",
-                     TDCoordModeName(good)];
-    } else if (anyArrived) {
-        _tip.textColor = TD_RED;
-        _tip.text = @"事件能进窗口但三档落点都不对 → 坐标没被采纳，不是量纲问题";
+        _tip.text = @"冷启动第一发就中 → 参数和会话都不是瓶颈，之前的问题另有原因";
+    } else if (lastOK) {
+        _tip.textColor = TD_YELLOW;
+        _tip.text = @"只有最后一发（复测现状参数）中了 → 起作用的是「前面几发把会话点亮」，不是压力";
+    } else if (midOK) {
+        _tip.textColor = TD_GREEN;
+        _tip.text = @"换了压力/半径的组能中、复测 p0 不中 → 压力就是钥匙，下一版把它设为默认";
     } else {
         _tip.textColor = TD_RED;
-        _tip.text = @"三档都没触摸：跟坐标无关，事件根本没进来（看下面签名的 platform）";
+        _tip.text = @"冷启动全灭 → 参数不是钥匙，必须先有物理触摸解锁（会话假设成立）";
     }
-    _scanLog.text = [_scanLog.text stringByAppendingFormat:@"────\n%@", TDHIDDiagReport()];
+    _scanLog.text = [NSString stringWithFormat:@"%@\n%@────\n%@", _physHead, _physLines, TDHIDDiagReport()];
+}
+
+#pragma mark - 连发续航测试
+
+#define TD_STRESS_N   20
+#define TD_STRESS_GAP 0.55
+
+// 现场观测：先用手点一下屏幕，之后注入的 tap 才生效，且能连续生效好几组。
+// 这跟 AutoTap 里那个 senderBelongsToCurrentSession: 的校验对得上——
+// senderID 本身没问题，问题是它必须属于「当前 HID 会话」，而会话是物理触摸建立的。
+// 于是唯一要紧的问题变成：这个窗口多长？后续注入能不能自己续命？
+// 连发 20 发就是为了把这两个数一次量出来。
+- (void)startStress {
+    if (_stressTimer || _probeTimer || _scanTimer) return;
+    _stressIdx = 0;
+    _stressLanded = 0;
+    _stressMarks = [NSMutableString string];
+    _fbWasOn = TDInjectFeedbackEnabled();
+    TDSetInjectFeedbackEnabled(NO);
+    _reWasOn = TDUseRealEvents();
+    TDSetUseRealEvents(NO);
+
+    NSInteger plan = TDBestInjectPlan();
+    if (plan < 0) plan = 1;                 // 第 2 组：v1.2.3 构造 + 真实 senderID
+    TDApplyInjectPlan(plan);
+
+    _stressHead = [NSString stringWithFormat:@"连发 %d 发 · 构造 #%ld %@\n按下去这一下就是「解锁」，之后别碰屏幕",
+                   TD_STRESS_N, (long)(plan + 1), TDInjectPlanDesc(plan)];
+    _scanLog.text = _stressHead;
+    _stressBtn.enabled = NO;
+    _scanBtn.enabled = NO;
+    _probeBtn.enabled = NO;
+    _stressBtn.alpha = 0.5;
+    [_stressBtn setTitle:@"连发中…" forState:UIControlStateNormal];
+
+    TDReleaseStuckTouch();
+    __weak typeof(self) ws = self;
+    // 按钮的触摸事件刚落地，先让会话建立起来再打第一发
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [ws stressStep]; });
+}
+
+- (void)stressStep {
+    _stressTimer = nil;
+
+    if (_stressIdx > 0) {
+        BOOL landed = (_catcher.hits - _stressBaseHits) > 0;
+        if (landed) _stressLanded++;
+        [_stressMarks appendString:landed ? @"●" : @"○"];
+        NSTimeInterval since = _catcher.lastTouchTime > 0
+                             ? CACurrentMediaTime() - _catcher.lastTouchTime : -1;
+        _scanLog.text = [NSString stringWithFormat:@"%@\n%@\n%ld/%ld 命中 · 距上次物理触摸 %.1fs",
+                         _stressHead, _stressMarks,
+                         (long)_stressLanded, (long)_stressIdx, since];
+    }
+
+    if (_stressIdx >= TD_STRESS_N) {
+        [self finishStress];
+        return;
+    }
+
+    _stressBaseHits = _catcher.hits;
+    CGPoint c = [_target.superview convertPoint:_target.center toView:nil];
+    TDtap(c.x, c.y);
+    _stressIdx++;
+
+    __weak typeof(self) ws = self;
+    _stressTimer = [NSTimer scheduledTimerWithTimeInterval:TD_STRESS_GAP
+                                                  repeats:NO
+                                                    block:^(NSTimer *t) { [ws stressStep]; }];
+}
+
+- (void)finishStress {
+    if (_stressTimer) { [_stressTimer invalidate]; _stressTimer = nil; }
+    TDSetInjectFeedbackEnabled(_fbWasOn);
+    TDSetUseRealEvents(_reWasOn);
+    _stressBtn.enabled = YES;
+    _scanBtn.enabled = YES;
+    _probeBtn.enabled = YES;
+    _stressBtn.alpha = 1;
+    [_stressBtn setTitle:@"连发 20" forState:UIControlStateNormal];
+
+    // 找最后一发命中的位置，用来估算窗口
+    NSInteger lastHit = -1;
+    for (NSInteger i = 0; i < (NSInteger)_stressMarks.length; i++) {
+        if ([_stressMarks characterAtIndex:i] != '0') lastHit = i;
+    }
+    if (_stressLanded >= TD_STRESS_N) {
+        _tip.textColor = TD_GREEN;
+        _tip.text = @"20/20 全中且全程没碰屏幕 → 会话能自持，一次解锁就能无限连点";
+    } else if (_stressLanded == 0) {
+        _tip.textColor = TD_RED;
+        _tip.text = @"一发都没中：这次没赶上会话窗口（按下去到第一发之间隔了 0.25s，可能太晚或太早）";
+    } else {
+        _tip.textColor = TD_YELLOW;
+        _tip.text = [NSString stringWithFormat:
+                     @"前 %ld 发有效（约 %.1f 秒），之后被丢 → 会话不能自持，循环里要定期重新解锁",
+                     (long)(lastHit + 1), (lastHit + 1) * TD_STRESS_GAP];
+    }
+    _scanLog.text = [NSString stringWithFormat:@"%@\n%@\n%ld/%ld 命中",
+                     _stressHead, _stressMarks, (long)_stressLanded, (long)TD_STRESS_N];
 }
 
 - (void)updateHits {

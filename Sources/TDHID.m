@@ -254,6 +254,16 @@ void TDInjectResetToSafeDefaults(void) {
             [d setInteger:TDInjectVariantSampleSender forKey:kInjVariantKey];
         }
     }
+    // v1.8.0：真机实测结论 —— 第 2 组（v1.2.3 构造 + 本机真实 senderID）是唯一能点中的。
+    // 现场数据：扫 14 组时，1/4/10（不设 sender）全灭；3（加了 BKS）和 9（父 mask 透传）也灭；
+    // 2/5/6/7/8 全中，而且**先用手点一下屏幕之后，后面几组不碰屏幕也能中**。
+    // 说明 senderID 是必要条件，并且它绑定在「当前 HID 会话」上，会话由物理触摸建立。
+    // 所以默认值必须落在第 2 组，同时关掉「真实事件副本」那条路（那是第 14 组，没有 sender）。
+    if (![d boolForKey:@"tdMigrated180"]) {
+        [d setBool:YES forKey:@"tdMigrated180"];
+        [d setInteger:1 forKey:@"tdPlanBest"];      // 1 = 第 2 组
+        TDSetUseRealEvents(NO);
+    }
     // 扫到过可用方案就沿用它（含 BKS 开关）；没扫过才回到「无 BKS」的保守状态
     if ([d objectForKey:@"tdPlanBest"] == nil) {
         TDSetInjectBKSDigitizerInfo(NO);
@@ -485,6 +495,32 @@ static CGFloat gActiveX = 0, gActiveY = 0;
 static volatile uint32_t gFingerSeq = 1;
 static uint32_t TDNextIdentity(void) { return ++gFingerSeq; }
 
+#pragma mark - 触摸物理量（压力 / 半径 / 质量）
+
+// 这几个数决定「这一下像不像真手指」。
+// 我们原来一直发 pressure=0、radius=0.04、quality=0、density=0：
+// 在系统看来是一根「面积为 0、没有按压力、质量未知」的接触点，
+// 完全可以在触摸过滤阶段被当噪声丢掉 —— 表现就是事件发出去了，窗口没收到。
+// 真手指大致是 pressure 0.6~1.0、majorRadius 几个单位（视驱动标定）。
+static IOHIDFloat gPressPressure = 0.0f;
+static IOHIDFloat gPressRadius   = 0.04f;
+static IOHIDFloat gPressQuality  = 0.0f;
+static IOHIDFloat gPressDensity  = 0.0f;
+
+void TDSetInjectTouchPhysics(IOHIDFloat pressure, IOHIDFloat radius,
+                             IOHIDFloat quality, IOHIDFloat density) {
+    gPressPressure = pressure;
+    gPressRadius   = radius;
+    gPressQuality  = quality;
+    gPressDensity  = density;
+}
+
+NSString *TDInjectTouchPhysicsDesc(void) {
+    return [NSString stringWithFormat:@"压力%.2f 半径%.2f 质量%.0f/%.0f",
+            (double)gPressPressure, (double)gPressRadius,
+            (double)gPressQuality, (double)gPressDensity];
+}
+
 // mask: kIOHIDDigitizerEvent* 位组合；touch: 当前是否接触屏幕
 static void TDEmit(uint32_t mask, BOOL touch, CGFloat x, CGFloat y, uint32_t identity) {
     if (gFixedIdentity) identity = 3;      // v1.2.3 的写法：identity 恒为 3
@@ -521,7 +557,9 @@ static void TDEmit(uint32_t mask, BOOL touch, CGFloat x, CGFloat y, uint32_t ide
                                                                mask,
                                                                (IOHIDFloat)e.x,
                                                                (IOHIDFloat)e.y,
-                                                               0.0f, 0.0f, 0.0f,
+                                                               0.0f,             // z
+                                                               gPressPressure,   // tipPressure（原来恒 0）
+                                                               0.0f,             // twist
                                                                isTouch,   // range
                                                                isTouch,   // touch
                                                                0);
@@ -536,8 +574,15 @@ static void TDEmit(uint32_t mask, BOOL touch, CGFloat x, CGFloat y, uint32_t ide
             IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerX, (IOHIDFloat)e.x);
             IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerY, (IOHIDFloat)e.y);
         }
-        IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerMajorRadius, 0.04f);
-        IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerMinorRadius, 0.04f);
+        IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerMajorRadius, gPressRadius);
+        IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerMinorRadius, gPressRadius);
+        if (gPressQuality != 0.0f) {
+            IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerQuality, gPressQuality);
+        }
+        if (gPressDensity != 0.0f) {
+            IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerDensity, gPressDensity);
+        }
+        IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerPressure, gPressPressure);
         IOHIDEventAppendEvent(hand, finger);
         CFRelease(finger);
     }
