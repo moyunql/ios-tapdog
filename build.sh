@@ -30,6 +30,7 @@ libs=(
   -framework AVFoundation
   -framework CoreFoundation
   -Wl,-undefined,dynamic_lookup
+  -Wl,-headerpad_max_install_names
 )
 
 echo "== 编译 =="
@@ -45,8 +46,7 @@ if [ -z "$LDID" ]; then
   LDID="$(command -v ldid)"
 fi
 
-# ldid 自带的手写 XML 解析器不认 <!-- 注释 -->，会 assert 退出。
-# 签名前生成一份去掉注释的副本。
+# ldid 自带的手写 XML 解析器不认 <!-- 注释 -->，签名前生成一份去掉注释的副本。
 python3 - <<'PY'
 import re, pathlib
 src = pathlib.Path("entitlements.plist").read_text(encoding="utf-8")
@@ -55,11 +55,17 @@ pathlib.Path("build/ent.plist").write_text(plain, encoding="utf-8")
 print("entitlements 去注释完成，%d -> %d 字节" % (len(src), len(plain)))
 PY
 
-"$LDID" -S build/ent.plist "$APP/TapDog"
-echo "签名完成"
+echo "-- 先试 ldid --"
+if "$LDID" -S build/ent.plist "$APP/TapDog" 2>build/ldid.err; then
+  echo "ldid 签名成功"
+else
+  echo "ldid 失败（$(cat build/ldid.err)），回退 codesign 临时签名"
+  codesign --force --sign - --entitlements build/ent.plist "$APP/TapDog"
+  echo "codesign 签名成功"
+fi
 
 echo "== 校验签名里的权限 =="
-"$LDID" -e "$APP/TapDog" | grep -E "hid.client.event-dispatch|platform-application|accessibility-window-hosting" || true
+codesign -d --entitlements :- "$APP/TapDog" 2>/dev/null | grep -E "hid.client.event-dispatch|platform-application|accessibility-window-hosting" || true
 
 echo "== 打包 ipa =="
 ( cd build && zip -qry TapDog.ipa Payload )
