@@ -107,6 +107,15 @@ NSInteger TDHIDLastKeyUsage(void);
 void TDKeysInstall(void);
 NSString *TDKeysStatus(void);
 
+#pragma mark - 内置模板
+
+/// 把 bundle 里的内置识图模板（点赞 / 评论 / 收藏）装到 Documents。
+/// 只在目标文件不存在时拷贝：用户删掉的不会被硬塞回来，但每版都会补新内置项。
+void TDInstallBuiltinTemplates(void);
+
+/// 这个模板是不是内置的（内置模板在库里排前面、显示中文名）
+BOOL TDTplIsBuiltin(NSString * _Nullable file);
+
 #pragma mark - 截屏
 
 BOOL TDcaptureReady(void);
@@ -120,6 +129,16 @@ CGFloat TDscreenScaleRatio(void);
 @class TDMatch;
 
 TDMatch * _Nullable TDfindImage(UIImage *tpl, double threshold, double minScale, double maxScale, int scaleSteps);
+
+/// 带尺度策略的识图：先按记住的尺度窄扫，再按原尺度，最后才做尺度扫描。
+/// 模板像素和屏幕实际尺寸不一致时（内置小图标、相册压过的截图）靠这一层兜住。
+/// tplName 用于记住/取回尺度，可传 nil（纯一次性匹配）；scanned 回填是否靠扫描命中。
+TDMatch * _Nullable TDfindImageSmart(UIImage *tpl, NSString * _Nullable tplName,
+                                    double threshold, BOOL * _Nullable scanned);
+
+/// 读/写某个模板记住的尺度（1.0 = 原尺度，0 = 没记过）
+double TDScaleHint(NSString * _Nullable tplName);
+void TDSetScaleHint(NSString * _Nullable tplName, double scale);
 
 @interface TDMatch : NSObject
 @property (nonatomic) double score;

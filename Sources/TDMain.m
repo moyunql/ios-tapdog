@@ -82,6 +82,10 @@ extern UIViewController *TDCreateMainVC(void);
 - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)opt {
     TDInstallCrashLogger();
 
+    // 内置识图模板（点赞 / 评论 / 收藏）落到 Documents，模板库里开箱就能选。
+    // 必须早于任何界面构建：编辑页一打开就会扫模板列表。
+    TDInstallBuiltinTemplates();
+
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     self.window.rootViewController = TDCreateMainVC();
     self.window.backgroundColor = [UIColor blackColor];

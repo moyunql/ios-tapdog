@@ -308,15 +308,10 @@ static CGPoint TDJitter(CGPoint p, double r) {
         BOOL scaledHit = NO;
         while (self->_running) {
             tries++;
-            m = TDfindImage(tpl, th, 1.0, 1.0, 1);
+            // smart 查找内部按「记住的尺度 → 原尺度 → 尺度扫描」逐级退让：
+            // 内置的小图标（38px）第一次会扫出真正的倍数并记住，之后就走窄扫。
+            m = TDfindImageSmart(tpl, name, th, &scaledHit);
             if (m) break;
-
-            // 尺度兜底：从相册导进来的模板像素尺度不一定和这块屏一样
-            // （被打包压过、或者干脆是别处裁的图）。原尺度找不到时，
-            // 在 ±15% 内再扫一遍 —— 只在没命中时才付这份开销。
-            m = TDfindImage(tpl, th, 0.85, 1.15, 7);
-            if (m) { scaledHit = YES; break; }
-
             if (timeoutMs <= 0 || CACurrentMediaTime() >= deadline) break;
             usleep(200 * 1000);
         }
@@ -326,7 +321,7 @@ static CGPoint TDJitter(CGPoint p, double r) {
             return;
         }
         if (scaledHit) {
-            [self logMsg:@"识图 %@ 是靠尺度扫描命中的（%.2f×），模板像素和屏幕不完全一致", name, m.scale];
+            [self logMsg:@"识图 %@ 靠尺度扫描命中（%.2f×），已记住这个倍数", name, m.scale];
         }
 
         CGPoint p = TDJitter(CGPointMake(m.point.x + dx, m.point.y + dy), jitter);

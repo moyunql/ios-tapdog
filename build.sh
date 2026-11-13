@@ -40,6 +40,15 @@ xcrun --sdk iphoneos clang "${cflags[@]}" -o "$APP/TapDog" Sources/*.m "${libs[@
 
 cp Sources/Info.plist "$APP/Info.plist"
 
+# 内置识图模板（点赞 / 评论 / 收藏）一起打进 bundle，
+# 由 TDInstallBuiltinTemplates() 在首次启动时拷到 Documents，
+# 这样模板库开箱就有三个能直接选的。
+if [ -d Resources/tpl ]; then
+  mkdir -p "$APP/tpl"
+  cp Resources/tpl/*.png "$APP/tpl/"
+  echo "内置模板: $(ls "$APP/tpl" | tr '\n' ' ')"
+fi
+
 echo "== ldid 签名（写入 entitlements）=="
 LDID="$(command -v ldid || true)"
 if [ -z "$LDID" ]; then

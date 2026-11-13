@@ -40,6 +40,57 @@ static NSString *TDTplPath(NSString *name) {
     return [TDDocsDir() stringByAppendingPathComponent:name ?: @""];
 }
 
+// 内置模板（点赞 / 评论 / 收藏）
+//
+// build.sh 把 Resources/tpl 打进 bundle 的 tpl/ 目录，这里在每次启动时补拷到 Documents：
+// 只在「文件不存在」且「没被用户主动删过」时拷 —— 首次安装能开箱即用，
+// 用户真不想要就删，删了记进黑名单，不会再被塞回来。
+// 文件名前缀 tpl_lib_ 是标记：库里显示中文名、排最前。
+static NSDictionary<NSString *, NSString *> *TDBuiltinNames(void) {
+    static NSDictionary *m = nil;
+    if (!m) {
+        m = @{@"tpl_lib_like.png":    @"点赞",
+              @"tpl_lib_comment.png": @"评论",
+              @"tpl_lib_star.png":    @"收藏"};
+    }
+    return m;
+}
+
+BOOL TDTplIsBuiltin(NSString *file) {
+    return file.length > 0 && TDBuiltinNames()[file] != nil;
+}
+
+static NSMutableArray<NSString *> *TDBuiltinHidden(void) {
+    NSArray *a = [[NSUserDefaults standardUserDefaults] arrayForKey:@"tdLibTplHidden"];
+    return [a mutableCopy] ?: [NSMutableArray array];
+}
+
+static void TDHideBuiltin(NSString *name) {
+    NSMutableArray *a = TDBuiltinHidden();
+    if ([a containsObject:name]) return;
+    [a addObject:name];
+    [[NSUserDefaults standardUserDefaults] setObject:a forKey:@"tdLibTplHidden"];
+}
+
+void TDInstallBuiltinTemplates(void) {
+    NSString *dir = TDDocsDir();
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *hidden = TDBuiltinHidden();
+
+    NSInteger copied = 0;
+    for (NSString *name in TDBuiltinNames()) {
+        if ([hidden containsObject:name]) continue;
+        NSString *dst = [dir stringByAppendingPathComponent:name];
+        if ([fm fileExistsAtPath:dst]) continue;
+        NSString *src = [[NSBundle mainBundle] pathForResource:[name stringByDeletingPathExtension]
+                                                        ofType:@"png"
+                                                   inDirectory:@"tpl"];
+        if (!src) continue;
+        if ([fm copyItemAtPath:src toPath:dst error:NULL]) copied++;
+    }
+    if (copied > 0) TDLog(@"内置识图模板已装入 %ld 个（点赞/评论/收藏）", (long)copied);
+}
+
 static NSArray<NSString *> *TDTemplateList(void) {
     NSArray *all = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:TDDocsDir() error:NULL];
     NSMutableArray *out = [NSMutableArray array];
@@ -48,7 +99,12 @@ static NSArray<NSString *> *TDTemplateList(void) {
             [out addObject:n];
         }
     }
-    [out sortUsingSelector:@selector(compare:)];
+    // 内置模板永远排最前，后面才是用户自己截的（按文件名即时间序）
+    [out sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        BOOL ba = TDTplIsBuiltin(a), bb = TDTplIsBuiltin(b);
+        if (ba != bb) return ba ? NSOrderedAscending : NSOrderedDescending;
+        return [a compare:b];
+    }];
     return out;
 }
 
@@ -111,6 +167,8 @@ static UIImage *TDImageToScreenScale(UIImage *img, NSInteger *mode) {
 
 /// tpl_1699880000.png → 尾 6 位，够区分又不占地方
 static NSString *TDTplDisplay(NSString *file) {
+    NSString *nice = TDBuiltinNames()[file];
+    if (nice) return [nice stringByAppendingString:@"（内置）"];
     if (file.length < 4) return file ?: @"";
     NSString *s = [file stringByDeletingPathExtension];
     if ([s hasPrefix:@"tpl_"]) s = [s substringFromIndex:4];
@@ -898,13 +956,9 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
     __weak typeof(self) ws = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         UIImage *tpl = [UIImage imageWithContentsOfFile:TDTplPath(name)];
-        TDMatch *m = tpl ? TDfindImage(tpl, th, 1.0, 1.0, 1) : nil;
         BOOL scaled = NO;
-        // 和回放时一样：原尺度不中就再扫一遍尺度 —— 相册图常常和屏幕像素不是 1:1
-        if (tpl && !m) {
-            m = TDfindImage(tpl, th, 0.85, 1.15, 7);
-            scaled = (m != nil);
-        }
+        // 和回放完全同一条路：记住的尺度 → 原尺度 → 尺度扫描
+        TDMatch *m = tpl ? TDfindImageSmart(tpl, name, th, &scaled) : nil;
         NSString *msg;
         if (!tpl) {
             msg = @"模板文件读不出来";
@@ -1013,6 +1067,7 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
 
 @interface TDTplListVC ()
 - (void)onImport;
+- (void)onResetScale;
 - (void)afterImport:(UIImage *)img;
 - (void)flashSaved:(NSString *)name;
 @end
@@ -1025,9 +1080,24 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
     self.tableView.backgroundColor = ED_BG;
     self.tableView.rowHeight = 62;
     // 模板也可以直接从这里进相册导入，然后框选保存
-    self.navigationItem.rightBarButtonItem =
+    UIBarButtonItem *add =
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd
                                                       target:self action:@selector(onImport)];
+    // 尺度记忆存在 NSUserDefaults 里，换界面/换图标尺寸后要能清掉重来
+    UIBarButtonItem *reset =
+        [[UIBarButtonItem alloc] initWithTitle:@"↺" style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(onResetScale)];
+    self.navigationItem.rightBarButtonItems = @[add, reset];
+}
+
+- (void)onResetScale {
+    for (NSString *n in TDTemplateList()) TDSetScaleHint(n, 0);
+    [self.tableView reloadData];
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"已清掉记住的倍数"
+                                                              message:@"下次识图会从原尺度开始重新找。"
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 - (void)onImport {
@@ -1089,11 +1159,23 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
     c.detailTextLabel.textColor = ED_DIM;
     c.textLabel.text = TDTplDisplay(n);
     UIImage *im = [UIImage imageWithContentsOfFile:TDTplPath(n)];
-    c.detailTextLabel.text = im ? [NSString stringWithFormat:@"%.0f×%.0f px", im.size.width, im.size.height] : @"读不出来";
+    double hint = TDScaleHint(n);
+    NSString *scaleNote = hint > 0.05 ? [NSString stringWithFormat:@" · 识别倍数 %.2f×", hint] : @"";
+    c.detailTextLabel.text = im
+        ? [NSString stringWithFormat:@"%.0f×%.0f px%@", im.size.width, im.size.height, scaleNote]
+        : @"读不出来";
     c.imageView.image = im;
     c.imageView.contentMode = UIViewContentModeScaleAspectFit;
     c.imageView.clipsToBounds = YES;
     return c;
+}
+
+/// 底部说明。两件事要说清：内置模板是「素材图」，尺度和屏幕不一样，
+/// 第一次识图会自动找倍数；以及想让它重找一遍该点哪。
+- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
+    if (TDTemplateList().count == 0) return nil;
+    return @"内置的点赞 / 评论 / 收藏是素材图，像素比屏幕上小，第一次识图会自动找出倍数并记住（显示在上面那行）。"
+            "点右上角「↺」可以清掉记住的倍数，让它重新找一遍。";
 }
 
 - (BOOL)tableView:(UITableView *)tv canEditRowAtIndexPath:(NSIndexPath *)ip { return YES; }
@@ -1102,6 +1184,7 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
  forRowAtIndexPath:(NSIndexPath *)ip {
     if (style != UITableViewCellEditingStyleDelete) return;
     NSString *n = TDTemplateList()[ip.row];
+    if (TDTplIsBuiltin(n)) TDHideBuiltin(n);   // 删了就真删，重启不会再塞回来
     [[NSFileManager defaultManager] removeItemAtPath:TDTplPath(n) error:NULL];
     [tv deleteRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationAutomatic];
 }

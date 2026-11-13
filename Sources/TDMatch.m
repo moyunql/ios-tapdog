@@ -209,3 +209,57 @@ TDMatch *TDfindImage(UIImage *tpl, double threshold, double minScale, double max
     free(sg);
     return nil;
 }
+
+// ---------------------------------------------------------------------------
+// 带尺度策略的识图
+//
+// 为什么需要这一层：模板的像素尺度不一定等于屏幕上的实际尺寸。
+//   · 内置的点赞/评论/收藏是从素材上取的小图（38px 左右），抖音里那个图标将近 100px；
+//   · 从相册导的截图可能被转发压过；
+//   · 截图裁出来的那些才是 1:1。
+// 全范围扫描每次几百毫秒，回放里每步都扫不现实，所以命中一次就把尺度记下来，
+// 下次只在它附近窄扫。界面没变的时候几乎零成本，变了会自动退回全扫描。
+// ---------------------------------------------------------------------------
+
+static NSString *TDScaleHintKey(NSString *name) {
+    return [@"tdScaleHint_" stringByAppendingString:name ?: @""];
+}
+
+double TDScaleHint(NSString *name) {
+    if (name.length == 0) return 0;
+    NSNumber *n = [[NSUserDefaults standardUserDefaults] objectForKey:TDScaleHintKey(name)];
+    return n ? n.doubleValue : 0;
+}
+
+void TDSetScaleHint(NSString *name, double s) {
+    if (name.length == 0 || s <= 0.05) return;
+    [[NSUserDefaults standardUserDefaults] setObject:@(s) forKey:TDScaleHintKey(name)];
+}
+
+TDMatch *TDfindImageSmart(UIImage *tpl, NSString *tplName, double threshold, BOOL *scanned) {
+    if (scanned) *scanned = NO;
+    if (!tpl) return nil;
+
+    // 1. 有记忆尺度：窄扫三档。失败说明画面/图标尺寸变了，落到下面重来
+    double hint = TDScaleHint(tplName);
+    if (hint > 0.05) {
+        TDMatch *m = TDfindImage(tpl, threshold, hint * 0.94, hint * 1.06, 3);
+        if (m) { TDSetScaleHint(tplName, m.scale); return m; }
+    }
+
+    // 2. 原尺度（截屏裁出来的模板走这条，命中率最高也最快）
+    TDMatch *m = TDfindImage(tpl, threshold, 1.0, 1.0, 1);
+    if (m) { TDSetScaleHint(tplName, 1.0); return m; }
+
+    // 3. 尺度扫描。小模板（内置图标 / 相册小图）可能差好几倍，范围放宽到 0.6~3.2
+    BOOL small = MIN(tpl.size.width, tpl.size.height) < 70;
+    double lo = small ? 0.60 : 0.85;
+    double hi = small ? 3.20 : 1.15;
+    int steps = small ? 9 : 7;
+    m = TDfindImage(tpl, threshold, lo, hi, steps);
+    if (m) {
+        TDSetScaleHint(tplName, m.scale);
+        if (scanned) *scanned = YES;
+    }
+    return m;
+}
