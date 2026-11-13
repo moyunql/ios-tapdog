@@ -499,7 +499,7 @@
 // 最后一发也中 → 起作用的是「前面那几发把会话点亮了」。
 typedef struct {
     const char *name;
-    IOHIDFloat  pressure, radius, quality, density;
+    CGFloat     pressure, radius, quality, density;
 } TDPhysCase;
 
 static const TDPhysCase kPhysCases[] = {
