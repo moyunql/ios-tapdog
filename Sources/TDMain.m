@@ -118,6 +118,8 @@ extern UIViewController *TDCreateMainVC(void);
     // 窗口会被 UIKit 藏起来，重新托管一次让 SpringBoard 继续画球
     dispatch_async(dispatch_get_main_queue(), ^{
         TDFloatSetVisible(TDFloatVisible());
+        // 穿透录制的蒙版同理：切到抖音之后它还得盖在上面显示轨迹
+        if (TDMaskVisible()) TDMaskShow();
         TDFloatRefresh();
     });
 }

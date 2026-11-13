@@ -15,7 +15,8 @@
 //   点 ■  = 停止执行 / 停止录制并保存
 //   点 ◎  = 3 秒后往屏幕中间注入一次点击（验证能不能点到别的 App）
 //   长按 ◎ = 3 秒后从下方往上方滑一次（不录制也能验证滑动）
-//   长按 ▶/■ = 开始/停止录制
+//   长按 ▶ = 穿透录制：蒙版不拦触摸，边刷抖音边录（推荐）
+//   长按 ■ = 取点录制：全屏取样，抖音会被挡住，纯标点用
 //   拖动  = 挪位置（位置记在 NSUserDefaults；取点模式下自动禁用，否则会把取点层拖走）
 // ---------------------------------------------------------------------------
 
@@ -146,8 +147,27 @@ static void TDFloatToggleRecord(void) {
             [[NSNotificationCenter defaultCenter] postNotificationName:TDDataChangedNotification object:nil];
             return;
         }
-        TDLog(@"开始录制，去抖音点几下，再点悬浮条停止");
+        TDLog(@"取点录制开始：抖音会被这一层挡住，纯取点用；要边刷边录就用长按 ▶");
     }
+    TDFloatRefresh();
+}
+
+/// 穿透录制：蒙版不接触摸，触摸直通抖音，靠监听抄真实触摸。
+/// 这是「边操作边录」的那个入口 —— 长按 ▶。
+static void TDFloatStartLiveRecord(void) {
+    TDRecorder *r = [TDRecorder shared];
+    TDEngine *e = [TDEngine shared];
+
+    if (r.recording) { TDFloatFinishRecording(); TDFloatRefresh(); return; }
+    if (e.running) [e stop];
+
+    if (![r startLive]) {
+        TDLog(@"穿透录制起不来：%@", [r status]);
+        [[NSNotificationCenter defaultCenter] postNotificationName:TDDataChangedNotification object:nil];
+        TDFloatRefresh();
+        return;
+    }
+    TDLog(@"穿透录制开始：直接在抖音里点/滑，录完点 ■ 或再长按 ▶");
     TDFloatRefresh();
 }
 
@@ -284,7 +304,16 @@ static void TDFloatDoTestSwipe(void) {
 }
 
 - (void)onLong:(UILongPressGestureRecognizer *)g {
-    if (g.state == UIGestureRecognizerStateBegan) TDFloatToggleRecord();
+    if (g.state != UIGestureRecognizerStateBegan) return;
+
+    // 录制中长按任何一个球 = 结束录制（这时屏幕上主要就剩这三个球可点）
+    if ([TDRecorder shared].recording) { TDFloatFinishRecording(); TDFloatRefresh(); return; }
+
+    // ▶ = 穿透录制（边操作边录，推荐）
+    // ■ = 取点录制（全屏取样，抖音会被挡住）
+    NSInteger tag = g.view.tag;
+    if (tag == 1)      TDFloatStartLiveRecord();
+    else if (tag == 2) TDFloatToggleRecord();
 }
 
 - (void)onTestLong:(UILongPressGestureRecognizer *)g {
@@ -564,3 +593,230 @@ void TDFloatSetFullScreen(BOOL on) {
     }
     TDFloatRefresh();
 }
+
+#pragma mark - 穿透录制蒙版
+//
+// 和「取点层」的根本区别：
+//   取点层是把我们的窗口铺满全屏去接触摸 —— 坐标准，但抖音被挡死，
+//   录的时候看不到翻页到底成没成。
+//   这一层 _ignoresHitTest 恒 YES，触摸原样穿到下面的抖音，用户是真的在刷，
+//   我们只是把系统监听抄下来的同一批触摸画成轨迹。
+//
+// 铁律：这一层和它的所有子视图都不能接收触摸。
+// 一旦哪里 userInteractionEnabled 变回 YES，抖音整屏就点不动 —— 之前踩过。
+
+@interface TDMaskWindow : TDHUDWindow
+@end
+
+@implementation TDMaskWindow
+- (BOOL)_ignoresHitTest { return YES; }
+- (BOOL)canBecomeKeyWindow { return NO; }
+@end
+
+@interface TDMaskView : UIView
+@property (nonatomic, strong) NSArray<NSDictionary *> *steps;
+@property (nonatomic, copy) NSString *hint;
+@property (nonatomic) CGPoint livePoint;
+@property (nonatomic) BOOL live;
+@end
+
+@implementation TDMaskView
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    self.backgroundColor = [UIColor clearColor];
+    self.opaque = NO;
+    self.userInteractionEnabled = NO;
+    return self;
+}
+
+- (void)setSteps:(NSArray<NSDictionary *> *)steps {
+    _steps = steps;
+    [self setNeedsDisplay];
+}
+
+- (void)setHint:(NSString *)hint {
+    _hint = [hint copy];
+    [self setNeedsDisplay];
+}
+
+- (void)setLive:(BOOL)live {
+    _live = live;
+    [self setNeedsDisplay];
+}
+
+- (void)setLivePoint:(CGPoint)livePoint {
+    _livePoint = livePoint;
+    if (_live) [self setNeedsDisplay];
+}
+
+- (void)drawDotIn:(CGContextRef)ctx at:(CGPoint)p index:(NSInteger)idx
+            color:(UIColor *)c radius:(CGFloat)r {
+    CGContextSetFillColorWithColor(ctx, [c colorWithAlphaComponent:0.85].CGColor);
+    CGContextFillEllipseInRect(ctx, CGRectMake(p.x - r, p.y - r, r * 2, r * 2));
+    CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithWhite:1 alpha:0.8].CGColor);
+    CGContextSetLineWidth(ctx, 1.2);
+    CGContextStrokeEllipseInRect(ctx, CGRectMake(p.x - r, p.y - r, r * 2, r * 2));
+    if (idx > 0) {
+        NSString *s = [NSString stringWithFormat:@"%ld", (long)idx];
+        UIFont *f = [UIFont boldSystemFontOfSize:11];
+        CGSize sz = [s sizeWithAttributes:@{NSFontAttributeName: f}];
+        [s drawAtPoint:CGPointMake(p.x - sz.width / 2, p.y - sz.height / 2)
+        withAttributes:@{NSFontAttributeName: f, NSForegroundColorAttributeName: UIColor.whiteColor}];
+    }
+}
+
+- (void)drawRect:(CGRect)rect {
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    UIColor *tapC   = [UIColor colorWithRed:0.22 green:0.72 blue:0.36 alpha:1];
+    UIColor *longC  = [UIColor colorWithRed:1.00 green:0.60 blue:0.10 alpha:1];
+    UIColor *swipeC = [UIColor colorWithRed:0.22 green:0.62 blue:1.00 alpha:1];
+
+    // 已录轨迹
+    NSInteger i = 0;
+    for (NSDictionary *d in _steps) {
+        i++;
+        NSString *t = d[@"t"];
+        if ([t isEqualToString:@"swipe"]) {
+            CGPoint a = CGPointMake([d[@"x1"] doubleValue], [d[@"y1"] doubleValue]);
+            CGPoint b = CGPointMake([d[@"x2"] doubleValue], [d[@"y2"] doubleValue]);
+            CGContextSetStrokeColorWithColor(ctx, [swipeC colorWithAlphaComponent:0.85].CGColor);
+            CGContextSetLineWidth(ctx, 3);
+            CGContextSetLineCap(ctx, kCGLineCapRound);
+            CGContextMoveToPoint(ctx, a.x, a.y);
+            CGContextAddLineToPoint(ctx, b.x, b.y);
+            CGContextStrokePath(ctx);
+            [self drawDotIn:ctx at:a index:i color:swipeC radius:9];
+            [self drawDotIn:ctx at:b index:0 color:swipeC radius:6];
+        } else if ([t isEqualToString:@"gesture"]) {
+            NSArray *pts = d[@"pts"];
+            if (pts.count >= 2) {
+                CGContextSetStrokeColorWithColor(ctx, [swipeC colorWithAlphaComponent:0.85].CGColor);
+                CGContextSetLineWidth(ctx, 3);
+                CGContextSetLineCap(ctx, kCGLineCapRound);
+                BOOL first = YES;
+                for (NSArray *pair in pts) {
+                    if (pair.count < 2) continue;
+                    CGPoint p = CGPointMake([pair[0] doubleValue], [pair[1] doubleValue]);
+                    if (first) { CGContextMoveToPoint(ctx, p.x, p.y); first = NO; }
+                    else CGContextAddLineToPoint(ctx, p.x, p.y);
+                }
+                CGContextStrokePath(ctx);
+                NSArray *p0 = pts.firstObject, *p1 = pts.lastObject;
+                if (p0.count >= 2) [self drawDotIn:ctx at:CGPointMake([p0[0] doubleValue], [p0[1] doubleValue])
+                                            index:i color:swipeC radius:9];
+                if (p1.count >= 2) [self drawDotIn:ctx at:CGPointMake([p1[0] doubleValue], [p1[1] doubleValue])
+                                            index:0 color:swipeC radius:6];
+            }
+        } else {
+            CGPoint a = CGPointMake([d[@"x"] doubleValue], [d[@"y"] doubleValue]);
+            [self drawDotIn:ctx at:a index:i
+                     color:([t isEqualToString:@"long"] ? longC : tapC) radius:9];
+        }
+    }
+
+    // 正在滑的那一笔
+    if (_live) {
+        CGContextSetFillColorWithColor(ctx, [UIColor colorWithWhite:1 alpha:0.35].CGColor);
+        CGContextFillEllipseInRect(ctx, CGRectMake(_livePoint.x - 13, _livePoint.y - 13, 26, 26));
+        CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithWhite:1 alpha:0.9].CGColor);
+        CGContextSetLineWidth(ctx, 2);
+        CGContextStrokeEllipseInRect(ctx, CGRectMake(_livePoint.x - 13, _livePoint.y - 13, 26, 26));
+    }
+
+    // 顶部状态胶囊：只写状态，不放按钮 —— 按钮会接收触摸，就穿不过去了
+    NSString *txt = _hint.length ? _hint
+        : [NSString stringWithFormat:@"● 录制中 · %lu 步", (unsigned long)_steps.count];
+    UIFont *bf = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightSemibold];
+    CGSize ts = [txt sizeWithAttributes:@{NSFontAttributeName: bf}];
+    CGFloat padX = 14, bh = 30;
+    CGFloat bw = ts.width + padX * 2;
+    CGFloat safeTop = self.safeAreaInsets.top;
+    if (safeTop <= 0) safeTop = 26;
+    CGRect br = CGRectMake((self.bounds.size.width - bw) / 2, safeTop + 6, bw, bh);
+
+    CGContextSetFillColorWithColor(ctx, [UIColor colorWithWhite:0 alpha:0.62].CGColor);
+    UIBezierPath *bp = [UIBezierPath bezierPathWithRoundedRect:br cornerRadius:bh / 2];
+    [bp fill];
+
+    // 左侧红点表示正在录
+    CGContextSetFillColorWithColor(ctx, [UIColor colorWithRed:1 green:0.25 blue:0.25 alpha:1].CGColor);
+    CGContextFillEllipseInRect(ctx, CGRectMake(br.origin.x + 9, br.origin.y + bh / 2 - 3, 6, 6));
+
+    [txt drawInRect:CGRectMake(br.origin.x + 20, br.origin.y + (bh - ts.height) / 2,
+                               ts.width, ts.height)
+     withAttributes:@{NSFontAttributeName: bf, NSForegroundColorAttributeName: UIColor.whiteColor}];
+}
+
+@end
+
+static TDMaskWindow *gMaskWindow = nil;
+static TDMaskView *gMaskView = nil;
+
+void TDMaskShow(void) {
+    if (gMaskWindow) {
+        gMaskWindow.hidden = NO;
+        TDHUDRegisterWindow(gMaskWindow);
+        return;
+    }
+    CGRect sb = [UIScreen mainScreen].bounds;
+
+    TDMaskWindow *w = [[TDMaskWindow alloc] initWithFrame:sb];
+    w.windowLevel = 10000008.0;          // 比悬浮条低，悬浮条要能点到
+    w.backgroundColor = [UIColor clearColor];
+    w.hidden = YES;
+
+    UIViewController *vc = [UIViewController new];
+    vc.view.backgroundColor = [UIColor clearColor];
+    vc.view.frame = sb;
+    w.rootViewController = vc;
+
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if ([s isKindOfClass:[UIWindowScene class]]) { w.windowScene = (UIWindowScene *)s; break; }
+    }
+
+    TDMaskView *v = [[TDMaskView alloc] initWithFrame:sb];
+    v.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [vc.view addSubview:v];
+
+    gMaskWindow = w;
+    gMaskView = v;
+    w.hidden = NO;
+    TDHUDRegisterWindow(w);
+
+    // 窗口服务器的注册有时候要等几帧
+    for (int i = 1; i <= 6; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * i * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (gMaskWindow && !gMaskWindow.hidden) TDHUDRegisterWindow(gMaskWindow);
+        });
+    }
+}
+
+void TDMaskHide(void) {
+    if (!gMaskWindow) return;
+    gMaskView.steps = nil;
+    gMaskView.live = NO;
+    gMaskWindow.hidden = YES;
+    TDHUDUnregisterWindow(gMaskWindow);
+    gMaskWindow.rootViewController = nil;
+    gMaskWindow = nil;
+    gMaskView = nil;
+}
+
+void TDMaskSetSteps(NSArray<NSDictionary *> *steps) {
+    if (gMaskView) gMaskView.steps = steps;
+}
+
+void TDMaskSetHint(NSString *hint) {
+    if (gMaskView) gMaskView.hint = hint;
+}
+
+void TDMaskSetLive(CGPoint p, BOOL on) {
+    if (!gMaskView) return;
+    gMaskView.livePoint = p;
+    gMaskView.live = on;
+}
+
+BOOL TDMaskVisible(void) { return gMaskWindow && !gMaskWindow.hidden; }

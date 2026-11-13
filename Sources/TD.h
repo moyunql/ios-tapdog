@@ -36,6 +36,20 @@ void TDHIDReplayTap(CGPoint p);
 BOOL TDUseRealEvents(void);
 void TDSetUseRealEvents(BOOL on);
 
+#pragma mark - 真实触摸轨迹（穿透录制的数据源）
+
+/// 开始收集真实触摸轨迹。蒙版不收触摸，用户是在抖音里真操作，我们从监听里抄。
+void TDHIDTraceStart(void);
+void TDHIDTraceStop(void);
+/// 已收集的样本数（含按下与抬起两种状态）
+NSInteger TDHIDTraceCount(void);
+/// 取第 i 个样本。坐标是原始值，量纲由调用方判定
+BOOL TDHIDTraceAt(NSInteger i, CGFloat *x, CGFloat *y, double *t, BOOL *down);
+/// mach_absolute_time 换算成秒（用于算手势时长）
+double TDHIDTraceSeconds(uint64_t t);
+/// 用已学到的真实事件判断坐标量纲：0 归一化 / 1 点 / 2 像素 / -1 未知
+NSInteger TDHIDSampleSpace(void);
+
 #pragma mark - 注入链路诊断
 
 /// 一次性报告：客户端能否建立、HID 服务数、探到的 senderID、
@@ -142,6 +156,8 @@ TDMatch * _Nullable TDfindImage(UIImage *tpl, double threshold, double minScale,
 
 /// 把托管窗口铺满全屏、盖上取点层。返回 NO 表示窗口没准备好
 - (BOOL)start;
+/// 穿透录制：不铺全屏、不拦触摸，靠监听抄真实触摸。边操作抖音边录
+- (BOOL)startLive;
 /// 结束录制，存成新脚本（唯一正常的收尾方式）
 - (void)finishAndSave;
 /// 结束并丢弃
@@ -311,5 +327,16 @@ UIWindow * _Nullable TDFloatWindow(void);
 /// 把托管窗口铺满全屏 / 缩回悬浮条（取点录制用）
 void TDFloatSetFullScreen(BOOL on);
 BOOL TDFloatIsFullScreen(void);
+
+#pragma mark - 穿透录制蒙版
+
+/// 全屏、完全不接触摸的叠加层：触摸原样穿到抖音，只把录到的轨迹画出来。
+/// 它和取点层是两条路：取点层坐标准但挡住抖音，蒙版能边操作边看真实效果。
+void TDMaskShow(void);
+void TDMaskHide(void);
+BOOL TDMaskVisible(void);
+void TDMaskSetSteps(NSArray<NSDictionary *> * _Nullable steps);
+void TDMaskSetHint(NSString * _Nullable hint);
+void TDMaskSetLive(CGPoint p, BOOL on);
 
 NS_ASSUME_NONNULL_END

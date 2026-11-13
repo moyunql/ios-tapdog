@@ -400,12 +400,36 @@ void TDtraceLogClear(void) {
 @end
 
 #pragma mark - 录制器
+//
+// 两种模式：
+//   取点（start）     —— 把窗口铺满全屏，坐在抖音上面接住触摸。
+//                        坐标准、不依赖任何私有接口，但录的时候抖音是死的。
+//   穿透（startLive）  —— 蒙版完全不碰触摸，用户在抖音里真操作，
+//                        我们从 HID 监听里抄同一批触摸。能边刷边录，
+//                        而且录到的就是「抖音真的翻页了」的那一刻。
 
 static TDPickerView *gPicker = nil;
 static NSString *gStatus = @"就绪（全屏取点）";
 
-@interface TDRecorder ()
+#define TD_LIVE_TICK   0.05     // 消费轨迹的节拍
+#define TD_LIVE_MOVE   16.0     // 位移超过它才算「滑」
+#define TD_LIVE_CURVE  14.0     // 偏离起终点连线超过它 → 记成轨迹而不是两点滑动
+
+@interface TDRecorder () {
+    BOOL _live;                             // 当前是不是穿透录制
+    NSInteger _liveCursor;                  // 已经消费到第几个样本
+    NSMutableArray<NSValue *> *_liveTrack;  // 这根手指走过的点（已转屏幕坐标）
+    double _liveStartTs;                    // 按下时刻（秒）
+    CFTimeInterval _liveLastEnd;            // 上一次手势结束的时刻
+    NSInteger _liveSpace;                   // -1 未知 / 0 归一化 / 1 点 / 2 像素
+    NSTimer *_liveTimer;
+    NSMutableArray<NSDictionary *> *_liveSteps;
+}
 @property (nonatomic, readwrite) BOOL recording;
+- (void)liveTick;
+- (void)liveFlush;
+- (void)liveFinishTrackAt:(CGPoint)p time:(double)sec;
+- (NSArray *)liveSampleTrack:(NSArray<NSValue *> *)track to:(CGPoint)end;
 @end
 
 @implementation TDRecorder
@@ -417,9 +441,13 @@ static NSString *gStatus = @"就绪（全屏取点）";
     return r;
 }
 
-- (NSInteger)eventCount { return (NSInteger)gPicker.steps.count; }
-- (NSInteger)rawEventCount { return (NSInteger)gPicker.steps.count; }
+- (NSInteger)eventCount {
+    return _live ? (NSInteger)_liveSteps.count : (NSInteger)gPicker.steps.count;
+}
+- (NSInteger)rawEventCount { return [self eventCount]; }
 - (NSString *)status { return gStatus; }
+
+#pragma mark 取点模式
 
 - (BOOL)start {
     if (self.recording) return YES;
@@ -466,6 +494,7 @@ static NSString *gStatus = @"就绪（全屏取点）";
     [w.rootViewController.view bringSubviewToFront:p];
     gPicker = p;
 
+    _live = NO;
     gStatus = @"取点中（窗口已铺满全屏）";
     self.recording = YES;
     TDTrace("picker: mounted, window=%.0fx%.0f", w.bounds.size.width, w.bounds.size.height);
@@ -473,7 +502,212 @@ static NSString *gStatus = @"就绪（全屏取点）";
     return YES;
 }
 
+#pragma mark 穿透模式
+
+- (BOOL)startLive {
+    if (self.recording) return YES;
+    if ([TDEngine shared].running) [[TDEngine shared] stop];
+
+    // 监听必须先在跑。没学到过真实触摸也能录（轨迹照样抄得到），
+    // 只是量纲要靠第一帧自己猜，所以这里不因为没学到就拒绝启动。
+    if (!TDHIDSampleStart()) {
+        gStatus = @"HID 监听起不来，穿透录制不可用";
+        return NO;
+    }
+
+    TDHIDTraceStart();
+
+    // 录制时人是在抖音里，我们的进程必须在后台继续跑：
+    // 一旦被挂起，HID 监听回调不执行、消费定时器也停，录出来就是空的。
+    [TDKeepAlive ensure];
+
+    _live = YES;
+    _liveCursor = 0;
+    _liveTrack = nil;
+    _liveSteps = [NSMutableArray array];
+    _liveLastEnd = 0;
+    _liveSpace = TDHIDSampleSpace();
+
+    TDMaskShow();
+    TDMaskSetSteps(_liveSteps);
+    TDMaskSetHint(nil);
+    TDMaskSetLive(CGPointZero, NO);
+
+    gStatus = @"穿透录制中（触摸直通抖音）";
+    self.recording = YES;
+    TDTrace("live: start, space=%ld", (long)_liveSpace);
+
+    __weak typeof(self) ws = self;
+    _liveTimer = [NSTimer scheduledTimerWithTimeInterval:TD_LIVE_TICK
+                                                 repeats:YES
+                                                   block:^(NSTimer *t) { [ws liveTick]; }];
+    if (self.onChange) self.onChange();
+    return YES;
+}
+
+- (void)liveTick {
+    if (!_live) return;
+
+    NSInteger total = TDHIDTraceCount();
+    if (total <= _liveCursor) return;
+
+    CGSize scr = [UIScreen mainScreen].bounds.size;
+    CGFloat sc = [UIScreen mainScreen].scale;
+    if (scr.width < 1 || sc < 1) sc = 1;
+
+    for (NSInteger i = _liveCursor; i < total; i++) {
+        CGFloat rx = 0, ry = 0;
+        double ts = 0;
+        BOOL down = NO;
+        if (!TDHIDTraceAt(i, &rx, &ry, &ts, &down)) break;
+
+        if (_liveSpace < 0) {
+            CGFloat m = MAX(rx, ry);
+            if (m > MAX(scr.width, scr.height) + 1) _liveSpace = 2;
+            else if (m > 1.001f) _liveSpace = 1;
+            else _liveSpace = 0;
+        }
+
+        CGFloat x = rx, y = ry;
+        if (_liveSpace == 0)      { x = rx * scr.width;  y = ry * scr.height; }
+        else if (_liveSpace == 2) { x = rx / sc;         y = ry / sc; }
+        x = MAX(0, MIN(scr.width  - 1, x));
+        y = MAX(0, MIN(scr.height - 1, y));
+
+        double sec = TDHIDTraceSeconds((uint64_t)ts);
+
+        if (down) {
+            if (!_liveTrack) {
+                _liveTrack = [NSMutableArray array];
+                _liveStartTs = sec;
+            }
+            [_liveTrack addObject:[NSValue valueWithCGPoint:CGPointMake(x, y)]];
+            TDMaskSetLive(CGPointMake(x, y), YES);
+        } else {
+            [self liveFinishTrackAt:CGPointMake(x, y) time:sec];
+        }
+    }
+    _liveCursor = total;
+}
+
+/// 一根手指离开屏幕：把这段轨迹切成一步
+- (void)liveFinishTrackAt:(CGPoint)p time:(double)sec {
+    if (!_liveTrack.count) return;
+    if (!(sec > _liveStartTs)) sec = _liveStartTs + 0.05;
+    [_liveTrack addObject:[NSValue valueWithCGPoint:p]];
+
+    NSInteger n = (NSInteger)_liveTrack.count;
+    CGPoint a = [_liveTrack[0] CGPointValue];
+
+    // 抬手前手指常常会往回带一点，直接用最后一点会把 400pt 的滑动
+    // 记成 60pt。用「离起点最远的那一点」当终点稳得多。
+    CGFloat maxD = 0;
+    CGPoint far = a;
+    for (NSInteger i = 1; i < n; i++) {
+        CGPoint q = [_liveTrack[i] CGPointValue];
+        CGFloat d = (CGFloat)hypot(q.x - a.x, q.y - a.y);
+        if (d > maxD) { maxD = d; far = q; }
+    }
+
+    double durMs = (sec - _liveStartTs) * 1000.0;
+    if (!(durMs >= 0)) durMs = 0;
+
+    CFTimeInterval now = CACurrentMediaTime();
+    double gap = _liveLastEnd > 0 ? (now - _liveLastEnd) * 1000.0 : 0;
+    gap = MAX(0.0, MIN(60000.0, gap));
+    _liveLastEnd = now;
+
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"gap"] = @((NSInteger)lround(gap));
+
+    if (maxD < TD_LIVE_MOVE) {
+        if (durMs >= 500) {
+            d[@"t"] = @"long";
+            d[@"x"] = @((NSInteger)lround(a.x));
+            d[@"y"] = @((NSInteger)lround(a.y));
+            d[@"ms"] = @((NSInteger)MAX(500.0, durMs));
+        } else {
+            d[@"t"] = @"tap";
+            d[@"x"] = @((NSInteger)lround(a.x));
+            d[@"y"] = @((NSInteger)lround(a.y));
+        }
+    } else {
+        // 弯曲度：所有点到「起点→最远点」这条直线的最大偏离。
+        // 直上直下就存成两点滑动（回放更像人），明显走弧线才存整条轨迹。
+        CGFloat dev = 0;
+        CGFloat dx = far.x - a.x, dy = far.y - a.y;
+        CGFloat len = (CGFloat)hypot(dx, dy);
+        if (len < 1) len = 1;
+        for (NSValue *v in _liveTrack) {
+            CGPoint q = v.CGPointValue;
+            CGFloat c2 = (CGFloat)fabs((dx * (q.y - a.y) - dy * (q.x - a.x)) / len);
+            if (c2 > dev) dev = c2;
+        }
+
+        NSInteger ms = (NSInteger)MAX(TD_SWIPE_MIN_MS, durMs);
+        if (n >= 5 && dev > TD_LIVE_CURVE) {
+            d[@"t"] = @"gesture";
+            d[@"pts"] = [self liveSampleTrack:_liveTrack to:far];
+            d[@"ms"] = @(ms);
+        } else {
+            d[@"t"] = @"swipe";
+            d[@"x1"] = @((NSInteger)lround(a.x));
+            d[@"y1"] = @((NSInteger)lround(a.y));
+            d[@"x2"] = @((NSInteger)lround(far.x));
+            d[@"y2"] = @((NSInteger)lround(far.y));
+            d[@"ms"] = @(ms);
+        }
+    }
+
+    TDTrace("live step %s (%.0f,%.0f)→(%.0f,%.0f) dur=%.0f",
+            [d[@"t"] UTF8String], a.x, a.y, far.x, far.y, durMs);
+
+    [_liveSteps addObject:d];
+    _liveTrack = nil;
+
+    TDMaskSetSteps(_liveSteps);
+    TDMaskSetLive(CGPointZero, NO);
+    if (self.onChange) self.onChange();
+}
+
+/// 轨迹抽样成最多 12 个点，保留形状又不让脚本膨胀
+- (NSArray *)liveSampleTrack:(NSArray<NSValue *> *)track to:(CGPoint)end {
+    NSInteger n = (NSInteger)track.count;
+    NSInteger want = MIN(12, n);
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSInteger i = 0; i < want; i++) {
+        NSInteger idx = (want <= 1) ? 0 : (NSInteger)llround((double)i * (n - 1) / (want - 1));
+        if (idx >= n) idx = n - 1;
+        CGPoint p = [track[idx] CGPointValue];
+        [out addObject:@[@((NSInteger)lround(p.x)), @((NSInteger)lround(p.y))]];
+    }
+    if (out.count) {
+        out[out.count - 1] = @[@((NSInteger)lround(end.x)), @((NSInteger)lround(end.y))];
+    }
+    return out;
+}
+
+/// 收尾：把还没抬手的这一笔也结算掉（否则点停止时最后一滑会丢）
+- (void)liveFlush {
+    [self liveTick];
+    if (_liveTrack.count) {
+        CGPoint last = [_liveTrack.lastObject CGPointValue];
+        [self liveFinishTrackAt:last time:_liveStartTs + 0.2];
+    }
+}
+
+#pragma mark 收尾
+
 - (void)teardown {
+    if (_liveTimer) { [_liveTimer invalidate]; _liveTimer = nil; }
+
+    if (_live) {
+        TDHIDTraceStop();
+        TDMaskHide();
+        _live = NO;
+        _liveTrack = nil;
+    }
+
     self.recording = NO;
     TDPickerView *p = gPicker;
     gPicker = nil;
@@ -487,14 +721,24 @@ static NSString *gStatus = @"就绪（全屏取点）";
 - (void)cancel {
     if (!self.recording) return;
     [self teardown];
+    _liveSteps = nil;
     TDLog(@"已取消录制，没有保存");
     [[NSNotificationCenter defaultCenter] postNotificationName:TDDataChangedNotification object:nil];
 }
 
 - (void)finishAndSave {
     if (!self.recording) return;
-    NSMutableArray<NSDictionary *> *steps = [gPicker.steps mutableCopy] ?: [NSMutableArray array];
+
+    if (_live) [self liveFlush];
+
+    NSMutableArray<NSDictionary *> *steps = nil;
+    if (_live) {
+        steps = [_liveSteps mutableCopy] ?: [NSMutableArray array];
+    } else {
+        steps = [gPicker.steps mutableCopy] ?: [NSMutableArray array];
+    }
     [self teardown];
+    _liveSteps = nil;
 
     TDScript *s = [[TDScriptStore shared] createScript];
     if (steps.count) s.steps = steps;
@@ -507,9 +751,16 @@ static NSString *gStatus = @"就绪（全屏取点）";
 
 - (NSMutableArray<NSDictionary *> *)stop {
     if (!self.recording) return nil;
-    NSMutableArray *steps = [gPicker.steps mutableCopy] ?: [NSMutableArray array];
+    if (_live) [self liveFlush];
+
+    NSMutableArray *steps = nil;
+    if (_live) steps = [_liveSteps mutableCopy] ?: [NSMutableArray array];
+    else steps = [gPicker.steps mutableCopy] ?: [NSMutableArray array];
+
     [self teardown];
+    _liveSteps = nil;
     return steps;
 }
 
 @end
+

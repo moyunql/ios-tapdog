@@ -696,7 +696,62 @@ static IOHIDEventRef TDFingerOf(IOHIDEventRef hand) {
     return NULL;
 }
 
-// 纯 C：不碰 ObjC、不动 UIKit
+// ---------------------------------------------------------------------------
+// 真实触摸轨迹录制（「穿透录制」的数据源）
+//
+// 为什么要这条：之前录制靠「把自己的窗口铺满全屏去接触摸」，好处是坐标准，
+// 坏处是抖音被我们挡死、录的时候看不见真实的翻页效果。
+//
+// 现在换一条：蒙版窗口 _ignoresHitTest 恒 YES，触摸全穿透到抖音，
+// 用户在抖音里真操作，我们从 HID 监听里把同一批触摸抄下来。
+//
+// 线程：回调是 ScheduleWithRunLoop(main) 驱动的，和 UI 定时器同一条线程，
+// 所以下面的缓冲不需要锁 —— 写只发生在回调里，读只发生在定时器里。
+//
+// 坐标：原样存。量纲（归一化/点/像素）由读端按「出现过的最大值」判断，
+// 和 TDHIDSampleGeometry 用的是同一套规则。
+// ---------------------------------------------------------------------------
+
+#define TD_TR_MAX 8192
+
+typedef struct {
+    float    x, y;      // 原始值，量纲未定
+    uint64_t ts;        // mach_absolute_time
+    uint8_t  down;      // 1 = 手指在屏上，0 = 抬起
+} TDTrSample;
+
+static TDTrSample gTr[TD_TR_MAX];
+static volatile int32_t gTrN = 0;
+static volatile int32_t gTrOn = 0;
+
+void TDHIDTraceStart(void) { gTrN = 0; gTrOn = 1; }
+
+void TDHIDTraceStop(void) { gTrOn = 0; }
+
+NSInteger TDHIDTraceCount(void) { return (NSInteger)gTrN; }
+
+BOOL TDHIDTraceAt(NSInteger i, CGFloat *x, CGFloat *y, double *t, BOOL *down) {
+    if (i < 0 || i >= (NSInteger)gTrN) return NO;
+    TDTrSample s = gTr[i];
+    if (x)    *x = (CGFloat)s.x;
+    if (y)    *y = (CGFloat)s.y;
+    if (t)    *t = (double)s.ts;
+    if (down) *down = (s.down != 0);
+    return YES;
+}
+
+/// mach_absolute_time 的单换算成秒
+double TDHIDTraceSeconds(uint64_t t) {
+    static double k = 0;
+    if (k == 0) {
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        k = (double)tb.numer / (double)tb.denom / 1e9;
+    }
+    return (double)t * k;
+}
+
+/// 纯 C：不碰 ObjC、不动 UIKit
 static void TDSampleHandler(void *target, void *refcon, IOHIDEventQueueRef q, IOHIDEventRef e) {
     if (!e) return;
     if (IOHIDEventGetType(e) != kIOHIDEventTypeDigitizer) return;
@@ -719,7 +774,25 @@ static void TDSampleHandler(void *target, void *refcon, IOHIDEventQueueRef q, IO
     }
     gSampleSender = IOHIDEventGetSenderID(e);
     TDSampleUnlock();
+
+    // 轨迹录制：手指停着不动时 120Hz 也在刷同样的坐标，全存下来几秒就灌满 8192，
+    // 所以位置和接触状态都没变就跳过（抬手那一下状态一定变，不会被跳掉）。
+    if (!gTrOn) return;
+    float tx = (float)IOHIDEventGetFloatValue(finger, kIOHIDEventFieldDigitizerX);
+    float ty = (float)IOHIDEventGetFloatValue(finger, kIOHIDEventFieldDigitizerY);
+    int i = gTrN;
+    if (i > 0) {
+        TDTrSample prev = gTr[i - 1];
+        if (prev.x == tx && prev.y == ty && prev.down == (touching ? 1 : 0)) return;
+    }
+    if (i >= TD_TR_MAX) return;
+    gTr[i].x = tx;
+    gTr[i].y = ty;
+    gTr[i].ts = IOHIDEventGetTimeStamp(e);
+    gTr[i].down = touching ? 1 : 0;
+    gTrN = i + 1;
 }
+
 
 BOOL TDHIDSampleStart(void) {
     if (gMon) return YES;
@@ -753,6 +826,24 @@ BOOL TDHIDSampleHasUp(void) {
 }
 
 uint64_t TDHIDSampleSenderID(void) { return gSampleSender; }
+
+NSInteger TDHIDSampleSpace(void) {
+    TDSampleLock();
+    IOHIDEventRef down = gSampleDown ? (IOHIDEventRef)CFRetain(gSampleDown) : NULL;
+    TDSampleUnlock();
+    if (!down) return -1;
+    IOHIDEventRef f = TDFingerOf(down);
+    IOHIDFloat fx = f ? IOHIDEventGetFloatValue(f, kIOHIDEventFieldDigitizerX) : 0;
+    IOHIDFloat fy = f ? IOHIDEventGetFloatValue(f, kIOHIDEventFieldDigitizerY) : 0;
+    CFRelease(down);
+    if (fx == 0 && fy == 0) return -1;
+
+    CGSize scr = TDMainPointSize();
+    CGFloat m = MAX((CGFloat)fx, (CGFloat)fy);
+    if (m <= 1.001f) return 0;                                   // 归一化
+    if (m <= MAX(scr.width, scr.height) + 1) return 1;           // 点
+    return 2;                                                    // 像素
+}
 
 /// 把存档的真实事件复制一份，换掉坐标和时间戳再发出去
 static void TDReplayOne(IOHIDEventRef tmpl, CGFloat x, CGFloat y, BOOL down) {

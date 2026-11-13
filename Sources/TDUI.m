@@ -1617,7 +1617,7 @@ static NSString *TDCalibModeName(NSInteger m) {
     _countdown.text = @"3";
     _countdown.textColor = _pendingRecord ? TD_RED : TD_GREEN;
     UILabel *hint = [_mask viewWithTag:99];
-    hint.text = _pendingRecord ? @"切到抖音 · 倒计时结束后出现取点面板"
+    hint.text = _pendingRecord ? @"切到抖音 · 倒计时结束后开始录，直接操作就好"
                                : @"现在切到抖音，马上开始回放";
     _mask.hidden = NO;
     [self.view bringSubviewToFront:_mask];
@@ -1641,11 +1641,13 @@ static NSString *TDCalibModeName(NSInteger m) {
 - (void)fire {
     if (_pendingRecord) {
         TDRecorder *r = [TDRecorder shared];
-        if (!r.recording && ![r start]) {
-            TDLog(@"取点层启动失败：%@", [r status]);
+        // 走穿透模式：蒙版不拦触摸，用户在抖音里真操作，边刷边录。
+        // 以前那套「全屏取点」抖音会被挡住，看不到翻页成没成。
+        if (!r.recording && ![r startLive]) {
+            TDLog(@"穿透录制启动失败：%@", [r status]);
             return;
         }
-        TDLog(@"取点中：切到抖音，点要执行的位置，最后点面板上的「完成」");
+        TDLog(@"录制中：直接在抖音里点/滑，蒙版只画轨迹不挡触摸；回来点停止保存");
         [self startLiveCounter];
     } else {
         TDScript *s = [[TDScriptStore shared] selectedScript];
@@ -1665,7 +1667,7 @@ static NSString *TDCalibModeName(NSInteger m) {
         if (!ss) { [tm invalidate]; return; }
         TDRecorder *r = [TDRecorder shared];
         if (!r.recording) { [ss stopLiveCounter]; return; }
-        ss->_log.text = [NSString stringWithFormat:@"取点中 · 已记录 %ld 步（面板上点「完成」保存）",
+        ss->_log.text = [NSString stringWithFormat:@"录制中 · 已记录 %ld 步（回 App 点「停止录制」保存）",
                          (long)r.eventCount];
     }];
 }

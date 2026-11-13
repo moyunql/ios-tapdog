@@ -27,7 +27,8 @@ static NSString *TDScriptsPath(void) {
     for (NSDictionary *s in _steps) {
         total += [s[@"gap"] doubleValue] / 1000.0;
         NSString *t = s[@"t"];
-        if ([t isEqualToString:@"wait"] || [t isEqualToString:@"long"] || [t isEqualToString:@"swipe"]) {
+        if ([t isEqualToString:@"wait"] || [t isEqualToString:@"long"] ||
+            [t isEqualToString:@"swipe"] || [t isEqualToString:@"gesture"]) {
             total += [s[@"ms"] doubleValue] / 1000.0;
         } else {
             total += 0.08;
@@ -43,6 +44,7 @@ static NSString *TDScriptsPath(void) {
         if ([t isEqualToString:@"tap"]) tap++;
         else if ([t isEqualToString:@"swipe"]) swp++;
         else if ([t isEqualToString:@"long"]) lng++;
+        else if ([t isEqualToString:@"gesture"]) swp++;
     }
     NSInteger secs = (NSInteger)llround([self duration]);
     return [NSString stringWithFormat:@"%lu 步 · 点%ld 滑%ld 长%ld · %ld:%02ld",
@@ -69,6 +71,16 @@ static NSString *TDScriptsPath(void) {
     if ([t isEqualToString:@"swipe"]) return [NSString stringWithFormat:@"滑动 (%.0f,%.0f)→(%.0f,%.0f) %.0fms",
                                               [st[@"x1"] doubleValue], [st[@"y1"] doubleValue],
                                               [st[@"x2"] doubleValue], [st[@"y2"] doubleValue], [st[@"ms"] doubleValue]];
+    if ([t isEqualToString:@"gesture"]) {
+        NSArray *pts = st[@"pts"];
+        NSArray *p0 = pts.count ? pts.firstObject : nil;
+        NSArray *p1 = pts.count ? pts.lastObject : nil;
+        return [NSString stringWithFormat:@"轨迹 %lu 点 (%.0f,%.0f)→(%.0f,%.0f) %.0fms",
+                (unsigned long)pts.count,
+                p0.count >= 2 ? [p0[0] doubleValue] : 0, p0.count >= 2 ? [p0[1] doubleValue] : 0,
+                p1.count >= 2 ? [p1[0] doubleValue] : 0, p1.count >= 2 ? [p1[1] doubleValue] : 0,
+                [st[@"ms"] doubleValue]];
+    }
     if ([t isEqualToString:@"wait"])  return [NSString stringWithFormat:@"等待 %.0fms", [st[@"ms"] doubleValue]];
     if ([t isEqualToString:@"find"])  return [NSString stringWithFormat:@"识图 %@ ≥%.2f", st[@"tpl"], [st[@"th"] doubleValue]];
     return t ?: @"?";
