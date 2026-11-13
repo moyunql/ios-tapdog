@@ -140,7 +140,7 @@
     self.title = @"诊断";
     self.view.backgroundColor = TD_BG;
 
-    _titles = @[@"触摸注入", @"截屏", @"悬浮球托管", @"录制（触摸监听）",
+    _titles = @[@"触摸注入", @"截屏", @"悬浮球托管", @"录制（全屏取点）",
                 @"后台保活", @"沙盒 / 权限", @"点击偏移 / 循环",
                 @"注入自检（点得动吗）", @"崩溃日志"];
 
@@ -163,8 +163,7 @@
     _values = [@[ TDhidStatus(),
                   TDcaptureStatus(),
                   TDHUDStatus(),
-                  [NSString stringWithFormat:@"%@ · 事件 %ld",
-                   [[TDRecorder shared] status], (long)[TDRecorder shared].rawEventCount],
+                  [NSString stringWithFormat:@"%@", [[TDRecorder shared] status]],
                   [NSString stringWithFormat:@"%@ · %@", [TDKeepAlive status],
                    [TDEngine shared].jetsamStatus ?: @"jetsam 未设置"],
                   TDSandboxStatus(),
@@ -425,14 +424,7 @@
         [self finishRecording];
         return;
     }
-    if (![r start]) {
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"录制用不了"
-                                                                  message:[r status]
-                                                           preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]];
-        [self presentViewController:a animated:YES completion:nil];
-        return;
-    }
+    // 录制要等倒计时结束才开始，否则倒计时这段时间的操作会被录进去
     _pendingRecord = YES;
     [self startCountdown];
 }
@@ -467,7 +459,8 @@
     _countdown.text = @"3";
     _countdown.textColor = _pendingRecord ? TD_RED : TD_GREEN;
     UILabel *hint = [_mask viewWithTag:99];
-    hint.text = _pendingRecord ? @"现在切到抖音，开始后随手点几下" : @"现在切到抖音，马上开始回放";
+    hint.text = _pendingRecord ? @"切到抖音 · 倒计时结束后出现取点面板"
+                               : @"现在切到抖音，马上开始回放";
     _mask.hidden = NO;
     [self.view bringSubviewToFront:_mask];
 
@@ -489,11 +482,12 @@
 
 - (void)fire {
     if (_pendingRecord) {
-        if (![TDRecorder shared].recording && ![TDRecorder shared].start) {
-            TDLog(@"录制启动失败：%@", [[TDRecorder shared] status]);
+        TDRecorder *r = [TDRecorder shared];
+        if (!r.recording && ![r start]) {
+            TDLog(@"取点层启动失败：%@", [r status]);
             return;
         }
-        TDLog(@"录制中…在抖音里点几下，回 App 或点悬浮条停止");
+        TDLog(@"取点中：切到抖音，点要执行的位置，最后点面板上的「完成」");
         [self startLiveCounter];
     } else {
         TDScript *s = [[TDScriptStore shared] selectedScript];
@@ -504,7 +498,7 @@
     TDFloatRefresh();
 }
 
-/// 录制时实时显示「系统投递了多少个事件 / 采到了多少」——用来判断监听到底通没通
+/// 取点时实时显示已经录了几步
 - (void)startLiveCounter {
     [self stopLiveCounter];
     __weak typeof(self) ws = self;
@@ -513,14 +507,8 @@
         if (!ss) { [tm invalidate]; return; }
         TDRecorder *r = [TDRecorder shared];
         if (!r.recording) { [ss stopLiveCounter]; return; }
-        NSInteger raw = r.rawEventCount;
-        NSInteger got = r.eventCount;
-        if (raw == 0) {
-            ss->_log.text = @"录制中 · 还没收到触摸：切到抖音点几下，再回来看";
-        } else {
-            ss->_log.text = [NSString stringWithFormat:@"录制中 · 系统事件 %ld · 采样 %ld",
-                             (long)raw, (long)got];
-        }
+        ss->_log.text = [NSString stringWithFormat:@"取点中 · 已记录 %ld 步（面板上点「完成」保存）",
+                         (long)r.eventCount];
     }];
 }
 
@@ -532,22 +520,9 @@
     [self stopLiveCounter];
     TDRecorder *r = [TDRecorder shared];
     if (!r.recording) return;
-    NSInteger raw = r.rawEventCount;
-    NSMutableArray *events = [r stop];
-    TDScript *s = [[TDScriptStore shared] createScript];
-    if (events.count) s.steps = events;
-    [[TDScriptStore shared] save];
-    TDLog(@"录制结束：%@（%lu 步，系统事件 %ld）", s.name, (unsigned long)s.steps.count, (long)raw);
-    if (events.count == 0) {
-        UIAlertController *a = [UIAlertController
-            alertControllerWithTitle:(raw == 0 ? @"一个触摸都没收到" : @"收到了，但没识别成点击")
-                             message:(raw == 0
-                                      ? @"系统没把触摸事件投给 TapDog。可能是录制期间 App 被挂起了，或者监听客户端没连上。先把诊断页第 4 行的内容发我。"
-                                      : @"事件收到了，但都被过滤掉了。把诊断页第 4 行发我，我调整过滤规则。")
-                      preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
-        [self presentViewController:a animated:YES completion:nil];
-    }
+    NSInteger n = r.eventCount;
+    [r finishAndSave];
+    TDLog(@"录制结束：%ld 步", (long)n);
     [_tv reloadData];
     [self refreshButtons];
     TDFloatRefresh();

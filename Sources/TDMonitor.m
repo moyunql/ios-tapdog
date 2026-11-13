@@ -1,86 +1,44 @@
 #import "TD.h"
-#import "IOHIDEvent.h"
-#import "IOHIDEventTypes.h"
-#import "IOHIDEventSystemClient.h"
-#import <dlfcn.h>
-#import <os/lock.h>
-#include <mach/mach_time.h>
-#include <math.h>
-#include <string.h>
+#import <QuartzCore/QuartzCore.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <math.h>
 
 // ===========================================================================
-// 录制：系统级触摸监听（display integrated digitizer）
+// 录制：全屏取点层（不碰任何私有 HID 监听接口）
 //
-// 历史坑位，逐条记着：
-//  1) RegisterEventCallback 的回调是 4 个参数：
-//     void (*)(void *target, void *refcon, IOHIDEventQueueRef queue, IOHIDEventRef event)
-//     少写一个参数 = 把 queue 当 event 读 = 一点录制就 EXC_BAD_ACCESS。
-//  2) 回调跑在 HID 的事件线程，里面绝不能发 ObjC 消息 / 读 UIScreen / 改容器。
-//     这里只做纯 C 提取 + 加锁写定长数组，解析留给主线程。
-//  3) 不要用 kIOHIDEventFieldDigitizerIsDisplayIntegrated 做硬过滤。
-//     这个字段在 hand 父事件上有、在 finger 子事件上经常读不到 0；
-//     一旦按它过滤，就变成「一个都收不到」——之前「录不到点击」就是这个。
-//     现在不过滤，只记录，谁上报就用谁。
+// 为什么放弃系统级触摸监听：
+//   IOHIDEventSystemClientRegisterEventCallback 的回调原型在不同系统上
+//   参数个数不一致，一旦对不上就是 EXC_BAD_ACCESS，且崩在 IOKit 内部，
+//   进程里根本拦不住。三轮实测（v1.1.3 点录制就崩、v1.1.4/1.1.5 倒计时后崩）
+//   全部落在这个回调里，代价太高，这条路直接弃用。
 //
-// 权限：com.apple.private.hid.client.event-monitor / event-filter
+// 现在怎么做：
+//   把我们自己的托管窗口（平时是 128×70 的悬浮条）临时铺满全屏，
+//   盖一层几乎透明的手势收集层，直接在上面点/滑。
+//   这一层在窗口服务器里就是「我们的窗口」，触摸必然投递到本进程，
+//   坐标就是屏幕坐标，跟抖音的实际坐标 1:1，不存在点偏。
+//   录完把窗口缩回悬浮条，抖音恢复正常。
+//
+// 代价：录制时抖音自己不响应（触摸被这层接住了），这是取点模式的常态。
 // ===========================================================================
 
-#define TD_SAMPLE_MAX 6144
+#pragma mark - 轻量轨迹日志（排障用）
 
-typedef struct {
-    uint64_t t;        // mach_absolute_time
-    double   x, y;     // 原始上报坐标（可能为点，也可能是像素）
-    uint8_t  touching;
-} TDSample;
-
-static TDSample gSamples[TD_SAMPLE_MAX];
-static volatile int gSampleCount = 0;
-static volatile int gArmed = 0;
-static os_unfair_lock gSampleLock = OS_UNFAIR_LOCK_INIT;
-
-// 诊断计数（回调里自增，主线程只读）
-static volatile int32_t gRawEvents = 0;      // 收到的 digitizer 事件数
-static volatile int32_t gPushedEvents = 0;   // 真正存下来的样本数
-
-typedef IOHIDEventSystemClientRef (*TDCreateWithTypeFn)(CFAllocatorRef, uint32_t, CFDictionaryRef);
-
-// !! 4 个参数，第 3 个是 IOHIDEventQueueRef !!
-typedef void (*TDEventCallback)(void *target, void *refcon, void *queue, IOHIDEventRef event);
-// 老 filter 接口是 3 个参数，且必须把 event 原样返回
-typedef IOHIDEventRef (*TDFilterCallback)(void *target, void *refcon, IOHIDEventRef event);
-
-typedef void (*TDRegisterEventFn)(IOHIDEventSystemClientRef, TDEventCallback, void *, void *);
-typedef void (*TDRegisterFilterFn)(IOHIDEventSystemClientRef, TDFilterCallback, void *, void *);
-typedef void (*TDScheduleFn)(IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef);
-
-static IOHIDEventSystemClientRef gClient = NULL;
-static IOHIDEventSystemClientRef gFilterClient = NULL;   // 备用通道
-static NSString *gStatus = @"未启动";
-static NSString *gApi = nil;
-
-static double TDmsBetween(uint64_t a, uint64_t b) {
-    static mach_timebase_info_data_t tb;
-    if (tb.denom == 0) mach_timebase_info(&tb);
-    if (a <= b) return 0;
-    return (double)(a - b) * (double)tb.numer / (double)tb.denom / 1000000.0;
-}
-
-// ---------------------------------------------------------------------------
-// HID 线程：只允许纯 C 操作
-// ---------------------------------------------------------------------------
-
-static int  gFingerDown = 0;      // 回调线程私有的按下状态
-static double gLastPushedX = -1e9, gLastPushedY = -1e9;
-static int  gTraceFirst = 0;
-
-// 崩溃定位用的轻量 trace：回调线程里不能发 ObjC 消息，
-// 所以路径在 start 时（主线程）就准备好，这里只做 fopen/fprintf。
 static char gTracePath[1024] = {0};
 
+static void TDTraceInit(void) {
+    if (gTracePath[0] != 0) return;
+    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                        NSUserDomainMask, YES) firstObject];
+    NSString *p = [dir stringByAppendingPathComponent:@"trace.log"];
+    snprintf(gTracePath, sizeof(gTracePath), "%s", p.fileSystemRepresentation);
+}
+
+/// 只在主线程调用
 static void TDTrace(const char *fmt, ...) {
+    TDTraceInit();
     if (gTracePath[0] == 0) return;
     FILE *fp = fopen(gTracePath, "a");
     if (!fp) return;
@@ -92,82 +50,324 @@ static void TDTrace(const char *fmt, ...) {
     fclose(fp);
 }
 
-static void TDPushSample(double x, double y, int touching) {
-    os_unfair_lock_lock(&gSampleLock);
-    if (gSampleCount < TD_SAMPLE_MAX) {
-        TDSample *s = &gSamples[gSampleCount];
-        s->t = mach_absolute_time();
-        s->x = x;
-        s->y = y;
-        s->touching = (uint8_t)(touching ? 1 : 0);
-        gSampleCount = gSampleCount + 1;
-        __sync_fetch_and_add(&gPushedEvents, 1);
-    }
-    os_unfair_lock_unlock(&gSampleLock);
+NSString *TDtraceLogText(void) {
+    TDTraceInit();
+    NSString *path = gTracePath[0] ? [NSString stringWithUTF8String:gTracePath] : nil;
+    if (!path) return @"";
+    NSString *s = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:NULL];
+    return s ?: @"";
 }
 
-static void TDHandleRawEvent(IOHIDEventRef event) {
-    if (!gArmed || !event) return;
-    IOHIDEventType t = IOHIDEventGetType(event);
-    if (!gTraceFirst) { gTraceFirst = 1; TDTrace("回调首次触发 type=%d", (int)t); }
-    if (t != kIOHIDEventTypeDigitizer) return;
+void TDtraceLogClear(void) {
+    TDTraceInit();
+    if (gTracePath[0] != 0) unlink(gTracePath);
+}
 
-    __sync_fetch_and_add(&gRawEvents, 1);
+#pragma mark - 取点层
 
-    CFArrayRef kids = IOHIDEventGetChildren(event);
-    CFIndex n = 0;
-    if (kids && CFGetTypeID(kids) == CFArrayGetTypeID()) n = CFArrayGetCount(kids);
-    if (gTraceFirst == 1) { gTraceFirst = 2; TDTrace("首次 digitizer 事件 kids=%d", (int)n); }
+#define TD_MARK_R 14.0
+#define TD_MOVE_THRESHOLD 12.0
 
-    if (n > 0) {
-        // 只取第一根手指；多指手势不支持
-        CFTypeRef c0 = CFArrayGetValueAtIndex(kids, 0);
-        if (!c0 || CFGetTypeID(c0) != IOHIDEventGetTypeID()) return;
+@interface TDPickerView : UIView
+@property (nonatomic, strong) NSMutableArray<NSDictionary *> *steps;
+@property (nonatomic, copy) void (^onStepsChanged)(void);
+@property (nonatomic, copy) void (^onFinish)(void);
+@property (nonatomic, copy) void (^onCancel)(void);
+- (void)undo;
+@end
 
-        IOHIDEventRef f = (IOHIDEventRef)c0;
-        int touching = (int)IOHIDEventGetIntegerValue(f, kIOHIDEventFieldDigitizerTouch);
-        if (!touching) {
-            // 子事件明确说没接触，但 collection 里还有它 —— 当作抬起处理
-            if (!gFingerDown) return;
-            gFingerDown = 0;
-            TDPushSample(0, 0, 0);
-            gLastPushedX = -1e9;
-            return;
+/// 私有方法先声明，避免「方法定义在使用之后」的编译告警
+@interface TDPickerView ()
+- (UIButton *)buttonWithTitle:(NSString *)t color:(UIColor *)c sel:(SEL)sel;
+- (void)updateTitle;
+- (void)onUndo;
+- (void)onDone;
+- (void)onCancelTap;
+- (void)commitWithDuration:(double)durMs;
+- (void)drawDot:(CGPoint)p index:(NSInteger)idx color:(UIColor *)color;
+@end
+
+@implementation TDPickerView {
+    UIView *_panel;
+    UILabel *_title;
+    UILabel *_hint;
+    UIButton *_undoBtn;
+    UIButton *_doneBtn;
+    UIButton *_cancelBtn;
+
+    BOOL _active;
+    BOOL _moved;
+    BOOL _live;
+    CGPoint _startP;
+    CGPoint _lastP;
+    CGPoint _curP;
+    CFTimeInterval _startT;
+    CFTimeInterval _lastEndT;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.10];
+    self.multipleTouchEnabled = NO;
+    self.opaque = NO;
+    self.clipsToBounds = YES;
+
+    _panel = [[UIView alloc] initWithFrame:CGRectZero];
+    _panel.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.94];
+    _panel.layer.cornerRadius = 14;
+    _panel.layer.borderWidth = 1;
+    _panel.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
+    [self addSubview:_panel];
+
+    _title = [[UILabel alloc] initWithFrame:CGRectZero];
+    _title.textColor = [UIColor whiteColor];
+    _title.font = [UIFont boldSystemFontOfSize:14];
+    [_panel addSubview:_title];
+
+    _hint = [[UILabel alloc] initWithFrame:CGRectZero];
+    _hint.textColor = [UIColor colorWithWhite:1 alpha:0.66];
+    _hint.font = [UIFont systemFontOfSize:11];
+    _hint.numberOfLines = 2;
+    _hint.text = @"在要点的位置点一下 · 按住不动=长按 · 滑动=滑动";
+    [_panel addSubview:_hint];
+
+    _undoBtn = [self buttonWithTitle:@"撤销" color:[UIColor colorWithWhite:0.30 alpha:1] sel:@selector(onUndo)];
+    _doneBtn = [self buttonWithTitle:@"完成" color:[UIColor colorWithRed:0.18 green:0.66 blue:0.32 alpha:1] sel:@selector(onDone)];
+    _cancelBtn = [self buttonWithTitle:@"取消" color:[UIColor colorWithRed:0.78 green:0.22 blue:0.22 alpha:1] sel:@selector(onCancelTap)];
+    [_panel addSubview:_undoBtn];
+    [_panel addSubview:_doneBtn];
+    [_panel addSubview:_cancelBtn];
+
+    [self updateTitle];
+    return self;
+}
+
+- (UIButton *)buttonWithTitle:(NSString *)t color:(UIColor *)c sel:(SEL)sel {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    [b setTitle:t forState:UIControlStateNormal];
+    [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    b.backgroundColor = c;
+    b.layer.cornerRadius = 9;
+    [b addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat w = self.bounds.size.width;
+    UIEdgeInsets safe = self.safeAreaInsets;
+    CGFloat top = safe.top > 0 ? safe.top : 26;
+    CGFloat pw = w - 20;
+    _panel.frame = CGRectMake(10, top + 6, pw, 104);
+    _title.frame = CGRectMake(12, 10, pw - 24, 18);
+    _hint.frame = CGRectMake(12, 30, pw - 24, 30);
+
+    CGFloat by = 64, bh = 34, gap = 8;
+    CGFloat ubw = 62, cbw = 62;
+    _undoBtn.frame = CGRectMake(12, by, ubw, bh);
+    _cancelBtn.frame = CGRectMake(pw - 12 - cbw, by, cbw, bh);
+    _doneBtn.frame = CGRectMake(12 + ubw + gap, by,
+                                pw - 24 - ubw - cbw - gap * 2, bh);
+}
+
+- (void)updateTitle {
+    _title.text = [NSString stringWithFormat:@"取点中 · 已记录 %lu 步",
+                   (unsigned long)self.steps.count];
+    _undoBtn.alpha = self.steps.count ? 1 : 0.4;
+}
+
+- (void)onUndo {
+    [self undo];
+}
+
+- (void)onDone {
+    TDTrace("picker done, steps=%lu", (unsigned long)self.steps.count);
+    if (self.onFinish) self.onFinish();
+}
+
+- (void)onCancelTap {
+    TDTrace("picker cancel");
+    if (self.onCancel) self.onCancel();
+}
+
+- (void)undo {
+    if (self.steps.count == 0) return;
+    [self.steps removeLastObject];
+    _lastEndT = 0;
+    [self updateTitle];
+    [self setNeedsDisplay];
+    if (self.onStepsChanged) self.onStepsChanged();
+}
+
+#pragma mark 触摸
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (_active) return;
+    UITouch *t = touches.anyObject;
+    if (!t) return;
+
+    _active = YES;
+    _moved = NO;
+    _live = YES;
+    _startP = [t locationInView:self];
+    _curP = _startP;
+    _lastP = _startP;
+    _startT = CACurrentMediaTime();
+    TDTrace("picker touch began (%.0f,%.0f)", _startP.x, _startP.y);
+    [self setNeedsDisplay];
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (!_active) return;
+    UITouch *t = touches.anyObject;
+    if (!t) return;
+    _curP = [t locationInView:self];
+    _lastP = _curP;
+    if (!_moved && hypot(_curP.x - _startP.x, _curP.y - _startP.y) > TD_MOVE_THRESHOLD) {
+        _moved = YES;
+    }
+    [self setNeedsDisplay];
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (!_active) return;
+    UITouch *t = touches.anyObject;
+    if (t) {
+        _curP = [t locationInView:self];
+        if (!_moved && hypot(_curP.x - _startP.x, _curP.y - _startP.y) > TD_MOVE_THRESHOLD) {
+            _moved = YES;
         }
+        if (_moved) _lastP = _curP;
+    }
+    double durMs = (CACurrentMediaTime() - _startT) * 1000.0;
+    [self commitWithDuration:durMs];
+}
 
-        double x = IOHIDEventGetFloatValue(f, kIOHIDEventFieldDigitizerX);
-        double y = IOHIDEventGetFloatValue(f, kIOHIDEventFieldDigitizerY);
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    _active = NO;
+    _live = NO;
+    [self setNeedsDisplay];
+}
 
-        gFingerDown = 1;
-        // 原地抖动不用每帧都存，省缓冲
-        if (fabs(x - gLastPushedX) < 5.0 && fabs(y - gLastPushedY) < 5.0) return;
-        gLastPushedX = x;
-        gLastPushedY = y;
-        TDPushSample(x, y, 1);
-        return;
+- (void)commitWithDuration:(double)durMs {
+    CGRect sb = [UIScreen mainScreen].bounds;
+    if (sb.size.width < 1) sb = self.bounds;
+
+    double gap = _lastEndT > 0 ? (CACurrentMediaTime() - _lastEndT) * 1000.0 : 0;
+    gap = MAX(0.0, MIN(60000.0, gap));
+
+    double x = MAX(0.0, MIN(sb.size.width  - 1, _startP.x));
+    double y = MAX(0.0, MIN(sb.size.height - 1, _startP.y));
+
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"gap"] = @((NSInteger)lround(gap));
+
+    double dist = hypot(_lastP.x - _startP.x, _lastP.y - _startP.y);
+    if (_moved && dist >= TD_MOVE_THRESHOLD) {
+        double x2 = MAX(0.0, MIN(sb.size.width  - 1, _lastP.x));
+        double y2 = MAX(0.0, MIN(sb.size.height - 1, _lastP.y));
+        d[@"t"] = @"swipe";
+        d[@"x1"] = @((NSInteger)lround(x));
+        d[@"y1"] = @((NSInteger)lround(y));
+        d[@"x2"] = @((NSInteger)lround(x2));
+        d[@"y2"] = @((NSInteger)lround(y2));
+        d[@"ms"] = @((NSInteger)MAX(80.0, durMs));
+    } else if (durMs >= 500) {
+        d[@"t"] = @"long";
+        d[@"x"] = @((NSInteger)lround(x));
+        d[@"y"] = @((NSInteger)lround(y));
+        d[@"ms"] = @((NSInteger)MAX(500.0, durMs));
+    } else {
+        d[@"t"] = @"tap";
+        d[@"x"] = @((NSInteger)lround(x));
+        d[@"y"] = @((NSInteger)lround(y));
     }
 
-    // collection 里一根手指都没有 = 抬手（只在按下过之后记一次）
-    if (!gFingerDown) return;
-    gFingerDown = 0;
-    gLastPushedX = -1e9;
-    TDPushSample(0, 0, 0);
+    [self.steps addObject:d];
+    TDTrace("picker step %s (%.0f,%.0f) dur=%.0f",
+            [d[@"t"] UTF8String], x, y, durMs);
+
+    _lastEndT = CACurrentMediaTime();
+    _active = NO;
+    _live = NO;
+    [self updateTitle];
+    [self setNeedsDisplay];
+    if (self.onStepsChanged) self.onStepsChanged();
+
+    // 轻微振动反馈（后台可能拿不到，失败就算了）
+    @try {
+        UIImpactFeedbackGenerator *g =
+            [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+        [g prepare];
+        [g impactOccurred];
+    } @catch (NSException *e) { }
 }
 
-// 返回 void 的那个（Monitor 类型专用，4 参数）
-static void TDEventCB(void *target, void *refcon, void *queue, IOHIDEventRef event) {
-    TDHandleRawEvent(event);
+#pragma mark 绘制
+
+- (void)drawDot:(CGPoint)p index:(NSInteger)idx color:(UIColor *)color {
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    CGContextSetFillColorWithColor(ctx, [color colorWithAlphaComponent:0.92].CGColor);
+    CGContextFillEllipseInRect(ctx, CGRectMake(p.x - TD_MARK_R, p.y - TD_MARK_R,
+                                               TD_MARK_R * 2, TD_MARK_R * 2));
+    CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithWhite:1 alpha:0.85].CGColor);
+    CGContextSetLineWidth(ctx, 1.5);
+    CGContextStrokeEllipseInRect(ctx, CGRectMake(p.x - TD_MARK_R, p.y - TD_MARK_R,
+                                                 TD_MARK_R * 2, TD_MARK_R * 2));
+    if (idx > 0) {
+        NSString *s = [NSString stringWithFormat:@"%ld", (long)idx];
+        UIFont *f = [UIFont boldSystemFontOfSize:12];
+        CGSize sz = [s sizeWithAttributes:@{NSFontAttributeName: f}];
+        [s drawAtPoint:CGPointMake(p.x - sz.width / 2, p.y - sz.height / 2)
+        withAttributes:@{NSFontAttributeName: f, NSForegroundColorAttributeName: UIColor.whiteColor}];
+    }
 }
 
-// 返回 IOHIDEventRef 的那个（Filter 类型专用，必须原样放行）
-static IOHIDEventRef TDFilterCB(void *target, void *refcon, IOHIDEventRef event) {
-    TDHandleRawEvent(event);
-    return event;
+- (void)drawRect:(CGRect)rect {
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    UIColor *tapColor  = [UIColor colorWithRed:0.22 green:0.72 blue:0.36 alpha:1];
+    UIColor *longColor = [UIColor colorWithRed:1.00 green:0.60 blue:0.10 alpha:1];
+    UIColor *swipeColor = [UIColor colorWithRed:0.22 green:0.62 blue:1.00 alpha:1];
+
+    NSInteger i = 0;
+    for (NSDictionary *d in self.steps) {
+        i++;
+        NSString *t = d[@"t"];
+        if ([t isEqualToString:@"swipe"]) {
+            CGPoint a = CGPointMake([d[@"x1"] doubleValue], [d[@"y1"] doubleValue]);
+            CGPoint b = CGPointMake([d[@"x2"] doubleValue], [d[@"y2"] doubleValue]);
+            CGContextSetStrokeColorWithColor(ctx, [swipeColor colorWithAlphaComponent:0.9].CGColor);
+            CGContextSetLineWidth(ctx, 3);
+            CGContextSetLineCap(ctx, kCGLineCapRound);
+            CGContextMoveToPoint(ctx, a.x, a.y);
+            CGContextAddLineToPoint(ctx, b.x, b.y);
+            CGContextStrokePath(ctx);
+            [self drawDot:a index:i color:swipeColor];
+            [self drawDot:b index:0 color:swipeColor];
+        } else {
+            CGPoint a = CGPointMake([d[@"x"] doubleValue], [d[@"y"] doubleValue]);
+            [self drawDot:a index:i
+                    color:([t isEqualToString:@"long"] ? longColor : tapColor)];
+        }
+    }
+
+    if (_live) {
+        CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithWhite:1 alpha:0.75].CGColor);
+        CGContextSetLineWidth(ctx, 2);
+        CGContextMoveToPoint(ctx, _startP.x, _startP.y);
+        CGContextAddLineToPoint(ctx, _curP.x, _curP.y);
+        CGContextStrokePath(ctx);
+    }
 }
 
-// ---------------------------------------------------------------------------
-// 录制器
-// ---------------------------------------------------------------------------
+@end
+
+#pragma mark - 录制器
+
+static TDPickerView *gPicker = nil;
+static NSString *gStatus = @"就绪（全屏取点）";
 
 @interface TDRecorder ()
 @property (nonatomic, readwrite) BOOL recording;
@@ -182,249 +382,99 @@ static IOHIDEventRef TDFilterCB(void *target, void *refcon, IOHIDEventRef event)
     return r;
 }
 
-- (NSInteger)eventCount { return (NSInteger)gSampleCount; }
-- (NSInteger)rawEventCount { return (NSInteger)gRawEvents; }
+- (NSInteger)eventCount { return (NSInteger)gPicker.steps.count; }
+- (NSInteger)rawEventCount { return (NSInteger)gPicker.steps.count; }
 - (NSString *)status { return gStatus; }
 
-- (BOOL)openMonitor {
-    if (gClient) return YES;
+- (BOOL)start {
+    if (self.recording) return YES;
+    if ([TDEngine shared].running) [[TDEngine shared] stop];
 
-    TDCreateWithTypeFn create = (TDCreateWithTypeFn)dlsym(RTLD_DEFAULT,
-                                                           "IOHIDEventSystemClientCreateWithType");
-    if (create) {
-        CFMutableDictionaryRef props = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
-                                                                &kCFTypeDictionaryKeyCallBacks,
-                                                                &kCFTypeDictionaryValueCallBacks);
-        // 2 = kIOHIDEventSystemClientTypeMonitor
-        gClient = create(kCFAllocatorDefault, 2, props);
-        if (props) CFRelease(props);
-    }
-    if (!gClient) gClient = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
-    if (!gClient) {
-        gStatus = @"失败：监听客户端建不起来（HID 权限）";
+    TDTraceInit();
+    unlink(gTracePath);
+    TDTrace("picker: start");
+
+    if (!TDFloatWindow()) TDFloatInstall();
+    UIWindow *w = TDFloatWindow();
+    if (!w) {
+        gStatus = @"悬浮窗没建起来，取点层无处安放";
         return NO;
     }
 
-    // iOS 13+：Monitor 类型配 RegisterEventCallback
-    TDRegisterEventFn regEv = (TDRegisterEventFn)dlsym(RTLD_DEFAULT,
-                                                       "IOHIDEventSystemClientRegisterEventCallback");
-    if (regEv) {
-        regEv(gClient, TDEventCB, NULL, NULL);
-        gApi = @"event-callback";
-    } else {
-        TDRegisterFilterFn regF = (TDRegisterFilterFn)dlsym(RTLD_DEFAULT,
-                                                            "IOHIDEventSystemClientRegisterEventFilterCallback");
-        if (regF) { regF(gClient, TDFilterCB, NULL, NULL); gApi = @"filter"; }
-    }
-    if (!gApi) {
-        gStatus = @"失败：系统没有触摸回调接口";
-        return NO;
-    }
+    // 铺满全屏 —— 这一层就是我们的窗口，触摸一定会投递到本进程
+    TDFloatSetFullScreen(YES);
 
-    TDScheduleFn sched = (TDScheduleFn)dlsym(RTLD_DEFAULT,
-                                             "IOHIDEventSystemClientScheduleWithRunLoop");
-    if (!sched) {
-        gStatus = @"失败：监听器挂不上 runloop";
-        return NO;
-    }
-    sched(gClient, CFRunLoopGetMain(), kCFRunLoopCommonModes);
+    TDPickerView *p = [[TDPickerView alloc] initWithFrame:w.bounds];
+    p.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    p.steps = [NSMutableArray array];
 
-    gStatus = [NSString stringWithFormat:@"已连接（%@）", gApi];
-    TDLog(@"触摸监听已建立：%@", gStatus);
+    __weak typeof(self) ws = self;
+    p.onStepsChanged = ^{
+        typeof(self) ss = ws;
+        if (!ss) return;
+        if (ss.onChange) ss.onChange();
+    };
+    p.onFinish = ^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) ss = ws;
+            if (ss) [ss finishAndSave];
+        });
+    };
+    p.onCancel = ^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) ss = ws;
+            if (ss) [ss cancel];
+        });
+    };
+
+    [w.rootViewController.view addSubview:p];
+    [w.rootViewController.view bringSubviewToFront:p];
+    gPicker = p;
+
+    gStatus = @"取点中（窗口已铺满全屏）";
+    self.recording = YES;
+    TDTrace("picker: mounted, window=%.0fx%.0f", w.bounds.size.width, w.bounds.size.height);
+    if (self.onChange) self.onChange();
     return YES;
 }
 
-/// 备用通道已停用（Filter 类型的 client 会插进系统事件链，
-/// 一旦回调有任何问题，整个系统的触摸都会跟着出问题，风险太大）。
-- (void)armFallbackTimer { /* 空实现，保留调用点 */ }
+- (void)teardown {
+    self.recording = NO;
+    TDPickerView *p = gPicker;
+    gPicker = nil;
+    [p removeFromSuperview];
+    TDFloatSetFullScreen(NO);
+    gStatus = @"就绪（全屏取点）";
+    TDTrace("picker: teardown");
+    if (self.onChange) self.onChange();
+}
 
-- (BOOL)start {
-    @try {
-        if (self.recording) return YES;
-        if ([TDEngine shared].running) [[TDEngine shared] stop];
+- (void)cancel {
+    if (!self.recording) return;
+    [self teardown];
+    TDLog(@"已取消录制，没有保存");
+    [[NSNotificationCenter defaultCenter] postNotificationName:TDDataChangedNotification object:nil];
+}
 
-        // trace 路径要在主线程准备好，回调线程里才敢直接 fopen
-        if (gTracePath[0] == 0) {
-            NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
-                                                                 NSUserDomainMask, YES) firstObject];
-            NSString *p = [dir stringByAppendingPathComponent:@"trace.log"];
-            snprintf(gTracePath, sizeof(gTracePath), "%s", p.fileSystemRepresentation);
-        }
-        unlink(gTracePath);
-        gTraceFirst = 0;
-        TDTrace("start: 准备建立监听");
+- (void)finishAndSave {
+    if (!self.recording) return;
+    NSMutableArray<NSDictionary *> *steps = [gPicker.steps mutableCopy] ?: [NSMutableArray array];
+    [self teardown];
 
-        if (![self openMonitor]) { TDTrace("openMonitor 失败"); return NO; }
-        TDTrace("监听已建立");
+    TDScript *s = [[TDScriptStore shared] createScript];
+    if (steps.count) s.steps = steps;
+    [[TDScriptStore shared] save];
 
-        // 切到抖音后要保持进程活着，否则一个事件都收不到
-        [TDKeepAlive ensure];
-        TDTrace("保活 ok");
-
-        os_unfair_lock_lock(&gSampleLock);
-        gSampleCount = 0;
-        os_unfair_lock_unlock(&gSampleLock);
-        gRawEvents = 0;
-        gPushedEvents = 0;
-        gFingerDown = 0;
-        gLastPushedX = -1e9;
-        gLastPushedY = -1e9;
-
-        self.recording = YES;
-        gArmed = 1;
-        [self armFallbackTimer];
-        if (self.onChange) self.onChange();
-        return YES;
-    } @catch (NSException *e) {
-        gStatus = [NSString stringWithFormat:@"异常：%@", e.reason ?: @"未知"];
-        self.recording = NO;
-        gArmed = 0;
-        return NO;
-    }
+    TDLog(@"录制完成：%@（%lu 步）", s.name, (unsigned long)s.steps.count);
+    TDTrace("picker: saved %lu steps", (unsigned long)steps.count);
+    [[NSNotificationCenter defaultCenter] postNotificationName:TDDataChangedNotification object:nil];
 }
 
 - (NSMutableArray<NSDictionary *> *)stop {
     if (!self.recording) return nil;
-    gArmed = 0;
-    self.recording = NO;
-
-    // 备用通道用一次就拆掉，避免下次录制两条通道重复入样
-    if (gFilterClient) {
-        typedef void (*TDCancelFn)(IOHIDEventSystemClientRef);
-        TDCancelFn cancel = (TDCancelFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientCancel");
-        if (cancel) cancel(gFilterClient);
-        CFRelease(gFilterClient);
-        gFilterClient = NULL;
-    }
-    static TDSample buf[TD_SAMPLE_MAX];
-    int n = 0;
-    os_unfair_lock_lock(&gSampleLock);
-    n = gSampleCount;
-    if (n > TD_SAMPLE_MAX) n = TD_SAMPLE_MAX;
-    if (n > 0) memcpy(buf, gSamples, sizeof(TDSample) * (size_t)n);
-    gSampleCount = 0;
-    os_unfair_lock_unlock(&gSampleLock);
-
-    TDLog(@"录制停止：系统事件 %d · 采样 %d", (int)gRawEvents, n);
-
-    NSMutableArray *steps = [self parseSamples:buf count:n];
-    if (self.onChange) self.onChange();
+    NSMutableArray *steps = [gPicker.steps mutableCopy] ?: [NSMutableArray array];
+    [self teardown];
     return steps;
 }
 
-#pragma mark - 样本 → 步骤（全在主线程）
-
-- (NSMutableArray<NSDictionary *> *)parseSamples:(TDSample *)s count:(int)n {
-    NSMutableArray *out = [NSMutableArray array];
-    if (n <= 0) return out;
-
-    CGSize sb = [UIScreen mainScreen].bounds.size;
-    if (sb.width < 1 || sb.height < 1) sb = CGSizeMake(414, 736);
-
-    // 坐标体系判定：HID 有时报点、有时报像素。
-    // 只要出现过超出屏幕点尺寸的坐标，就说明这套样本是像素坐标，整段统一换算
-    // （逐点换算会导致一半点缩放、一半不缩放，位置全乱）。
-    double maxX = 0, maxY = 0;
-    for (int i = 0; i < n; i++) {
-        if (!s[i].touching) continue;
-        if (s[i].x > maxX) maxX = s[i].x;
-        if (s[i].y > maxY) maxY = s[i].y;
-    }
-    CGFloat ratio = 1.0;
-    if (maxX > sb.width + 2 || maxY > sb.height + 2) {
-        ratio = TDscreenScaleRatio();
-        if (ratio < 1.2 || ratio > 4.0) ratio = [UIScreen mainScreen].nativeScale;
-        if (ratio < 1.2 || ratio > 4.0) ratio = 1.0;
-        TDLog(@"坐标按像素换算：最大 (%.0f, %.0f) / 屏宽 %.0f = %.3f", maxX, maxY, sb.width, ratio);
-    } else {
-        TDLog(@"坐标按点处理：最大 (%.0f, %.0f)", maxX, maxY);
-    }
-
-    BOOL down = NO, moved = NO;
-    uint64_t downT = 0, lastEnd = s[0].t;
-    double sx = 0, sy = 0, lx = 0, ly = 0;
-    const double moveThresh = 12.0;
-
-    for (int i = 0; i < n; i++) {
-        double x = s[i].x / ratio;
-        double y = s[i].y / ratio;
-
-        if (s[i].touching && !down) {
-            down = YES;
-            moved = NO;
-            sx = x; sy = y; lx = x; ly = y;
-            downT = s[i].t;
-            continue;
-        }
-        if (s[i].touching && down) {
-            lx = x; ly = y;
-            if (!moved && hypot(x - sx, y - sy) > moveThresh) moved = YES;
-            continue;
-        }
-        if (!s[i].touching && down) {
-            down = NO;
-            double durMs = TDmsBetween(s[i].t, downT);
-
-            // 从屏幕最底部起手往上拖 = 上滑回桌面，别录
-            if (sy > sb.height - 44 && moved && ly < sy - 60) {
-                lastEnd = s[i].t;
-                continue;
-            }
-
-            NSMutableDictionary *d = [NSMutableDictionary dictionary];
-            d[@"gap"] = @((NSInteger)MAX(0.0, TDmsBetween(downT, lastEnd)));
-
-            double cx = MAX(0, MIN(sb.width  - 1, sx));
-            double cy = MAX(0, MIN(sb.height - 1, sy));
-
-            if (!moved && durMs < 450) {
-                d[@"t"] = @"tap";
-                d[@"x"] = @((NSInteger)lround(cx));
-                d[@"y"] = @((NSInteger)lround(cy));
-            } else if (!moved) {
-                d[@"t"] = @"long";
-                d[@"x"] = @((NSInteger)lround(cx));
-                d[@"y"] = @((NSInteger)lround(cy));
-                d[@"ms"] = @((NSInteger)MAX(300.0, durMs));
-            } else {
-                double ex = MAX(0, MIN(sb.width  - 1, lx));
-                double ey = MAX(0, MIN(sb.height - 1, ly));
-                if (hypot(ex - cx, ey - cy) < moveThresh) {
-                    d[@"t"] = @"tap";
-                    d[@"x"] = @((NSInteger)lround(cx));
-                    d[@"y"] = @((NSInteger)lround(cy));
-                } else {
-                    d[@"t"] = @"swipe";
-                    d[@"x1"] = @((NSInteger)lround(cx));
-                    d[@"y1"] = @((NSInteger)lround(cy));
-                    d[@"x2"] = @((NSInteger)lround(ex));
-                    d[@"y2"] = @((NSInteger)lround(ey));
-                    d[@"ms"] = @((NSInteger)MAX(80.0, durMs));
-                }
-            }
-            [out addObject:d];
-            lastEnd = s[i].t;
-        }
-    }
-
-    return out;
-}
-
 @end
-
-NSString *TDtraceLogText(void) {
-    NSString *path = nil;
-    if (gTracePath[0] != 0) {
-        path = [NSString stringWithUTF8String:gTracePath];
-    } else {
-        NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
-                                                            NSUserDomainMask, YES) firstObject];
-        path = [dir stringByAppendingPathComponent:@"trace.log"];
-    }
-    NSString *s = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:NULL];
-    return s ?: @"";
-}
-
-void TDtraceLogClear(void) {
-    if (gTracePath[0] != 0) unlink(gTracePath);
-}

@@ -65,17 +65,22 @@ TDMatch * _Nullable TDfindImage(UIImage *tpl, double threshold, double minScale,
 - (void)load;
 @end
 
-#pragma mark - 录制（系统级触摸监听）
+#pragma mark - 录制（全屏取点层，不依赖私有 HID 监听）
 
 @interface TDRecorder : NSObject
 + (instancetype)shared;
 @property (nonatomic, readonly) BOOL recording;
-@property (nonatomic, readonly) NSInteger eventCount;      // 已采到的样本数
-@property (nonatomic, readonly) NSInteger rawEventCount;   // 系统投递过来的事件数（诊断用）
+@property (nonatomic, readonly) NSInteger eventCount;      // 已录到的步骤数
+@property (nonatomic, readonly) NSInteger rawEventCount;   // 同上（保留兼容）
 @property (nonatomic, copy, nullable) void (^onChange)(void);
 
-/// 返回 NO 表示系统不给监听（权限/接口不可用），此时只能用手动取点
+/// 把托管窗口铺满全屏、盖上取点层。返回 NO 表示窗口没准备好
 - (BOOL)start;
+/// 结束录制，存成新脚本（唯一正常的收尾方式）
+- (void)finishAndSave;
+/// 结束并丢弃
+- (void)cancel;
+/// 取走步骤并结束（内部用）
 - (NSMutableArray<NSDictionary *> *)stop;
 - (NSString *)status;
 @end
@@ -161,5 +166,11 @@ BOOL TDFloatVisible(void);
 /// 引擎/录制状态变了以后调它，球会换颜色和文字
 void TDFloatRefresh(void);
 void TDFloatResetPosition(void);
+
+/// 托管窗口本体（录制取点层要挂到它的 rootViewController 上）
+UIWindow * _Nullable TDFloatWindow(void);
+/// 把托管窗口铺满全屏 / 缩回悬浮条（取点录制用）
+void TDFloatSetFullScreen(BOOL on);
+BOOL TDFloatIsFullScreen(void);
 
 NS_ASSUME_NONNULL_END

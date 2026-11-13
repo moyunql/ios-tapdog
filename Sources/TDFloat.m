@@ -28,6 +28,7 @@ static NSString * const kTDBallPosX = @"tdBallCenterX";
 static NSString * const kTDBallPosY = @"tdBallCenterY";
 
 static TDHUDWindow *gBallWindow = nil;
+static BOOL gFullScreen = NO;      // 取点模式下窗口铺满全屏
 static UIView *gStartView = nil;
 static UILabel *gStartLabel = nil;
 static UIView *gStopView = nil;
@@ -37,6 +38,11 @@ static UILabel *gStopLabel = nil;
 
 static void TDApplyBallPosition(UIWindow *w) {
     if (!w) return;
+    // 取点模式下窗口是故意铺满全屏的，任何「回默认位置」都不能把它缩回去
+    if (gFullScreen) {
+        TDHUDRegisterWindow(w);
+        return;
+    }
     CGRect sb = [UIScreen mainScreen].bounds;
     CGFloat hw = kTDOverlayW / 2.0;
     CGFloat hh = kTDOverlayH / 2.0;
@@ -89,14 +95,9 @@ void TDFloatRefresh(void) {
 
 /// 结束录制并存成新脚本
 static void TDFloatFinishRecording(void) {
-    TDRecorder *r = [TDRecorder shared];
-    if (!r.recording) return;
-    NSMutableArray<NSDictionary *> *events = [r stop];
-    TDScript *s = [[TDScriptStore shared] createScript];
-    if (events.count) s.steps = events;
-    [[TDScriptStore shared] save];
-    TDLog(@"录制结束：%@（%lu 步）", s.name, (unsigned long)s.steps.count);
-    [[NSNotificationCenter defaultCenter] postNotificationName:TDDataChangedNotification object:nil];
+    if (![TDRecorder shared].recording) return;
+    [[TDRecorder shared] finishAndSave];
+    TDFloatRefresh();
 }
 
 static void TDFloatDoStart(void) {
@@ -301,4 +302,38 @@ void TDFloatResetPosition(void) {
     [d removeObjectForKey:kTDBallPosX];
     [d removeObjectForKey:kTDBallPosY];
     TDApplyBallPosition(gBallWindow);
+}
+
+#pragma mark - 全屏取点模式
+
+UIWindow *TDFloatWindow(void) { return gBallWindow; }
+
+BOOL TDFloatIsFullScreen(void) { return gFullScreen; }
+
+/// 取点录制时把窗口铺满全屏：这一层就变成「我们的全屏窗口」，
+/// 触摸必然投递到本进程，坐标即屏幕坐标。录完必须收回悬浮条尺寸，
+/// 否则全屏窗口会把抖音整屏的触摸都吞掉。
+void TDFloatSetFullScreen(BOOL on) {
+    if (!gBallWindow) return;
+    if (on == gFullScreen) return;
+    gFullScreen = on;
+
+    if (on) {
+        gStartView.hidden = YES;
+        gStopView.hidden = YES;
+        // 换一个 level，逼 TDHUD 重新向 SpringBoard 注册新几何
+        gBallWindow.windowLevel = 10000012.0;
+        gBallWindow.frame = [UIScreen mainScreen].bounds;
+        [gBallWindow layoutIfNeeded];   // 让 rootViewController.view 立刻跟着变成全屏
+        TDHUDRegisterWindow(gBallWindow);
+        TDLog(@"进入取点模式（窗口铺满全屏）");
+    } else {
+        gBallWindow.windowLevel = 10000010.0;
+        gStartView.hidden = NO;
+        gStopView.hidden = NO;
+        TDApplyBallPosition(gBallWindow);
+        [gBallWindow layoutIfNeeded];
+        TDLog(@"退出取点模式");
+    }
+    TDFloatRefresh();
 }

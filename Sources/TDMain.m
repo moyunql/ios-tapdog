@@ -113,15 +113,11 @@ extern UIViewController *TDCreateMainVC(void);
 
 - (void)didBecomeActive {
     dispatch_async(dispatch_get_main_queue(), ^{
-        // 回来自动停：录制停止并落盘，回放也停，免得在自己界面上乱点
+        // 回来自动停：取点结束并落盘，回放也停，免得在自己界面上乱点
         TDRecorder *r = [TDRecorder shared];
         if (r.recording) {
-            NSMutableArray *events = [r stop];
-            TDScript *s = [[TDScriptStore shared] createScript];
-            if (events.count) s.steps = events;
-            [[TDScriptStore shared] save];
-            TDLog(@"录制结束：%@（%lu 步）", s.name, (unsigned long)s.steps.count);
-            [[NSNotificationCenter defaultCenter] postNotificationName:TDDataChangedNotification object:nil];
+            [r finishAndSave];
+            TDLog(@"回到 App，取点已结束并保存");
         }
         if ([TDEngine shared].running) {
             [[TDEngine shared] stop];
