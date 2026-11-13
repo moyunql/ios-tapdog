@@ -2,7 +2,7 @@
 #import <QuartzCore/QuartzCore.h>
 
 // ---------------------------------------------------------------------------
-// 悬浮条（两个按钮：▶ 开始执行 / ■ 停止执行）
+// 悬浮条（三个按钮：▶ 开始执行 / ■ 停止执行 / ◎ 注入自检）
 //
 // ★ 托管窗口必须贴合按钮本身，绝不能铺满全屏：
 //   跨进程托管窗口的触摸命中在窗口服务器侧完成，我们进程里 hitTest 返回
@@ -13,6 +13,7 @@
 // 交互：
 //   点 ▶  = 开始执行选中脚本（录制中则结束录制并保存）
 //   点 ■  = 停止执行 / 停止录制并保存
+//   点 ◎  = 3 秒后往屏幕中间注入一次点击（验证能不能点到别的 App）
 //   长按  = 开始/停止录制
 //   拖动  = 挪位置（位置记在 NSUserDefaults）
 // ---------------------------------------------------------------------------
@@ -21,7 +22,7 @@ NSString * const TDDataChangedNotification = @"TDDataChangedNotification";
 
 static const CGFloat kTDBallSize = 54.0;
 static const CGFloat kTDBallGap  = 5.0;
-static const CGFloat kTDOverlayW = 128.0;   // 7 + 54 + 5 + 54 + 8
+static const CGFloat kTDOverlayW = 187.0;   // 7 + 54 + 5 + 54 + 5 + 54 + 8
 static const CGFloat kTDOverlayH = 70.0;    // 8 + 54 + 8
 
 static NSString * const kTDBallPosX = @"tdBallCenterX";
@@ -33,6 +34,8 @@ static UIView *gStartView = nil;
 static UILabel *gStartLabel = nil;
 static UIView *gStopView = nil;
 static UILabel *gStopLabel = nil;
+static UIView *gTestView = nil;
+static UILabel *gTestLabel = nil;
 
 #pragma mark - 位置
 
@@ -89,6 +92,11 @@ void TDFloatRefresh(void) {
         gStopLabel.text = @"■";
         gStopView.alpha = 0.45;
     }
+    if (gTestView) {
+        gTestView.backgroundColor = [UIColor colorWithRed:0.42 green:0.36 blue:0.86 alpha:0.95];
+        gTestLabel.text = @"◎";
+        gTestView.alpha = (r.recording || e.running) ? 0.45 : 1;
+    }
 }
 
 #pragma mark - 动作
@@ -139,6 +147,19 @@ static void TDFloatToggleRecord(void) {
         TDLog(@"开始录制，去抖音点几下，再点悬浮条停止");
     }
     TDFloatRefresh();
+}
+
+/// 注入自检：3 秒后往屏幕中间点一下。
+/// 在抖音里按它 —— 视频暂停/继续，说明注入真的到得了别的 App。
+static void TDFloatDoTestTap(void) {
+    CGSize sb = [UIScreen mainScreen].bounds.size;
+    CGPoint c = CGPointMake(sb.width / 2.0, sb.height * 0.45);
+    TDLog(@"3 秒后往屏幕中间 (%.0f, %.0f) 注入一次点击…", c.x, c.y);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        TDtap(c.x, c.y);
+        TDLog(@"已注入点击 (%.0f, %.0f) · %@", c.x, c.y, TDhidStatus());
+    });
 }
 
 #pragma mark - 球体视图
@@ -201,6 +222,11 @@ static void TDFloatToggleRecord(void) {
     gStopView.tag = 2;
     gStopLabel.text = @"■";
 
+    gTestView = [self makeBallAtX:7 + (kTDBallSize + kTDBallGap) * 2];
+    gTestLabel = (UILabel *)gTestView.subviews.firstObject;
+    gTestView.tag = 3;
+    gTestLabel.text = @"◎";
+
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPan:)];
     [self.view addGestureRecognizer:pan];
 
@@ -211,6 +237,7 @@ static void TDFloatToggleRecord(void) {
     UIView *v = g.view;
     if (v.tag == 1) TDFloatDoStart();
     else if (v.tag == 2) TDFloatDoStop();
+    else if (v.tag == 3) TDFloatDoTestTap();
 }
 
 - (void)onLong:(UILongPressGestureRecognizer *)g {

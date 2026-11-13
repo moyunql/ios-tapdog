@@ -55,15 +55,26 @@ NSString *TDhidStatus(void) {
 }
 
 // hand 父事件
+//
+// 这一段是照社区验证过的写法对齐的（SimulateTouch / TouchSimulator 系列）：
+//   - 父事件的 eventMask 给 kIOHIDDigitizerEventTouch，不能是 0
+//   - 补 TiltX / TiltY / Altitude 三个字段，否则 BackBoard 认为这不是屏幕触摸
+//   - finger 的 Major/MinorRadius 给 0.04（真实手指量级），给 0 会被当噪声丢掉
 static IOHIDEventRef TDCreateHand(uint32_t mask, uint64_t ts) {
     IOHIDEventRef hand = IOHIDEventCreateDigitizerEvent(kCFAllocatorDefault,
                                                        ts,
                                                        kIOHIDDigitizerTransducerTypeHand,
-                                                       0, 0, 0, 0,
+                                                       0, 0,
+                                                       kIOHIDDigitizerEventTouch,
+                                                       0,
                                                        0.0, 0.0, 0.0, 0.0, 0.0,
-                                                       0, 0, 0);
+                                                       0, true, 0);
     if (!hand) return NULL;
     IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
+    IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerTiltX,
+                              kIOHIDDigitizerTransducerTypeHand);
+    IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerTiltY, 1);
+    IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerAltitude, 1);
     return hand;
 }
 
@@ -76,20 +87,23 @@ static void TDEmit(uint32_t mask, BOOL touch, CGFloat x, CGFloat y) {
     IOHIDEventRef hand = TDCreateHand(mask, ts);
     if (!hand) return;
 
+    int isTouch = touch ? 1 : 0;
     IOHIDEventRef finger = IOHIDEventCreateDigitizerFingerEvent(kCFAllocatorDefault,
                                                                ts,
                                                                1,      // index
-                                                               2,      // identity
+                                                               3,      // identity
                                                                mask,
                                                                (IOHIDFloat)x,
                                                                (IOHIDFloat)y,
                                                                0.0f, 0.0f, 0.0f,
-                                                               touch ? 1 : 0,   // range
-                                                               touch ? 1 : 0,   // touch
+                                                               isTouch,   // range
+                                                               isTouch,   // touch
                                                                0);
     if (finger) {
         IOHIDEventSetIntegerValue(finger, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
-        IOHIDEventSetIntegerValue(finger, kIOHIDEventFieldDigitizerTouch, touch ? 1 : 0);
+        IOHIDEventSetIntegerValue(finger, kIOHIDEventFieldDigitizerTouch, isTouch);
+        IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerMajorRadius, 0.04f);
+        IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerMinorRadius, 0.04f);
         IOHIDEventAppendEvent(hand, finger);
         CFRelease(finger);
     }
