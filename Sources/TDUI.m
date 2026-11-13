@@ -253,23 +253,25 @@ static NSString *TDCalibModeName(NSInteger m) {
     TDSetCoordMode(mode);
 
     CGSize s = [UIScreen mainScreen].bounds.size;
-    CGPoint pts[2] = { CGPointMake(s.width * 0.5, s.height * 0.5),
-                       CGPointMake(s.width * 0.25, s.height * 0.3) };
+    // block 里不能引用局部数组，拆成两个标量
+    CGPoint ptCenter = CGPointMake(s.width * 0.5, s.height * 0.5);
+    CGPoint ptCorner = CGPointMake(s.width * 0.25, s.height * 0.3);
+    CGPoint want = (gotIdx == 0) ? ptCenter : ptCorner;
 
     __weak typeof(self) ws = self;
-    [self probeAt:pts[gotIdx] done:^(BOOL ok, CGPoint at) {
+    [self probeAt:want done:^(BOOL ok, CGPoint at) {
         TDCalibVC *ss = ws;
         if (!ss) return;
 
         if (ok) {
-            CGFloat d = hypot(at.x - pts[gotIdx].x, at.y - pts[gotIdx].y);
+            CGFloat d = hypot(at.x - want.x, at.y - want.y);
             [notes addObject:[NSString stringWithFormat:@"%@ (%.0f,%.0f) → (%.0f,%.0f) 偏差%.0f %@",
                               TDCalibModeName(mode),
-                              pts[gotIdx].x, pts[gotIdx].y, at.x, at.y, d, d < 15 ? @"✓" : @"✗"]];
+                              want.x, want.y, at.x, at.y, d, d < 15 ? @"✓" : @"✗"]];
         } else {
             [notes addObject:[NSString stringWithFormat:@"%@ (%.0f,%.0f) → 没接到",
                               TDCalibModeName(mode),
-                              pts[gotIdx].x, pts[gotIdx].y]];
+                              want.x, want.y]];
         }
         [ss say:@"%@", [notes componentsJoinedByString:@"\n"]];
 
@@ -559,6 +561,7 @@ static NSString *TDCalibModeName(NSInteger m) {
             c.accessoryType = UITableViewCellAccessoryCheckmark;
         }
     } else {
+        if (_trialLeft > 0) {
             c.textLabel.text = [NSString stringWithFormat:@"%ld 秒后注入… 现在切抖音", (long)_trialLeft];
             c.textLabel.textColor = [UIColor colorWithRed:1.0 green:0.62 blue:0.15 alpha:1.0];
             c.detailTextLabel.text = @"按 Home 切过去等着";
