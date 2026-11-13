@@ -86,6 +86,36 @@ static NSString *TDSandboxStatus(void) {
     return [NSString stringWithFormat:@"受限 errno=%d（权限没生效）", errno];
 }
 
+static const CGFloat kTDBallSize    = 56.0;   // 球直径
+static const CGFloat kTDBallPad     = 10.0;   // 窗口相对球留的一圈余量
+static const CGFloat kTDOverlaySide = 76.0;   // 托管窗口边长 = 56 + 10*2
+
+static NSString * const kTDBallPosX = @"tdBallCenterX";
+static NSString * const kTDBallPosY = @"tdBallCenterY";
+
+/// 主界面要用它开关悬浮球，AppDelegate 创建后赋值
+static UIWindow *gTDOverlayWindow = nil;
+
+/// 把窗口放到「上次拖到的位置」；没有记录就放右侧中部
+static void TDApplyBallPosition(UIWindow *w) {
+    if (!w) return;
+    CGRect sb = [UIScreen mainScreen].bounds;
+    CGFloat half = kTDOverlaySide / 2.0;
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    double cx = [d doubleForKey:kTDBallPosX];
+    double cy = [d doubleForKey:kTDBallPosY];
+    if (cx <= 0 || cy <= 0) {
+        cx = sb.size.width - half - 6;
+        cy = sb.size.height * 0.45;
+    }
+    cx = MAX(half + 2, MIN(sb.size.width  - half - 2, cx));
+    cy = MAX(half + 30, MIN(sb.size.height - half - 34, cy));   // 让开状态栏和 Home 条
+    w.frame = CGRectMake(cx - half, cy - half, kTDOverlaySide, kTDOverlaySide);
+
+    // 位置变了要重新让 SpringBoard 认一遍（surface 几何变化）
+    TDHUDRegisterWindow(w);
+}
+
 #pragma mark - 取点面板
 
 typedef NS_ENUM(NSInteger, TDPickerMode) {
@@ -402,7 +432,8 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
                                       [TDEngine shared].jetsamStatus ?: @"jetsam 未设置"];
         } else if (ip.row == 4) {
             c.textLabel.text = @"悬浮窗（盖在其他 App 上）";
-            c.detailTextLabel.text = TDHUDStatus();
+            c.detailTextLabel.text = [NSString stringWithFormat:@"%@ · 76×76 小球（点这里可关闭/回位）", TDHUDStatus()];
+            c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         } else if (ip.row == 5) {
             c.textLabel.text = @"穿透模式（手动刷抖音时打开）";
             c.detailTextLabel.text = TDHUDPassthrough() ? @"开：悬浮球不接管触摸" : @"关：可拖动悬浮球";
@@ -455,6 +486,7 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
     if (ip.section == 0 && ip.row == 7) { [self editSettings]; return; }
+    if (ip.section == 0 && ip.row == 4) { [self floatActions]; return; }
     if (ip.section != 2) return;
 
     TDPickerMode mode = (ip.row == 0) ? TDPickerTap : (ip.row == 1) ? TDPickerLong : (ip.row == 2) ? TDPickerSwipe : TDPickerRect;
@@ -510,6 +542,46 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
     [self reload];
 }
 
+/// 悬浮球管理：万一球卡在屏幕上了，回 TapDog 点这里就能关掉或复位
+- (void)floatActions {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"悬浮球"
+                                                              message:TDHUDStatus()
+                                                       preferredStyle:UIAlertControllerStyleActionSheet];
+    BOOL visible = (gTDOverlayWindow && !gTDOverlayWindow.hidden);
+
+    [a addAction:[UIAlertAction actionWithTitle:(visible ? @"关闭悬浮球" : @"打开悬浮球")
+                                          style:UIAlertActionStyleDestructive
+                                        handler:^(UIAlertAction *x) {
+        if (!gTDOverlayWindow) return;
+        if (visible) {
+            gTDOverlayWindow.hidden = YES;
+            TDHUDUnregisterWindow(gTDOverlayWindow);
+            [[TDEngine shared] logMsg:@"悬浮球已关闭"];
+        } else {
+            gTDOverlayWindow.hidden = NO;
+            TDApplyBallPosition(gTDOverlayWindow);
+            [[TDEngine shared] logMsg:@"悬浮球：%@", TDHUDStatus()];
+        }
+        [self reload];
+    }]];
+
+    [a addAction:[UIAlertAction actionWithTitle:@"回到默认位置（右侧中部）"
+                                          style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) {
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:kTDBallPosX];
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:kTDBallPosY];
+        TDApplyBallPosition(gTDOverlayWindow);
+        [self reload];
+    }]];
+
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+
+    // iPad 上 actionSheet 必须有锚点；这里给个兜底，避免崩溃
+    a.popoverPresentationController.sourceView = self.view;
+    a.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2, 120, 1, 1);
+    [self presentViewController:a animated:YES completion:nil];
+}
+
 - (void)editSettings {
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"参数" message:@"随机偏移防检测 / 识图阈值 / 循环次数(0=无限)" preferredStyle:UIAlertControllerStyleAlert];
     [a addTextFieldWithConfigurationHandler:^(UITextField *t) { t.placeholder = @"偏移(点)"; t.text = @([TDConfig shared].jitterPx).stringValue; t.keyboardType = UIKeyboardTypeDecimalPad; }];
@@ -549,23 +621,15 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
 @end
 
 #pragma mark - 悬浮球
-
-/// 全屏但只让球本身接收触摸，其余区域点击穿透，不影响下面的界面
-@interface TDPassView : UIView
-@property (nonatomic, weak) UIView *ball;
-@end
-
-@implementation TDPassView
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    if (self.ball && !self.ball.hidden) {
-        CGPoint p = [self convertPoint:point toView:self.ball];
-        if ([self.ball pointInside:p withEvent:event]) {
-            return [super hitTest:point withEvent:event];
-        }
-    }
-    return nil;
-}
-@end
+//
+//  ★ 关键设计（v1.0.16 修正）★
+//  托管窗口必须是「球那么大」，绝不能铺满全屏。
+//  原因：跨进程托管窗口的触摸命中在窗口服务器侧完成，我们进程里的
+//  hitTest 返回 nil 只是让本进程没人接这个触摸 —— 触摸会被这个窗口
+//  「接住后丢弃」，并不会转发给下面抖音的窗口。所以窗口铺满全屏 =
+//  整个屏幕都点不动。窗口只有 76×76，则窗口外的触摸压根不归它管，
+//  抖音正常操作，只有球那一小块被占用（可拖动挪开）。
+//
 
 @interface TDFloatVC : UIViewController
 @property (nonatomic, copy) void (^onTap)(void);
@@ -575,11 +639,14 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
 @implementation TDFloatVC {
     UIView *_ball;
     UILabel *_label;
+    CGPoint _dragStartCenter;   // 拖动开始时窗口中心（屏幕坐标）
+    CGPoint _dragStartTouch;    // 拖动开始时手指位置（屏幕坐标，与窗口无关）
 }
 
 - (void)loadView {
-    TDPassView *v = [[TDPassView alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kTDOverlaySide, kTDOverlaySide)];
     v.backgroundColor = [UIColor clearColor];
+    v.clipsToBounds = NO;
     self.view = v;
 }
 
@@ -587,36 +654,68 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor clearColor];
 
-    _ball = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 56, 56)];
-    _ball.center = CGPointMake(self.view.bounds.size.width - 38, self.view.bounds.size.height * 0.42);
+    _ball = [[UIView alloc] initWithFrame:CGRectMake(kTDBallPad, kTDBallPad, kTDBallSize, kTDBallSize)];
     _ball.backgroundColor = [UIColor colorWithRed:0.18 green:0.33 blue:0.98 alpha:0.92];
-    _ball.layer.cornerRadius = 28;
+    _ball.layer.cornerRadius = kTDBallSize / 2;
     _ball.layer.borderWidth = 2;
     _ball.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.55].CGColor;
     _ball.userInteractionEnabled = YES;
     [self.view addSubview:_ball];
-    ((TDPassView *)self.view).ball = _ball;
 
     _label = [[UILabel alloc] initWithFrame:_ball.bounds];
     _label.text = @"跑";
     _label.textColor = [UIColor whiteColor];
     _label.font = [UIFont boldSystemFontOfSize:22];
     _label.textAlignment = NSTextAlignmentCenter;
+    _label.userInteractionEnabled = NO;
     [_ball addSubview:_label];
 
     UITapGestureRecognizer *t = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tapBall)];
     [_ball addGestureRecognizer:t];
     UIPanGestureRecognizer *p = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragBall:)];
     [_ball addGestureRecognizer:p];
+    [t requireGestureRecognizerToFail:p];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    _ball.center = CGPointMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds));
 }
 
 - (void)tapBall { if (self.onTap) self.onTap(); }
 
+/// 取「不随窗口移动而变化的屏幕坐标」，否则窗口一挪 translation 就被抵消，球会原地抖
+- (CGPoint)screenPointOf:(CGPoint)p inWindow:(UIWindow *)w {
+    if (w.windowScene) return [w convertPoint:p toCoordinateSpace:w.windowScene.coordinateSpace];
+    return p;
+}
+
 - (void)dragBall:(UIPanGestureRecognizer *)g {
-    CGPoint d = [g translationInView:self.view];
-    CGPoint c = CGPointMake(_ball.center.x + d.x, _ball.center.y + d.y);
-    _ball.center = c;
-    [g setTranslation:CGPointZero inView:self.view];
+    UIWindow *w = self.view.window;
+    if (!w) return;
+    CGPoint touch = [self screenPointOf:[g locationInView:w] inWindow:w];
+
+    if (g.state == UIGestureRecognizerStateBegan) {
+        _dragStartCenter = w.center;
+        _dragStartTouch  = touch;
+        return;
+    }
+    if (g.state == UIGestureRecognizerStateChanged) {
+        CGRect sb = [UIScreen mainScreen].bounds;
+        CGFloat half = kTDOverlaySide / 2.0;
+        CGPoint c = CGPointMake(_dragStartCenter.x + touch.x - _dragStartTouch.x,
+                                _dragStartCenter.y + touch.y - _dragStartTouch.y);
+        c.x = MAX(half + 2, MIN(sb.size.width  - half - 2, c.x));
+        c.y = MAX(half + 30, MIN(sb.size.height - half - 34, c.y));
+        w.center = c;
+        return;
+    }
+    if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled) {
+        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+        [d setDouble:w.center.x forKey:kTDBallPosX];
+        [d setDouble:w.center.y forKey:kTDBallPosY];
+        TDHUDRegisterWindow(w);   // 几何变了，重挂一次更稳
+    }
 }
 
 - (void)setRunning:(BOOL)run {
@@ -648,12 +747,15 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
 
     // 悬浮球：TDHUDWindow 是「系统窗口」，配合 SBSAccessibilityWindowHostingController
     // 把 context 托管给 SpringBoard 渲染，所以切到抖音后依然浮在最上层、还能拖、还能点。
-    TDHUDWindow *fw = [[TDHUDWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    // ★ 窗口只做 76×76（球那么大），铺满全屏会吞掉整块屏幕的触摸（抖音全点不动）。
+    TDHUDWindow *fw = [[TDHUDWindow alloc] initWithFrame:CGRectMake(0, 0, kTDOverlaySide, kTDOverlaySide)];
     fw.windowLevel = 10000010.0;          // 高于状态栏/键盘/系统弹窗
     fw.backgroundColor = [UIColor clearColor];
     fw.rootViewController = [TDFloatVC new];
     self.floatWindow = fw;
     self.floatVC = (TDFloatVC *)fw.rootViewController;
+    gTDOverlayWindow = fw;
+    TDApplyBallPosition(fw);              // 恢复上次拖动的位置
     __weak typeof(self) ws = self;
     self.floatVC.onTap = ^{
         TDEngine *e = [TDEngine shared];
@@ -736,7 +838,13 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!self.floatWindow) return;
         self.floatWindow.hidden = NO;
-        TDHUDRegisterWindow(self.floatWindow);
+        // 兜底：万一窗口被谁改成全屏，立刻缩回小球大小，否则抖音整个屏幕都点不动
+        if (self.floatWindow.frame.size.width > kTDOverlaySide + 1 ||
+            self.floatWindow.frame.size.height > kTDOverlaySide + 1) {
+            TDApplyBallPosition(self.floatWindow);
+        } else {
+            TDHUDRegisterWindow(self.floatWindow);
+        }
 
         if (TDAutoStartGet() && [TDConfig shared].steps.count > 0 && ![TDEngine shared].running) {
             self->_autoStarted = YES;
