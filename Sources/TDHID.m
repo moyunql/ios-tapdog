@@ -507,8 +507,8 @@ static IOHIDFloat gPressRadius   = 0.04f;
 static IOHIDFloat gPressQuality  = 0.0f;
 static IOHIDFloat gPressDensity  = 0.0f;
 
-void TDSetInjectTouchPhysics(IOHIDFloat pressure, IOHIDFloat radius,
-                             IOHIDFloat quality, IOHIDFloat density) {
+void TDSetInjectTouchPhysics(CGFloat pressure, CGFloat radius,
+                             CGFloat quality, CGFloat density) {
     gPressPressure = pressure;
     gPressRadius   = radius;
     gPressQuality  = quality;

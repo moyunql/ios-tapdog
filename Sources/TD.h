@@ -70,8 +70,8 @@ void TDRunInjectPlan(NSInteger i, CGPoint p);
 /// 改的是 finger 事件的 tipPressure / majorRadius / quality / density。
 /// 发 pressure=0 等于告诉系统「一个没有按压力、面积为 0 的接触点」，
 /// 很可能在过滤阶段就被当噪声丢掉。这一组参数可以单独扫，用来验证这个猜测。
-void TDSetInjectTouchPhysics(IOHIDFloat pressure, IOHIDFloat radius,
-                             IOHIDFloat quality, IOHIDFloat density);
+void TDSetInjectTouchPhysics(CGFloat pressure, CGFloat radius,
+                             CGFloat quality, CGFloat density);
 NSString *TDInjectTouchPhysicsDesc(void);
 /// 用监听学到的真实 senderID 当事件来源（不是猜的，是本机数字转换器的真值）
 void TDSetInjectSampleSender(BOOL on);
