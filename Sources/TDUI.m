@@ -1020,11 +1020,17 @@ static NSString *TDCalibModeName(NSInteger m) {
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 2; }
 
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
-    return s == 0 ? @"脚本（点选，左滑删除）" : @"";
+    if (s == 0) {
+        NSDictionary *info = [NSBundle mainBundle].infoDictionary;
+        return [NSString stringWithFormat:@"脚本（%@ · build %@）",
+                info[@"CFBundleShortVersionString"] ?: @"?",
+                info[@"CFBundleVersion"] ?: @"?"];
+    }
+    return @"工具";
 }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    return s == 0 ? [TDScriptStore shared].scripts.count : 2;
+    return s == 0 ? [TDScriptStore shared].scripts.count : 3;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
@@ -1046,6 +1052,10 @@ static NSString *TDCalibModeName(NSInteger m) {
         if (ip.row == 0) {
             c.textLabel.text = @"＋ 新建脚本";
             c.detailTextLabel.text = @"从空白开始，用录制往里加步骤";
+        } else if (ip.row == 1) {
+            c.textLabel.text = @"注入自检";
+            c.detailTextLabel.text = [NSString stringWithFormat:@"点得动吗 · 已注入 %ld 次",
+                                      (long)TDInjectCount()];
         } else {
             TDConfig *cfg = [TDConfig shared];
             c.textLabel.text = @"循环次数 / 点击偏移";
@@ -1070,6 +1080,8 @@ static NSString *TDCalibModeName(NSInteger m) {
         [[TDScriptStore shared] createScript];
         [tv reloadData];
         [self refreshButtons];
+    } else if (ip.row == 1) {
+        [self.navigationController pushViewController:[TDSelfTestVC new] animated:YES];
     } else {
         [self editSettings];
     }
