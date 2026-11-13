@@ -95,6 +95,7 @@ void TDLog(NSString *fmt, ...) {
     BOOL _failsafeFired;        // 这次运行有没有已经兜过底（once 用）
     BOOL _inFailsafe;           // 正在跑兜底动作（防止兜底里再套兜底）
     NSInteger _fbIndex;         // 兜底动作跑到第几步（只为日志）
+    NSInteger _fsPos;           // 判断的位置：0 当场 / 1 每轮开始 / 2 每轮末尾
 }
 
 + (instancetype)shared {
@@ -187,6 +188,8 @@ static CGPoint TDJitter(CGPoint p, double r) {
     _failsafeFired = NO;
     _inFailsafe = NO;
     _fbIndex = 0;
+    _fsPos = failsafe ? [failsafe[@"pos"] integerValue] : 0;
+    if (_fsPos < 0 || _fsPos > 2) _fsPos = 0;
     NSArray *plan = [steps copy];
     _currentPlan = plan;
 
@@ -196,20 +199,30 @@ static CGPoint TDJitter(CGPoint p, double r) {
     if (failsafe) {
         NSArray *fsteps = failsafe[@"steps"];
         NSString *tpl = [failsafe[@"tpl"] isKindOfClass:[NSString class]] ? failsafe[@"tpl"] : @"";
-        [self logMsg:@"判断已开：识图%@找不到时跑 %lu 步兜底动作（%@）",
+        [self logMsg:@"判断已开：%@找不到时跑 %lu 步兜底动作（%@，%@）",
                       tpl.length ? tpl : @"任意",
                       (unsigned long)fsteps.count,
-                      [failsafe[@"once"] boolValue] ? @"只第一次触发" : @"每次都触发"];
+                      [failsafe[@"once"] boolValue] ? @"只第一次触发" : @"每次都触发",
+                      [self failsafePosDesc]];
     }
 
     dispatch_async(_q, ^{
         NSInteger round = 0;
         while (self->_running) {
+            // 判断放在「脚本开始」：开跑之前先看一眼画面，
+            // 图不在就直接做兜底动作，然后再按原样跑主脚本。
+            if (self->_fsPos == 1) { @autoreleasepool { [self failsafeGate:@"脚本开始"]; } }
+            if (!self->_running) break;
+
             for (NSDictionary *st in plan) {
                 if (!self->_running) break;
                 @autoreleasepool { [self execStep:st]; }
             }
             if (!self->_running) break;
+
+            // 判断放在「脚本末尾」：这一轮跑完了再回头检查，图不在就补一段兜底。
+            if (self->_fsPos == 2) { @autoreleasepool { [self failsafeGate:@"脚本末尾"]; } }
+
             round++;
             self->_loopsDone = round;
             if (loops > 0 && round >= loops) break;
@@ -310,7 +323,8 @@ static CGPoint TDJitter(CGPoint p, double r) {
     }
 
     // 粘贴：把评论话术塞进「当前有焦点」的输入框。
-    // 取文本 → 写剪贴板 → Cmd+V。前面的步骤要先把输入框点开（这一步不管焦点）。
+    // 取文本 → 写剪贴板 → 长按输入框弹菜单再点「粘贴」（或 Cmd+V，看设置）。
+    // 输入框位置取「上一次注入的落点」—— 也就是脚本里点评论框那一下。
     if ([t isEqualToString:@"paste"]) {
         NSString *txt = [st[@"text"] isKindOfClass:[NSString class]] ? [st[@"text"] copy] : nil;
         BOOL fromPool = (txt.length == 0);
@@ -319,9 +333,10 @@ static CGPoint TDJitter(CGPoint p, double r) {
             [self logMsg:@"%@ 要粘贴，但评论池是空的（去脚本编辑页加几条话术）", [self stepTag:st]];
             return;
         }
-        TDPasteText(txt);
+        CGPoint anchor = [self pasteAnchorFor:st];
+        TDPasteTextAt(txt, anchor);
         NSString *show = txt.length > 12 ? [[txt substringToIndex:12] stringByAppendingString:@"…"] : txt;
-        [self logMsg:@"粘贴%@：%@", fromPool ? @"（池随机）" : @"", show];
+        [self logMsg:@"粘贴%@（%@）：%@", fromPool ? @"（池随机）" : @"", TDPasteMethodDesc(), show];
         usleep((useconds_t)(interval * 1000));
         return;
     }
@@ -375,7 +390,8 @@ static CGPoint TDJitter(CGPoint p, double r) {
         UIImage *tpl = [UIImage imageWithContentsOfFile:[dir stringByAppendingPathComponent:name]];
         if (!tpl) {
             [self logMsg:@"模板文件不见了：%@", name];
-            [self runFailsafeFor:name];
+            // 判断放在首/尾时，失败当场不兜底 —— 那一轮的首尾会自己检查
+            if (self->_fsPos == 0) [self runFailsafeFor:name];
             return;
         }
 
@@ -397,7 +413,7 @@ static CGPoint TDJitter(CGPoint p, double r) {
 
         if (!m) {
             [self logMsg:@"识图没找到 %@（阈值 %.2f，试了 %ld 次）", name, th, (long)tries];
-            [self runFailsafeFor:name];
+            if (self->_fsPos == 0) [self runFailsafeFor:name];
             return;
         }
         if (scaledHit) {
@@ -415,6 +431,76 @@ static CGPoint TDJitter(CGPoint p, double r) {
         usleep((useconds_t)(interval * 1000));
         return;
     }
+}
+
+/// 粘贴要用的「输入框在哪儿」。
+/// 优先用刚刚注入过的落点（脚本里点评论框那一下就是它）；
+/// 没有就往前翻最近的点击步骤（脚本刚启动、还没点过任何东西时用得上）。
+/// 两者都没有就返回 (0,0)，粘贴那边会退回 Cmd+V，绝不瞎长按屏幕。
+- (CGPoint)pasteAnchorFor:(NSDictionary *)st {
+    if (TDLastTapPointReady()) return TDLastTapPoint();
+    NSInteger idx = (NSInteger)[_currentPlan indexOfObjectIdenticalTo:st];
+    for (NSInteger i = idx - 1; i >= 0; i--) {
+        NSDictionary *p = _currentPlan[i];
+        NSString *pt = p[@"t"];
+        if ([pt isEqualToString:@"tap"] || [pt isEqualToString:@"long"]) {
+            return CGPointMake([p[@"x"] doubleValue], [p[@"y"] doubleValue]);
+        }
+    }
+    return CGPointZero;
+}
+
+/// 判断的位置说成人话（日志里用）
+- (NSString *)failsafePosDesc {
+    switch (_fsPos) {
+        case 1:  return @"位置＝每轮脚本开始";
+        case 2:  return @"位置＝每轮脚本末尾";
+        default: return @"位置＝识图失败当场";
+    }
+}
+
+/// 这条判断到底在判断哪张图：
+/// 指定了模板就用它；没指定就取脚本里第一个识图步骤的模板。
+/// 两个都没有 = 没东西可判断（首/尾这种「主动看一眼」的模式就没法做）。
+- (NSString *)failsafeSubjectTpl {
+    NSString *want = [_failsafe[@"tpl"] isKindOfClass:[NSString class]] ? _failsafe[@"tpl"] : @"";
+    if (want.length) return want;
+    for (NSDictionary *st in _currentPlan) {
+        if (![[st[@"t"] description] isEqualToString:@"find"]) continue;
+        NSString *n = [st[@"tpl"] isKindOfClass:[NSString class]] ? st[@"tpl"] : @"";
+        if (n.length) return n;
+    }
+    return nil;
+}
+
+/// 首/尾判断的闸门：主动截一屏看目标图在不在。
+/// 在 → 什么都不做；不在 → 跑兜底动作（走 runFailsafeFor，所以 once / 模板匹配照常生效）。
+- (void)failsafeGate:(NSString *)where {
+    NSDictionary *fs = _failsafe;
+    if (!fs || _inFailsafe || !_running) return;
+    if (![fs[@"on"] boolValue]) return;
+
+    NSString *tplName = [self failsafeSubjectTpl];
+    if (tplName.length == 0) {
+        [self logMsg:@"判断设在「%@」，但没选模板、脚本里也没有识图步骤 → 没法判断，跳过", where];
+        return;
+    }
+    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    UIImage *img = [UIImage imageWithContentsOfFile:[dir stringByAppendingPathComponent:tplName]];
+    if (!img) {
+        [self logMsg:@"判断（%@）：模板 %@ 不在，直接兜底", where, tplName];
+        [self runFailsafeFor:tplName];
+        return;
+    }
+
+    double th = [TDConfig shared].threshold;
+    TDMatch *m = TDfindImageSmart(img, tplName, th, NULL);
+    if (m) {
+        [self logMsg:@"判断（%@）：%@ 在（%.2f）→ 不用兜底", where, tplName, m.score];
+        return;
+    }
+    [self logMsg:@"判断（%@）：%@ 不在（阈值 %.2f）", where, tplName, th];
+    [self runFailsafeFor:tplName];
 }
 
 /// 步骤序号（只为日志好读：能对上编辑页里的第几行）。

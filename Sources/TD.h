@@ -122,6 +122,32 @@ NSInteger TDPasteVariant(void);
 void TDSetPasteVariant(NSInteger v);
 NSString *TDPasteVariantDesc(void);
 
+#pragma mark - 粘贴方式（Cmd+V 走不通时的替代方案）
+
+/// 这台机器实测：HID 键盘事件（Cmd+V）打不进抖音的评论框 —— 输入法那条通道
+/// 对非平台进程是关着的。所以粘贴改成三条路，评论池页可以现场切：
+///   0 = Cmd+V（HID 键盘事件，老方案，留着）
+///   1 = 长按输入框 → 系统弹出编辑菜单 → 点菜单里的「粘贴」（全触摸注入，默认）
+///   2 = 长按弹菜单 → 用识图找「粘贴」两个字再点（需要模板 tpl_paste.png）
+NSInteger TDPasteMethod(void);
+void TDSetPasteMethod(NSInteger m);
+NSString *TDPasteMethodDesc(void);
+
+/// 方式 1/2 的菜单落点：相对长按点的偏移（点）。默认 dx=0 / dy=-62 = 落点正上方。
+/// 弹不出来/点偏了就在评论池页长按「粘贴方式」按钮现场调。
+void TDPasteSetMenuOffset(CGFloat dx, CGFloat dy);
+CGPoint TDPasteMenuOffset(void);
+void TDPasteSetHoldMs(double holdMs);
+double TDPasteHoldMs(void);
+
+/// 上一次注入点下去的位置 —— 粘贴拿它当「输入框在哪儿」的锚点
+CGPoint TDLastTapPoint(void);
+BOOL TDLastTapPointReady(void);
+void TDSetLastTapPoint(CGPoint p);
+
+/// 在 anchor 处粘贴一条文本（anchor 不合法就退回 Cmd+V）
+void TDPasteTextAt(NSString *text, CGPoint anchor);
+
 #pragma mark - 评论池（话术）
 
 /// 评论池存 Documents/comment_pool.txt，一行一条。读出来的都是去空白后的非空行。
@@ -198,6 +224,10 @@ void TDSetScaleHint(NSString * _Nullable tplName, double scale);
 /// 脚本级还有两块配置（都可选，缺省等于关）：
 ///   loop     {"on":1,"count":5,"gap":800}   整套脚本循环几次（count=0 无限），每轮之间歇多久
 ///   failsafe {"on":1,"tpl":"","once":1,     判断：识图找不到时做什么
+///             "pos":2,                      判断放在哪儿做：
+///                                           0 = 识图失败当场（默认，原来的行为）
+///                                           1 = 每轮脚本**开始时**先判断一次
+///                                           2 = 每轮脚本**跑完后**判断一次
 ///             "steps":[ …同普通步骤… ]}      tpl 空 = 任意识图失败都算；steps 可带随机参数
 @interface TDScript : NSObject
 @property (nonatomic, copy) NSString *name;

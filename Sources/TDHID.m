@@ -936,7 +936,19 @@ static void TDSynthTap(CGFloat x, CGFloat y) {
     TDEmit(kMaskUp, NO, x, y, ident);
 }
 
+// 上一次注入点下去的位置。
+// 粘贴（长按弹菜单那种）需要一个「落点」——输入框在哪儿。脚本里点评论框那一下
+// 就是最好的锚点，所以每注入一次就记一下，粘贴步骤直接拿来用。
+static CGPoint gLastTapPt = {0, 0};
+static BOOL gLastTapOK = NO;
+
+CGPoint TDLastTapPoint(void) { return gLastTapPt; }
+BOOL TDLastTapPointReady(void) { return gLastTapOK; }
+void TDSetLastTapPoint(CGPoint p) { gLastTapPt = p; gLastTapOK = YES; }
+
 void TDtap(CGFloat x, CGFloat y) {
+    gLastTapPt = CGPointMake(x, y);
+    gLastTapOK = YES;
     // 学到过真实触摸时优先走「真实事件副本」这条路：
     // 物理事件的字段（senderID、quality、pressure、display 信息…）全都齐，
     // 系统不会当成伪造输入丢掉；我们自己拼的那份永远缺东西。
@@ -950,6 +962,8 @@ void TDtap(CGFloat x, CGFloat y) {
 }
 
 void TDlongPress(CGFloat x, CGFloat y, NSTimeInterval sec) {
+    gLastTapPt = CGPointMake(x, y);
+    gLastTapOK = YES;
     uint32_t ident = TDNextIdentity();
     TDEmit(kMaskDown, YES, x, y, ident);
     NSTimeInterval d = sec > 0 ? sec : 0.8;

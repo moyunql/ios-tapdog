@@ -19,7 +19,8 @@ static NSString *TDScriptsPath(void) {
         _createdAt = [[NSDate date] timeIntervalSince1970];
         _steps = [NSMutableArray array];
         // 判断默认关：老脚本打开就是原来的行为，不会莫名多出一段兜底动作
-        _failsafe = [@{@"on": @NO, @"tpl": @"", @"once": @YES,
+        // pos：判断在哪儿做 —— 0 识图失败当场 / 1 脚本开始时 / 2 脚本末（每轮跑完）
+        _failsafe = [@{@"on": @NO, @"tpl": @"", @"once": @YES, @"pos": @0,
                        @"steps": [NSMutableArray array]} mutableCopy];
         // 循环默认关：一条脚本默认跑一遍
         _loop = [@{@"on": @NO, @"count": @1, @"gap": @800} mutableCopy];

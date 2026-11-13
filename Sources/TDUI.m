@@ -7,15 +7,15 @@
 // 主界面（按键精灵式：录制 / 播放 / 停止 + 脚本列表 + 诊断）
 // ---------------------------------------------------------------------------
 
-#define TD_BG      [UIColor colorWithRed:0.043 green:0.067 blue:0.086 alpha:1]
-#define TD_CARD    [UIColor colorWithRed:0.078 green:0.110 blue:0.145 alpha:1]
-#define TD_LINE    [UIColor colorWithRed:0.125 green:0.169 blue:0.212 alpha:1]
-#define TD_TEXT    [UIColor colorWithRed:0.910 green:0.937 blue:0.961 alpha:1]
-#define TD_DIM     [UIColor colorWithRed:0.545 green:0.627 blue:0.694 alpha:1]
-#define TD_ACCENT  [UIColor colorWithRed:0.231 green:0.541 blue:0.980 alpha:1]
-#define TD_RED     [UIColor colorWithRed:0.902 green:0.263 blue:0.263 alpha:1]
-#define TD_GREEN   [UIColor colorWithRed:0.235 green:0.749 blue:0.478 alpha:1]
-#define TD_YELLOW  [UIColor colorWithRed:0.960 green:0.710 blue:0.290 alpha:1]
+#define TD_BG      [UIColor colorWithRed:0.957 green:0.965 blue:0.973 alpha:1]
+#define TD_CARD    [UIColor colorWithRed:1.000 green:1.000 blue:1.000 alpha:1]
+#define TD_LINE    [UIColor colorWithRed:0.851 green:0.871 blue:0.890 alpha:1]
+#define TD_TEXT    [UIColor colorWithRed:0.106 green:0.125 blue:0.149 alpha:1]
+#define TD_DIM     [UIColor colorWithRed:0.420 green:0.451 blue:0.482 alpha:1]
+#define TD_ACCENT  [UIColor colorWithRed:0.129 green:0.447 blue:0.918 alpha:1]
+#define TD_RED     [UIColor colorWithRed:0.812 green:0.165 blue:0.165 alpha:1]
+#define TD_GREEN   [UIColor colorWithRed:0.094 green:0.549 blue:0.302 alpha:1]
+#define TD_YELLOW  [UIColor colorWithRed:0.741 green:0.494 blue:0.047 alpha:1]
 
 #pragma mark - 任意触摸捕获层
 
@@ -198,7 +198,7 @@
     [self.view addSubview:_status];
 
     _target = [[UIView alloc] initWithFrame:CGRectZero];
-    _target.backgroundColor = [UIColor colorWithRed:0.25 green:0.30 blue:0.36 alpha:1];
+    _target.backgroundColor = [UIColor colorWithRed:0.878 green:0.898 blue:0.925 alpha:1];
     _target.layer.cornerRadius = 14;
     _target.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:_target];
@@ -776,7 +776,7 @@ static const NSInteger kPhysCaseCount = (NSInteger)(sizeof(kPhysCases) / sizeof(
         self->_target.backgroundColor = TD_GREEN;
     } completion:^(BOOL f) {
         [UIView animateWithDuration:0.25 animations:^{
-            self->_target.backgroundColor = [UIColor colorWithRed:0.25 green:0.30 blue:0.36 alpha:1];
+            self->_target.backgroundColor = [UIColor colorWithRed:0.878 green:0.898 blue:0.925 alpha:1];
         }];
     }];
 }
@@ -1276,7 +1276,7 @@ static NSString *TDCalibModeName(NSInteger m) {
             c.detailTextLabel.text = @"按 Home 切过去等着";
         } else {
             c.textLabel.text = @"5 秒后往屏幕中间注入一次";
-            c.textLabel.textColor = [UIColor colorWithRed:0.24 green:0.80 blue:0.42 alpha:1.0];
+            c.textLabel.textColor = [UIColor colorWithRed:0.094 green:0.549 blue:0.302 alpha:1.0];
             c.detailTextLabel.text = @"看到红圈 + 视频暂停 = 这个组合对了";
         }
     }
@@ -1822,7 +1822,7 @@ static NSString *TDCalibModeName(NSInteger m) {
 UIViewController *TDCreateMainVC(void) {
     TDMainVC *root = [TDMainVC new];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:root];
-    nav.navigationBar.barStyle = UIBarStyleBlack;
+    nav.navigationBar.barStyle = UIBarStyleDefault;
     nav.navigationBar.tintColor = TD_ACCENT;
     nav.navigationBar.translucent = YES;
     if (@available(iOS 13.0, *)) {

@@ -15,9 +15,9 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.14.0</string>
+	<string>1.15.0</string>
 	<key>CFBundleVersion</key>
-	<string>42</string>
+	<string>43</string>
 	<key>MinimumOSVersion</key>
 	<string>15.0</string>
 	<key>CFBundleSupportedPlatforms</key>
@@ -53,6 +53,10 @@
 		<string>UIInterfaceOrientationPortrait</string>
 	</array>
 	<key>UIStatusBarStyle</key>
-	<string>UIStatusBarStyleLightContent</string>
+	<string>UIStatusBarStyleDarkContent</string>
+	<!-- 界面整体是白底黑字，强制 Light：不然系统深色模式下系统控件（键盘、分段控件、
+	     弹窗）会变深色，和白底撞在一起。 -->
+	<key>UIUserInterfaceStyle</key>
+	<string>Light</string>
 </dict>
 </plist>

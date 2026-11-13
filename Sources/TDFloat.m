@@ -157,13 +157,13 @@ static void TDFloatRefreshHead(void) {
     NSString *state;
     if (r.recording) {
         state = @"录制中";
-        c = [UIColor colorWithRed:1.00 green:0.62 blue:0.15 alpha:1];
+        c = [UIColor colorWithRed:0.85 green:0.45 blue:0.02 alpha:1];
     } else if (e.running) {
         state = [NSString stringWithFormat:@"运行中 · 第 %ld 轮", (long)MAX(1, e.loopsDone)];
-        c = [UIColor colorWithRed:0.30 green:0.82 blue:0.48 alpha:1];
+        c = [UIColor colorWithRed:0.06 green:0.52 blue:0.25 alpha:1];
     } else {
         state = @"空闲";
-        c = [UIColor colorWithWhite:0.62 alpha:1];
+        c = [UIColor colorWithWhite:0.46 alpha:1];
     }
     gLogHead.attributedText = [[NSAttributedString alloc]
         initWithString:[NSString stringWithFormat:@"● %@", state]
@@ -229,19 +229,19 @@ void TDFloatRefresh(void) {
 static UIColor *TDFloatLogColor(NSString *m) {
     if ([m containsString:@"没找到"] || [m containsString:@"不见了"] ||
         [m containsString:@"起不来"] || [m containsString:@"空的"]) {
-        return [UIColor colorWithRed:1.00 green:0.45 blue:0.42 alpha:1];
+        return [UIColor colorWithRed:0.78 green:0.13 blue:0.12 alpha:1];
     }
     if ([m containsString:@"→ 点"] || [m containsString:@"命中"] ||
         [m containsString:@"靠尺度扫描"]) {
-        return [UIColor colorWithRed:0.40 green:0.88 blue:0.55 alpha:1];
+        return [UIColor colorWithRed:0.05 green:0.47 blue:0.24 alpha:1];
     }
     if ([m containsString:@"判断"] || [m containsString:@"兜底"]) {
-        return [UIColor colorWithRed:1.00 green:0.80 blue:0.35 alpha:1];
+        return [UIColor colorWithRed:0.62 green:0.40 blue:0.00 alpha:1];
     }
     if ([m containsString:@"粘贴"]) {
-        return [UIColor colorWithRed:0.45 green:0.72 blue:1.00 alpha:1];
+        return [UIColor colorWithRed:0.09 green:0.36 blue:0.78 alpha:1];
     }
-    return [UIColor colorWithWhite:0.80 alpha:1];
+    return [UIColor colorWithWhite:0.30 alpha:1];
 }
 
 static void TDFloatRenderLog(void) {
@@ -262,7 +262,7 @@ static void TDFloatRenderLog(void) {
         [as appendAttributedString:[[NSAttributedString alloc]
             initWithString:@"（还没开始跑，点 ▶ 后这里会显示识图结果）"
                 attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:9.5],
-                             NSForegroundColorAttributeName: [UIColor colorWithWhite:0.55 alpha:1]}]];
+                             NSForegroundColorAttributeName: [UIColor colorWithWhite:0.50 alpha:1]}]];
     }
     gLogBody.attributedText = as;
 }
@@ -295,10 +295,10 @@ static void TDFloatEnsureLogWindow(void) {
     }
 
     gLogPanel = [[UIView alloc] initWithFrame:r];
-    gLogPanel.backgroundColor = [UIColor colorWithWhite:0 alpha:0.70];
+    gLogPanel.backgroundColor = [UIColor colorWithWhite:1 alpha:0.94];
     gLogPanel.layer.cornerRadius = 12;
     gLogPanel.layer.borderWidth = 1;
-    gLogPanel.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.14].CGColor;
+    gLogPanel.layer.borderColor = [UIColor colorWithWhite:0 alpha:0.13].CGColor;
     gLogPanel.userInteractionEnabled = NO;
     [vc.view addSubview:gLogPanel];
 
@@ -506,15 +506,17 @@ static void TDFloatStartLiveRecord(void) {
 - (void)buildToggle {
     gToggleView = [[UIView alloc] initWithFrame:CGRectZero];
     gToggleView.userInteractionEnabled = YES;
-    gToggleView.backgroundColor = [UIColor colorWithWhite:0 alpha:0.68];
+    gToggleView.backgroundColor = [UIColor colorWithWhite:1 alpha:0.94];
     gToggleView.layer.cornerRadius = 8;
+    gToggleView.layer.borderWidth = 1;
+    gToggleView.layer.borderColor = [UIColor colorWithWhite:0 alpha:0.13].CGColor;
     [gToggleView addGestureRecognizer:
         [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onToggleLog)]];
     [self.view addSubview:gToggleView];
 
     gToggleLabel = [[UILabel alloc] initWithFrame:CGRectZero];
     gToggleLabel.font = [UIFont systemFontOfSize:10.5 weight:UIFontWeightSemibold];
-    gToggleLabel.textColor = [UIColor colorWithWhite:0.86 alpha:1];
+    gToggleLabel.textColor = [UIColor colorWithWhite:0.24 alpha:1];
     gToggleLabel.textAlignment = NSTextAlignmentCenter;
     gToggleLabel.userInteractionEnabled = NO;
     [gToggleView addSubview:gToggleLabel];
@@ -526,8 +528,8 @@ static void TDFloatStartLiveRecord(void) {
     gToggleView.frame = CGRectMake(0, 0, kTDOverlayW, kTDStripH);
     gToggleLabel.frame = gToggleView.bounds;
     gToggleLabel.text = gLogOpen ? @"▤ 日志 ▾" : @"▤ 日志 ▸";
-    gToggleLabel.textColor = gLogOpen ? [UIColor colorWithWhite:0.92 alpha:1]
-                                      : [UIColor colorWithWhite:0.68 alpha:1];
+    gToggleLabel.textColor = gLogOpen ? [UIColor colorWithWhite:0.20 alpha:1]
+                                      : [UIColor colorWithWhite:0.45 alpha:1];
 }
 
 - (void)onToggleLog {

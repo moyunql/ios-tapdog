@@ -19,15 +19,15 @@
 // 存 Documents 下，文件名 tpl_xxx.png，回放时由引擎按名字取。
 // ---------------------------------------------------------------------------
 
-#define ED_BG     [UIColor colorWithRed:0.043 green:0.067 blue:0.086 alpha:1]
-#define ED_CARD   [UIColor colorWithRed:0.078 green:0.110 blue:0.145 alpha:1]
-#define ED_LINE   [UIColor colorWithRed:0.125 green:0.169 blue:0.212 alpha:1]
-#define ED_TEXT   [UIColor colorWithRed:0.910 green:0.937 blue:0.961 alpha:1]
-#define ED_DIM    [UIColor colorWithRed:0.545 green:0.627 blue:0.694 alpha:1]
-#define ED_ACCENT [UIColor colorWithRed:0.231 green:0.541 blue:0.980 alpha:1]
-#define ED_GREEN  [UIColor colorWithRed:0.235 green:0.749 blue:0.478 alpha:1]
-#define ED_RED    [UIColor colorWithRed:0.902 green:0.263 blue:0.263 alpha:1]
-#define ED_YELL   [UIColor colorWithRed:0.960 green:0.710 blue:0.290 alpha:1]
+#define ED_BG     [UIColor colorWithRed:0.957 green:0.965 blue:0.973 alpha:1]
+#define ED_CARD   [UIColor colorWithRed:1.000 green:1.000 blue:1.000 alpha:1]
+#define ED_LINE   [UIColor colorWithRed:0.851 green:0.871 blue:0.890 alpha:1]
+#define ED_TEXT   [UIColor colorWithRed:0.106 green:0.125 blue:0.149 alpha:1]
+#define ED_DIM    [UIColor colorWithRed:0.420 green:0.451 blue:0.482 alpha:1]
+#define ED_ACCENT [UIColor colorWithRed:0.129 green:0.447 blue:0.918 alpha:1]
+#define ED_GREEN  [UIColor colorWithRed:0.094 green:0.549 blue:0.302 alpha:1]
+#define ED_RED    [UIColor colorWithRed:0.812 green:0.165 blue:0.165 alpha:1]
+#define ED_YELL   [UIColor colorWithRed:0.741 green:0.494 blue:0.047 alpha:1]
 
 #pragma mark - 模板库
 
@@ -781,7 +781,7 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
 
     if (k == RPasteTest) {
         UITableViewCell *c = [self baseCell:@"ptest"];
-        c.textLabel.text = @"试粘贴一次（会真发 Cmd+V）";
+        c.textLabel.text = [NSString stringWithFormat:@"试粘贴一次（%@）", TDPasteMethodDesc()];
         c.textLabel.textColor = ED_ACCENT;
         c.textLabel.textAlignment = NSTextAlignmentCenter;
         c.selectionStyle = UITableViewCellSelectionStyleDefault;
@@ -872,10 +872,10 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
     }
     TDPasteText(txt);
     NSString *msg = [NSString stringWithFormat:
-                     @"已写剪贴板并发了一次 Cmd+V：\n「%@」\n\n"
-                      "发送方式：%@\n"
-                      "如果抖音输入框里没出现这段字，去「评论池」页换一种发送方式再试。",
-                     txt, TDPasteVariantDesc()];
+                     @"已写好剪贴板，按「%@」发了一次：\n「%@」\n\n"
+                      "想在抖音里看效果：用「▶ 试运行整条脚本」，前面要有一步先点开评论框。\n"
+                      "「长按 + 点菜单 / 识图」这两种必须在抖音里做，在这里按不出效果。",
+                     TDPasteMethodDesc(), txt];
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"已尝试粘贴"
                                                               message:msg
                                                        preferredStyle:UIAlertControllerStyleAlert];
@@ -1514,6 +1514,7 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
 
 - (NSMutableDictionary *)fs { return self.script.failsafe; }
 - (BOOL)on { return [[self fs][@"on"] boolValue]; }
+- (NSInteger)pos { return [[self fs][@"pos"] integerValue]; }
 
 - (NSMutableArray *)steps {
     id a = [self fs][@"steps"];
@@ -1534,7 +1535,7 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 3; }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    if (s == 0) return 2;              // 启用 + 只触发一次
+    if (s == 0) return 3;              // 启用 + 只触发一次 + 在哪儿判断
     if (s == 1) return [self on] ? 3 : 0;
     return [self on] ? (NSInteger)[self steps].count : 0;
 }
@@ -1548,7 +1549,11 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
     if (s == 0) {
         return @"「找不到自定义识图图片」时不再只是跳过：会先跑一遍下面的兜底动作，再继续主脚本。\n"
-                "目标模板留空 = 任何一个识图失败都算。";
+                "目标模板留空 = 任何一个识图失败都算。\n\n"
+                "在哪判断：\n"
+                "· 识图失败 → 跑到那一步发现没图上，当场做兜底（原来的行为）\n"
+                "· 脚本开始 → 每轮开跑前先看一眼画面，图不在就先做兜底再跑主脚本\n"
+                "· 脚本末尾 → 每轮跑完再检查，图不在就补一段兜底（刷完一条再判断用这个）";
     }
     if (s == 1) {
         return @"兜底动作就是你录下来的真实操作，录完会自动带上随机（位置 ±8pt / 时长 ±20% / 间隔 ±30%）。\n"
@@ -1575,7 +1580,7 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
             sw.onTintColor = ED_GREEN;
             [sw addTarget:self action:@selector(onChanged:) forControlEvents:UIControlEventValueChanged];
             c.accessoryView = sw;
-        } else {
+        } else if (ip.row == 1) {
             c.textLabel.text = @"只触发一次";
             UISwitch *sw = [[UISwitch alloc] init];
             sw.on = [[self fs][@"once"] boolValue];
@@ -1583,6 +1588,23 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
             [sw addTarget:self action:@selector(onceChanged:) forControlEvents:UIControlEventValueChanged];
             c.accessoryView = sw;
             c.detailTextLabel.text = @"关 = 每次找不到都兜底";
+        } else {
+            c.textLabel.text = @"在哪判断";
+            UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:
+                                       @[@"识图失败", @"脚本开始", @"脚本末尾"]];
+            seg.frame = CGRectMake(0, 0, 208, 30);
+            if (@available(iOS 13.0, *)) {
+                seg.selectedSegmentTintColor = ED_CARD;
+                [seg setTitleTextAttributes:@{NSForegroundColorAttributeName: ED_TEXT}
+                                   forState:UIControlStateSelected];
+                [seg setTitleTextAttributes:@{NSForegroundColorAttributeName: ED_DIM}
+                                   forState:UIControlStateNormal];
+            }
+            seg.tintColor = ED_ACCENT;
+            seg.selectedSegmentIndex = MIN(2, MAX(0, [self pos]));
+            [seg addTarget:self action:@selector(posChanged:) forControlEvents:UIControlEventValueChanged];
+            c.accessoryView = seg;
+            c.selectionStyle = UITableViewCellSelectionStyleNone;
         }
         return c;
     }
@@ -1626,6 +1648,13 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
 - (void)onceChanged:(UISwitch *)sw {
     [self fs][@"once"] = @(sw.on);
     [self commit];
+}
+
+- (void)posChanged:(UISegmentedControl *)seg {
+    [self fs][@"pos"] = @(MAX(0, seg.selectedSegmentIndex));
+    [self commit];
+    NSString *where = @[@"识图失败当场", @"每轮脚本开始", @"每轮脚本末尾"][MIN(2, seg.selectedSegmentIndex)];
+    TDLog(@"判断位置：%@", where);
 }
 
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
@@ -1804,6 +1833,9 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
     _modeBtn.layer.borderWidth = 1;
     _modeBtn.layer.borderColor = ED_LINE.CGColor;
     [_modeBtn addTarget:self action:@selector(onCycleMode) forControlEvents:UIControlEventTouchUpInside];
+    // 点一下切方式；长按调「菜单偏移」—— 菜单没点准就靠这个救
+    [_modeBtn addGestureRecognizer:
+        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(onOffset:)]];
     [self.view addSubview:_modeBtn];
     [self refreshModeBtn];
 }
@@ -1827,15 +1859,53 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
 }
 
 - (void)refreshModeBtn {
-    [_modeBtn setTitle:[NSString stringWithFormat:@"发送方式：%@\n（点一下切换）", TDPasteVariantDesc()]
+    NSString *extra = @"";
+    if (TDPasteMethod() != 0) {
+        CGPoint off = TDPasteMenuOffset();
+        extra = [NSString stringWithFormat:@"  偏移 %.0f,%.0f", off.x, off.y];
+    }
+    [_modeBtn setTitle:[NSString stringWithFormat:@"粘贴方式：%@%@\n（点切换 · 长按调偏移）",
+                        TDPasteMethodDesc(), extra]
               forState:UIControlStateNormal];
 }
 
 - (void)onCycleMode {
-    NSInteger v = (TDPasteVariant() + 1) % 3;
-    TDSetPasteVariant(v);
+    NSInteger v = (TDPasteMethod() + 1) % 3;
+    TDSetPasteMethod(v);
     [self refreshModeBtn];
-    TDLog(@"粘贴发送方式切到：%@", TDPasteVariantDesc());
+    TDLog(@"粘贴方式切到：%@", TDPasteMethodDesc());
+}
+
+/// 长按「粘贴方式」：调编辑菜单的落点偏移（相对长按位置）
+- (void)onOffset:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    CGPoint off = TDPasteMenuOffset();
+
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"菜单偏移"
+                         message:@"长按输入框后系统弹出的「粘贴」菜单，相对长按点的位置。\n"
+                                  "默认 0 / -62（正上方 62pt）。点偏了就往上下左右调几 pt。"
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"dx（左右，正数往右）";
+        tf.text = [NSString stringWithFormat:@"%.0f", off.x];
+        tf.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
+    }];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"dy（上下，负数往上）";
+        tf.text = [NSString stringWithFormat:@"%.0f", off.y];
+        tf.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction *x) {
+        double dx = [a.textFields[0].text doubleValue];
+        double dy = [a.textFields[1].text doubleValue];
+        TDPasteSetMenuOffset((CGFloat)dx, (CGFloat)dy);
+        [self refreshModeBtn];
+        TDLog(@"菜单偏移改成 %.0f / %.0f", dx, dy);
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 - (NSArray<NSString *> *)linesFromTV {
@@ -1874,11 +1944,33 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
         [self alertTitle:@"池是空的" message:@"先写一条话术再试"];
         return;
     }
-    TDPasteText(txt);
-    [self alertTitle:@"已发了一次 Cmd+V"
-             message:[NSString stringWithFormat:@"「%@」\n\n发送方式：%@\n"
-                       "先切到抖音、点开输入框再来试，否则字没地方落。",
-                       txt, TDPasteVariantDesc()]];
+
+    NSString *show = txt.length > 16 ? [[txt substringToIndex:16] stringByAppendingString:@"…"] : txt;
+
+    // Cmd+V 那种随时可点；长按菜单那种必须在抖音里做，所以给 4 秒切 App 的时间
+    if (TDPasteMethod() == 0) {
+        TDPasteText(txt);
+        [self alertTitle:@"已发了一次 Cmd+V"
+                 message:[NSString stringWithFormat:@"「%@」\n\n先切到抖音、点开输入框再来试，否则字没地方落。", show]];
+        return;
+    }
+    if (!TDLastTapPointReady()) {
+        [self alertTitle:@"还没有可用的落点"
+                 message:@"长按菜单这种方式要知道输入框在哪儿。\n\n"
+                          "先在抖音里跑一次脚本（哪怕只跑一步「点评论框」），"
+                          "落点就记住了，再来试就有地方落。"];
+        return;
+    }
+
+    __weak typeof(self) ws = self;
+    [self alertTitle:@"4 秒后粘贴"
+             message:[NSString stringWithFormat:@"「%@」\n\n现在切到抖音、把评论框点开（光标在框里），"
+                       "4 秒后会在上次的落点上长按并点「粘贴」。", show]];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        typeof(self) ss = ws;
+        if (ss) TDPasteTextAt(txt, TDLastTapPoint());
+    });
 }
 
 - (void)alertTitle:(NSString *)t message:(NSString *)m {
@@ -1986,8 +2078,10 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
             c.detailTextLabel.text = [_script loopDesc];
         } else if (ip.row == 1) {
             c.textLabel.text = @"⚖ 判断（识图找不到时）";
+            NSInteger pos = [_script.failsafe[@"pos"] integerValue];
+            NSString *where = @[@"当场", @"脚本开始", @"脚本末尾"][MIN(2, MAX(0, pos))];
             c.detailTextLabel.text = [_script failsafeEnabled]
-                ? [NSString stringWithFormat:@"开 · 兜底 %ld 步 · %@", (long)fsn,
+                ? [NSString stringWithFormat:@"开 · %@判断 · 兜底 %ld 步 · %@", where, (long)fsn,
                    [_script.failsafe[@"once"] boolValue] ? @"只触发一次" : @"每次触发"]
                 : @"关";
             c.textLabel.textColor = [_script failsafeEnabled] ? ED_YELL : ED_TEXT;
@@ -2211,7 +2305,7 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
 UIViewController *TDCreateScriptEditVC(TDScript *script) {
     TDScriptEditVC *vc = [[TDScriptEditVC alloc] initWithScript:script];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
-    nav.navigationBar.barStyle = UIBarStyleBlack;
+    nav.navigationBar.barStyle = UIBarStyleDefault;
     nav.navigationBar.tintColor = ED_GREEN;
     if (@available(iOS 13.0, *)) {
         UINavigationBarAppearance *ap = [[UINavigationBarAppearance alloc] init];
