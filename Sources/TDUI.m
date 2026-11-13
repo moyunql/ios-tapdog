@@ -1,12 +1,18 @@
 #import "TD.h"
 #import <AVFoundation/AVFoundation.h>
 #import <QuartzCore/QuartzCore.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
 
 // ---------------------------------------------------------------------------
 // 后台保活：UIBackgroundModes=audio + 循环播放静音，切到抖音后进程不被挂起
 // ---------------------------------------------------------------------------
+static NSString *gAudioStatus = @"未启动";
+
 @interface TDKeepAlive : NSObject
 + (void)start;
++ (NSString *)status;
 @end
 
 @implementation TDKeepAlive {
@@ -19,12 +25,17 @@
     return k;
 }
 + (void)start { [[self shared] begin]; }
++ (NSString *)status { return gAudioStatus; }
 
 - (void)begin {
     if (_player) return;
     AVAudioSession *s = [AVAudioSession sharedInstance];
-    [s setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:NULL];
-    [s setActive:YES error:NULL];
+    NSError *err = nil;
+    [s setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&err];
+    if (err) { gAudioStatus = [NSString stringWithFormat:@"setCategory 失败 %ld", (long)err.code]; return; }
+    err = nil;
+    [s setActive:YES error:&err];
+    if (err) { gAudioStatus = [NSString stringWithFormat:@"setActive 失败 %ld", (long)err.code]; return; }
 
     // 生成 1 秒 8kHz 单声道静音 PCM，包成最小 WAV
     const int rate = 8000, secs = 1, ch = 1, bits = 16;
@@ -47,10 +58,24 @@
 
     _player = [[AVAudioPlayer alloc] initWithData:wav error:NULL];
     _player.numberOfLoops = -1;
-    _player.volume = 0.0;
-    [_player play];
+    _player.volume = 0.02;
+    BOOL ok = [_player play];
+    gAudioStatus = ok ? @"静音播放中（后台不会被挂起）"
+                      : @"播放失败（切到抖音可能被挂起）";
 }
 @end
+
+// 沙盒探测：能往 /var/mobile/Media 写文件，说明 no-sandbox 权限真的生效了。
+static NSString *TDSandboxStatus(void) {
+    const char *path = "/var/mobile/Media/.tapdog_probe";
+    int fd = open(path, O_CREAT | O_WRONLY, 0644);
+    if (fd >= 0) {
+        close(fd);
+        unlink(path);
+        return @"已绕过（no-sandbox 生效）";
+    }
+    return [NSString stringWithFormat:@"受限 errno=%d（权限没生效）", errno];
+}
 
 #pragma mark - 取点面板
 
@@ -206,6 +231,8 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
     UITextView *_logView;
     UIButton *_runBtn;
     UIBarButtonItem *_runItem;
+    UILabel *_countdown;
+    NSTimer *_countTimer;
 }
 
 - (void)viewDidLoad {
@@ -259,12 +286,54 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
 
     [TDKeepAlive start];
     [[TDEngine shared] logMsg:@"HID: %@ | 截屏: %@", TDhidStatus(), TDcaptureStatus()];
+
+    // 倒计时大字：点「开始」后给 3 秒切到抖音
+    _countdown = [[UILabel alloc] initWithFrame:CGRectZero];
+    _countdown.font = [UIFont monospacedDigitSystemFontOfSize:96 weight:UIFontWeightBold];
+    _countdown.textColor = [UIColor colorWithRed:0.3 green:1 blue:0.6 alpha:1];
+    _countdown.textAlignment = NSTextAlignmentCenter;
+    _countdown.hidden = YES;
+    _countdown.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:_countdown];
+    [NSLayoutConstraint activateConstraints:@[
+        [_countdown.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [_countdown.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor],
+    ]];
+}
+
+- (void)startWithCountdown {
+    if (_countTimer) return;
+    __block NSInteger left = 3;
+    _countdown.text = @"3";
+    _countdown.hidden = NO;
+    [[TDEngine shared] logMsg:@"3 秒后开始，现在切到抖音"];
+    __weak typeof(self) ws = self;
+    _countTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *tm) {
+        typeof(self) ss = ws;
+        if (!ss) { [tm invalidate]; return; }
+        left--;
+        if (left <= 0) {
+            [tm invalidate];
+            ss->_countTimer = nil;
+            ss->_countdown.hidden = YES;
+            [[TDEngine shared] startWithScript:@{}];
+            [ss refreshRunBtn];
+            [ss->_tv reloadData];
+        } else {
+            ss->_countdown.text = [NSString stringWithFormat:@"%ld", (long)left];
+        }
+    }];
 }
 
 - (void)toggleRun {
     TDEngine *e = [TDEngine shared];
-    if (e.running) { [e stop]; }
-    else { [e startWithScript:@{}]; }
+    if (e.running) {
+        [e stop];
+        if (_countTimer) { [_countTimer invalidate]; _countTimer = nil; }
+        _countdown.hidden = YES;
+    } else {
+        [self startWithCountdown];
+    }
     [self refreshRunBtn];
     [_tv reloadData];
 }
@@ -282,7 +351,7 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
 }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    if (s == 0) return 3;
+    if (s == 0) return 5;
     if (s == 1) return [TDConfig shared].steps.count;
     return 4;
 }
@@ -313,6 +382,12 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
         } else if (ip.row == 1) {
             c.textLabel.text = @"截屏";
             c.detailTextLabel.text = TDcaptureStatus();
+        } else if (ip.row == 2) {
+            c.textLabel.text = @"沙盒 / 权限";
+            c.detailTextLabel.text = TDSandboxStatus();
+        } else if (ip.row == 3) {
+            c.textLabel.text = @"后台保活";
+            c.detailTextLabel.text = [TDKeepAlive status];
         } else {
             c.textLabel.text = @"随机偏移 / 阈值 / 循环";
             c.detailTextLabel.text = [NSString stringWithFormat:@"±%.0fpt   %.2f   %@",
@@ -337,7 +412,7 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
 
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
-    if (ip.section == 0 && ip.row == 2) { [self editSettings]; return; }
+    if (ip.section == 0 && ip.row == 4) { [self editSettings]; return; }
     if (ip.section != 2) return;
 
     TDPickerMode mode = (ip.row == 0) ? TDPickerTap : (ip.row == 1) ? TDPickerLong : (ip.row == 2) ? TDPickerSwipe : TDPickerRect;
@@ -433,6 +508,23 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
 
 #pragma mark - 悬浮球
 
+/// 全屏但只让球本身接收触摸，其余区域点击穿透，不影响下面的界面
+@interface TDPassView : UIView
+@property (nonatomic, weak) UIView *ball;
+@end
+
+@implementation TDPassView
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (self.ball && !self.ball.hidden) {
+        CGPoint p = [self convertPoint:point toView:self.ball];
+        if ([self.ball pointInside:p withEvent:event]) {
+            return [super hitTest:point withEvent:event];
+        }
+    }
+    return nil;
+}
+@end
+
 @interface TDFloatVC : UIViewController
 @property (nonatomic, copy) void (^onTap)(void);
 - (void)setRunning:(BOOL)run;
@@ -443,17 +535,25 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
     UILabel *_label;
 }
 
+- (void)loadView {
+    TDPassView *v = [[TDPassView alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    v.backgroundColor = [UIColor clearColor];
+    self.view = v;
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor clearColor];
 
     _ball = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 56, 56)];
+    _ball.center = CGPointMake(self.view.bounds.size.width - 38, self.view.bounds.size.height * 0.42);
     _ball.backgroundColor = [UIColor colorWithRed:0.18 green:0.33 blue:0.98 alpha:0.92];
     _ball.layer.cornerRadius = 28;
     _ball.layer.borderWidth = 2;
     _ball.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.55].CGColor;
     _ball.userInteractionEnabled = YES;
     [self.view addSubview:_ball];
+    ((TDPassView *)self.view).ball = _ball;
 
     _label = [[UILabel alloc] initWithFrame:_ball.bounds];
     _label.text = @"跑";
@@ -502,10 +602,10 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
     self.window.rootViewController = nav;
     [self.window makeKeyAndVisible];
 
-    // 悬浮球：entitlement com.apple.springboard.accessibility-window-hosting
-    // 让它能盖在别的 App 上面
-    CGRect b = [UIScreen mainScreen].bounds;
-    self.floatWindow = [[UIWindow alloc] initWithFrame:CGRectMake(b.size.width - 76, b.size.height * 0.5, 56, 56)];
+    // 悬浮球：只在 TapDog 自己的界面里可见。
+    // 想盖到别的 App 上面需要 SpringBoard 侧的 window hosting，纯 TrollStore 环境做不到，
+    // 所以实际用法是「点开始 → 3 秒倒计时 → 自己切到抖音」。
+    self.floatWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     self.floatWindow.windowLevel = 10000000;
     self.floatWindow.backgroundColor = [UIColor clearColor];
     self.floatWindow.rootViewController = [TDFloatVC new];
