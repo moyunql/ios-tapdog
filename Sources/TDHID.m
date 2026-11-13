@@ -2,59 +2,84 @@
 #import "IOHIDEvent.h"
 #import "IOHIDEventTypes.h"
 #import "IOHIDEventSystemClient.h"
+#import <dlfcn.h>
 #include <mach/mach_time.h>
 #include <unistd.h>
 
 // ---------------------------------------------------------------------------
-// 全局触摸注入：构造 digitizer(hand) + finger 子事件，交给 IOHIDEventSystemClient
-// 派发到系统 HID 栈，由 SpringBoard / 前台 App 接收。
-// 需要 com.apple.private.hid.client.event-dispatch 权限（见 entitlements.plist）
+// 全局触摸注入
+//
+// iOS 15 上要「点得动别的 App」，必须满足三条：
+//   1) IOHIDEventSystemClient 用 admin 类型创建（CreateWithType(…,1,…)）。
+//      普通 IOHIDEventSystemClientCreate 建出来的是 monitor 客户端，
+//      DispatchEvent 进去要么被丢弃，要么直接在 IOKit 里崩掉 —— 这正是
+//      之前「一点开始就闪退」的根源。
+//   2) hand 事件 IsDisplayIntegrated=1，坐标用「点」（不是像素）。
+//   3) finger 子事件也要带 DisplayIntegrated，且 range/touch 成对切换。
+//
+// 权限：com.apple.private.hid.client.event-dispatch
 // ---------------------------------------------------------------------------
 
-static IOHIDEventSystemClientRef gClient = NULL;
+typedef IOHIDEventSystemClientRef (*TDCreateWithTypeFn)(CFAllocatorRef, uint32_t, void *);
 
-// 常见的触摸注入 senderID，系统据此认定事件来自内建触摸屏
+static IOHIDEventSystemClientRef gClient = NULL;
+static int gClientType = -1;          // 1=admin 0=fallback
+
+// 内建触摸屏的 senderID；系统据此认定事件来自真实屏幕
 static const uint64_t kTDSenderID = 0x8000000817319372ULL;
 
-BOOL TDhidReady(void) {
-    if (gClient == NULL) {
-        gClient = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+static IOHIDEventSystemClientRef TDhidClient(void) {
+    if (gClient) return gClient;
+
+    TDCreateWithTypeFn create = (TDCreateWithTypeFn)dlsym(RTLD_DEFAULT,
+                                                           "IOHIDEventSystemClientCreateWithType");
+    if (create) {
+        // 1 = kIOHIDEventSystemClientTypeAdmin
+        gClient = create(kCFAllocatorDefault, 1, NULL);
+        if (gClient) gClientType = 1;
     }
-    return gClient != NULL;
+    if (!gClient) {
+        gClient = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+        if (gClient) gClientType = 0;
+    }
+    return gClient;
 }
+
+BOOL TDhidReady(void) { return TDhidClient() != NULL; }
 
 NSString *TDhidStatus(void) {
-    return TDhidReady() ? @"HID 就绪" : @"HID 失败:客户端创建不出来";
+    if (!TDhidClient()) {
+        return @"失败：客户端建不起来（检查 HID 权限）";
+    }
+    return gClientType == 1 ? @"就绪（admin）" : @"就绪（兼容模式）";
 }
 
-// 构造 hand 父事件（display integrated 必须为 1，否则系统不当作真实触摸）
-static IOHIDEventRef TDCreateHand(void) {
+// hand 父事件
+static IOHIDEventRef TDCreateHand(uint32_t mask, uint64_t ts) {
     IOHIDEventRef hand = IOHIDEventCreateDigitizerEvent(kCFAllocatorDefault,
-                                                       mach_absolute_time(),
+                                                       ts,
                                                        kIOHIDDigitizerTransducerTypeHand,
                                                        0, 0, 0, 0,
                                                        0.0, 0.0, 0.0, 0.0, 0.0,
                                                        0, 0, 0);
-    if (hand == NULL) return NULL;
-
+    if (!hand) return NULL;
     IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
-    IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerTiltX, kIOHIDDigitizerTransducerTypeHand);
-    IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerTiltY, 1);
-    IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerAltitude, 1);
     return hand;
 }
 
 // mask: kIOHIDDigitizerEvent* 位组合；touch: 当前是否接触屏幕
 static void TDEmit(uint32_t mask, BOOL touch, CGFloat x, CGFloat y) {
-    if (!TDhidReady()) return;
+    IOHIDEventSystemClientRef client = TDhidClient();
+    if (!client) return;
 
-    IOHIDEventRef hand = TDCreateHand();
-    if (hand == NULL) return;
+    uint64_t ts = mach_absolute_time();
+    IOHIDEventRef hand = TDCreateHand(mask, ts);
+    if (!hand) return;
 
     IOHIDEventRef finger = IOHIDEventCreateDigitizerFingerEvent(kCFAllocatorDefault,
-                                                               mach_absolute_time(),
+                                                               ts,
                                                                1,      // index
-                                                               3,      // identity
+                                                               2,      // identity
                                                                mask,
                                                                (IOHIDFloat)x,
                                                                (IOHIDFloat)y,
@@ -62,38 +87,40 @@ static void TDEmit(uint32_t mask, BOOL touch, CGFloat x, CGFloat y) {
                                                                touch ? 1 : 0,   // range
                                                                touch ? 1 : 0,   // touch
                                                                0);
-    if (finger != NULL) {
-        IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerMajorRadius, 0.04f);
-        IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerMinorRadius, 0.04f);
-        IOHIDEventAppendEvent(hand, finger);   // hand 持有 child
+    if (finger) {
+        IOHIDEventSetIntegerValue(finger, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
+        IOHIDEventSetIntegerValue(finger, kIOHIDEventFieldDigitizerTouch, touch ? 1 : 0);
+        IOHIDEventAppendEvent(hand, finger);
         CFRelease(finger);
     }
 
     IOHIDEventSetSenderID(hand, kTDSenderID);
-    IOHIDEventSystemClientDispatchEvent(gClient, hand);
+    IOHIDEventSystemClientDispatchEvent(client, hand);
     CFRelease(hand);
 }
 
-static const uint32_t kMaskDown = (kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventRange);
+static const uint32_t kMaskDown = (kIOHIDDigitizerEventTouch |
+                                   kIOHIDDigitizerEventRange |
+                                   kIOHIDDigitizerEventPosition);
 static const uint32_t kMaskMove = kIOHIDDigitizerEventPosition;
 static const uint32_t kMaskUp   = (kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventRange);
 
 void TDtap(CGFloat x, CGFloat y) {
     TDEmit(kMaskDown, YES, x, y);
-    usleep(30000);                 // 30ms，太短会被系统当抖动丢弃
+    usleep(50000);                 // 50ms，接近真人点按，太短会被当抖动丢掉
     TDEmit(kMaskUp, NO, x, y);
 }
 
 void TDlongPress(CGFloat x, CGFloat y, NSTimeInterval sec) {
     TDEmit(kMaskDown, YES, x, y);
     NSTimeInterval d = sec > 0 ? sec : 0.8;
-    // 期间补几帧 move，长按更稳（系统会判定 hold）
     NSInteger frames = (NSInteger)(d / 0.12);
     for (NSInteger i = 1; i <= frames; i++) {
         usleep((useconds_t)(0.12 * 1000000));
         TDEmit(kMaskMove, YES, x, y);
     }
-    usleep((useconds_t)((d - frames * 0.12) * 1000000));
+    NSTimeInterval rest = d - frames * 0.12;
+    if (rest > 0) usleep((useconds_t)(rest * 1000000));
     TDEmit(kMaskUp, NO, x, y);
 }
 
@@ -104,26 +131,23 @@ void TDgesture(NSArray<NSValue *> *points, NSTimeInterval sec) {
     TDEmit(kMaskDown, YES, first.x, first.y);
 
     NSTimeInterval total = sec > 0 ? sec : 0.35;
-    NSInteger segments = points.count - 1;
-    // 每段按距离分配帧数，保证匀速
+    NSInteger segments = (NSInteger)points.count - 1;
     CGFloat totalLen = 0;
-    for (NSInteger i = 1; i < (NSInteger)points.count; i++) {
+    for (NSUInteger i = 1; i < points.count; i++) {
         CGPoint a = [points[i - 1] CGPointValue];
         CGPoint b = [points[i] CGPointValue];
         totalLen += hypot(b.x - a.x, b.y - a.y);
     }
     if (totalLen < 1) totalLen = 1;
 
-    for (NSInteger i = 1; i < (NSInteger)points.count; i++) {
+    for (NSUInteger i = 1; i < points.count; i++) {
         CGPoint a = [points[i - 1] CGPointValue];
         CGPoint b = [points[i] CGPointValue];
         CGFloat len = hypot(b.x - a.x, b.y - a.y);
         NSInteger frames = MAX(2, (NSInteger)round(len / totalLen * total / 0.012));
         for (NSInteger f = 1; f <= frames; f++) {
             CGFloat t = (CGFloat)f / (CGFloat)frames;
-            CGFloat x = a.x + (b.x - a.x) * t;
-            CGFloat y = a.y + (b.y - a.y) * t;
-            TDEmit(kMaskMove, YES, x, y);
+            TDEmit(kMaskMove, YES, a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
             usleep((useconds_t)(total / (frames * MAX(1, segments)) * 1000000));
         }
     }

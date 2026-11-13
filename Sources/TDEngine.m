@@ -4,14 +4,7 @@
 #include <unistd.h>
 
 // ---------------------------------------------------------------------------
-// 配置 + 脚本引擎
-// 脚本结构（Documents/tapdog.json）：
-// { "jitter":4, "hold":30, "interval":200, "threshold":0.85, "loop":0,
-//   "steps":[ {"t":"tap","x":207,"y":660},
-//             {"t":"wait","ms":800},
-//             {"t":"swipe","x1":207,"y1":600,"x2":207,"y2":200,"ms":400},
-//             {"t":"gesture","pts":[[100,600],[200,400],[300,600]],"ms":600},
-//             {"t":"find","tpl":"tpl_1.png","th":0.85} ] }
+// 配置 + 回放引擎
 // ---------------------------------------------------------------------------
 
 static NSString *TDConfigPath(void) {
@@ -19,29 +12,27 @@ static NSString *TDConfigPath(void) {
     return [dir stringByAppendingPathComponent:@"tapdog.json"];
 }
 
-@implementation TDConfig {
-    NSMutableArray<NSMutableDictionary *> *_steps;
-}
+@implementation TDConfig
 
 + (instancetype)shared {
     static TDConfig *c = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         c = [TDConfig new];
-        c.jitterPx = 4;
-        c.tapHoldMs = 30;
-        c.intervalMs = 200;
-        c.threshold = 0.85;
-        c.loopCount = 0;
-        c->_steps = [NSMutableArray array];
         [c load];
     });
     return c;
 }
 
-- (NSMutableArray<NSMutableDictionary *> *)steps {
-    if (!_steps) _steps = [NSMutableArray array];
-    return _steps;
+- (instancetype)init {
+    if (self = [super init]) {
+        _jitterPx = 3;
+        _tapHoldMs = 50;
+        _intervalMs = 150;
+        _threshold = 0.85;
+        _loopCount = 1;
+    }
+    return self;
 }
 
 - (void)load {
@@ -50,60 +41,43 @@ static NSString *TDConfigPath(void) {
     id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL];
     if (![obj isKindOfClass:[NSDictionary class]]) return;
     NSDictionary *j = obj;
-    if (j[@"jitter"])   self.jitterPx = [j[@"jitter"] doubleValue];
-    if (j[@"hold"])     self.tapHoldMs = [j[@"hold"] doubleValue];
-    if (j[@"interval"]) self.intervalMs = [j[@"interval"] doubleValue];
-    if (j[@"threshold"])self.threshold = [j[@"threshold"] doubleValue];
-    if (j[@"loop"])     self.loopCount = [j[@"loop"] integerValue];
-    if ([j[@"steps"] isKindOfClass:[NSArray class]]) {
-        _steps = [NSMutableArray array];
-        for (id s in j[@"steps"]) {
-            if ([s isKindOfClass:[NSDictionary class]]) [self.steps addObject:[s mutableCopy]];
-        }
-    }
+    if (j[@"jitter"])   _jitterPx = [j[@"jitter"] doubleValue];
+    if (j[@"hold"])     _tapHoldMs = [j[@"hold"] doubleValue];
+    if (j[@"interval"]) _intervalMs = [j[@"interval"] doubleValue];
+    if (j[@"threshold"])_threshold = [j[@"threshold"] doubleValue];
+    if (j[@"loop"])     _loopCount = [j[@"loop"] integerValue];
 }
 
 - (void)save {
-    NSDictionary *j = @{ @"jitter": @(self.jitterPx),
-                         @"hold": @(self.tapHoldMs),
-                         @"interval": @(self.intervalMs),
-                         @"threshold": @(self.threshold),
-                         @"loop": @(self.loopCount),
-                         @"steps": self.steps };
+    NSDictionary *j = @{@"jitter": @(_jitterPx),
+                        @"hold": @(_tapHoldMs),
+                        @"interval": @(_intervalMs),
+                        @"threshold": @(_threshold),
+                        @"loop": @(_loopCount)};
     NSData *d = [NSJSONSerialization dataWithJSONObject:j options:NSJSONWritingPrettyPrinted error:NULL];
     [d writeToFile:TDConfigPath() atomically:YES];
-}
-
-- (void)addStep:(NSDictionary *)step {
-    [[self steps] addObject:[step mutableCopy]];
-    [self save];
-}
-
-- (void)removeStepAtIndex:(NSInteger)idx {
-    if (idx < 0 || idx >= (NSInteger)[self steps].count) return;
-    [[self steps] removeObjectAtIndex:idx];
-    [self save];
-}
-
-- (void)moveStepFrom:(NSInteger)from to:(NSInteger)to {
-    NSMutableArray *s = [self steps];
-    if (from < 0 || from >= (NSInteger)s.count) return;
-    NSMutableDictionary *o = s[from];
-    [s removeObjectAtIndex:from];
-    if (to < 0) to = 0;
-    if (to > (NSInteger)s.count) to = s.count;
-    [s insertObject:o atIndex:to];
-    [self save];
 }
 
 @end
 
 #pragma mark - 引擎
 
+void TDSetLogHandler(void (^h)(NSString *)) {
+    [TDEngine shared].logHandler = h;
+}
+
+void TDLog(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    [[TDEngine shared] logMsg:@"%@", s];
+}
+
 @implementation TDEngine {
     BOOL _running;
     dispatch_queue_t _q;
-    NSInteger _doneCount;
+    NSInteger _loopsDone;
     NSString *_jetsamStatus;
 }
 
@@ -118,6 +92,9 @@ static NSString *TDConfigPath(void) {
 }
 
 - (BOOL)running { return _running; }
+- (NSInteger)loopsDone { return _loopsDone; }
+- (NSString *)jetsamStatus { return _jetsamStatus; }
+- (void)setJetsamStatus:(NSString *)s { _jetsamStatus = [s copy]; }
 
 - (void)logMsg:(NSString *)fmt, ... {
     va_list ap;
@@ -126,6 +103,9 @@ static NSString *TDConfigPath(void) {
     va_end(ap);
     void (^h)(NSString *) = self.logHandler;
     if (h) dispatch_async(dispatch_get_main_queue(), ^{ h(s); });
+#ifdef DEBUG
+    NSLog(@"[tapdog] %@", s);
+#endif
 }
 
 static CGPoint TDJitter(CGPoint p, double r) {
@@ -135,36 +115,38 @@ static CGPoint TDJitter(CGPoint p, double r) {
     return CGPointMake(p.x + cos(a) * d, p.y + sin(a) * d);
 }
 
-- (void)startWithScript:(NSDictionary *)script {
-    if (_running) return;
-    TDConfig *cfg = [TDConfig shared];
-    NSArray *steps = script[@"steps"] ?: cfg.steps;
+- (void)playSteps:(NSArray<NSDictionary *> *)steps loop:(NSInteger)loops {
+    if (_running) {
+        [self logMsg:@"已经在跑了"];
+        return;
+    }
     if (steps.count == 0) {
-        [self logMsg:@"还没有步骤，先在「添加」里取几个点"];
+        [self logMsg:@"脚本是空的，先录一遍"];
         return;
     }
     _running = YES;
-    _doneCount = 0;
-    NSInteger loops = script[@"loop"] ? [script[@"loop"] integerValue] : cfg.loopCount;
+    _loopsDone = 0;
+    NSArray *plan = [steps copy];
 
-    [self logMsg:@"开始，共 %lu 步，循环 %@", (unsigned long)steps.count,
+    [self logMsg:@"开始：%lu 步，循环 %@", (unsigned long)plan.count,
                   loops == 0 ? @"无限" : [NSString stringWithFormat:@"%ld 次", (long)loops]];
 
     dispatch_async(_q, ^{
         NSInteger round = 0;
         while (self->_running) {
-            for (NSDictionary *st in steps) {
+            for (NSDictionary *st in plan) {
                 if (!self->_running) break;
-                @autoreleasepool {
-                    [self execStep:st];
-                }
+                @autoreleasepool { [self execStep:st]; }
             }
-            round++;
-            if (loops > 0 && round >= loops) break;
             if (!self->_running) break;
+            round++;
+            self->_loopsDone = round;
+            if (loops > 0 && round >= loops) break;
         }
         self->_running = NO;
-        [self logMsg:@"已停止（执行 %ld 轮）", (long)round];
+        [self logMsg:@"结束，跑了 %ld 轮", (long)round];
+        void (^f)(void) = self.onFinish;
+        if (f) dispatch_async(dispatch_get_main_queue(), ^{ f(); });
     });
 }
 
@@ -181,32 +163,25 @@ static CGPoint TDJitter(CGPoint p, double r) {
     }
 
     if ([t isEqualToString:@"tap"]) {
-        CGPoint p = CGPointMake([st[@"x"] doubleValue], [st[@"y"] doubleValue]);
-        CGPoint j = TDJitter(p, cfg.jitterPx);
-        TDtap(j.x, j.y);
-        [self logMsg:@"点击 (%.0f,%.0f) 偏移%.0f", j.x, j.y, cfg.jitterPx];
+        CGPoint p = TDJitter(CGPointMake([st[@"x"] doubleValue], [st[@"y"] doubleValue]), cfg.jitterPx);
+        TDtap(p.x, p.y);
         usleep((useconds_t)(cfg.intervalMs * 1000));
         return;
     }
 
     if ([t isEqualToString:@"long"]) {
-        CGPoint p = CGPointMake([st[@"x"] doubleValue], [st[@"y"] doubleValue]);
-        CGPoint j = TDJitter(p, cfg.jitterPx);
+        CGPoint p = TDJitter(CGPointMake([st[@"x"] doubleValue], [st[@"y"] doubleValue]), cfg.jitterPx);
         double ms = st[@"ms"] ? [st[@"ms"] doubleValue] : 800;
-        TDlongPress(j.x, j.y, ms / 1000.0);
-        [self logMsg:@"长按 %.0fms (%.0f,%.0f)", ms, j.x, j.y];
+        TDlongPress(p.x, p.y, ms / 1000.0);
         usleep((useconds_t)(cfg.intervalMs * 1000));
         return;
     }
 
     if ([t isEqualToString:@"swipe"]) {
-        CGPoint a = CGPointMake([st[@"x1"] doubleValue], [st[@"y1"] doubleValue]);
-        CGPoint b = CGPointMake([st[@"x2"] doubleValue], [st[@"y2"] doubleValue]);
-        a = TDJitter(a, cfg.jitterPx);
-        b = TDJitter(b, cfg.jitterPx);
+        CGPoint a = TDJitter(CGPointMake([st[@"x1"] doubleValue], [st[@"y1"] doubleValue]), cfg.jitterPx);
+        CGPoint b = TDJitter(CGPointMake([st[@"x2"] doubleValue], [st[@"y2"] doubleValue]), cfg.jitterPx);
         double ms = st[@"ms"] ? [st[@"ms"] doubleValue] : 400;
         TDswipe(a, b, ms / 1000.0);
-        [self logMsg:@"滑动 (%.0f,%.0f)→(%.0f,%.0f) %.0fms", a.x, a.y, b.x, b.y, ms];
         usleep((useconds_t)(cfg.intervalMs * 1000));
         return;
     }
@@ -223,7 +198,6 @@ static CGPoint TDJitter(CGPoint p, double r) {
         if (pts.count >= 2) {
             double ms = st[@"ms"] ? [st[@"ms"] doubleValue] : 500;
             TDgesture(pts, ms / 1000.0);
-            [self logMsg:@"轨迹手势 %lu 点 %.0fms", (unsigned long)pts.count, ms];
         }
         usleep((useconds_t)(cfg.intervalMs * 1000));
         return;
@@ -233,25 +207,22 @@ static CGPoint TDJitter(CGPoint p, double r) {
         NSString *name = st[@"tpl"];
         double th = st[@"th"] ? [st[@"th"] doubleValue] : cfg.threshold;
         NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-        NSString *path = [dir stringByAppendingPathComponent:name ?: @""];
-        UIImage *tpl = [UIImage imageWithContentsOfFile:path];
+        UIImage *tpl = [UIImage imageWithContentsOfFile:[dir stringByAppendingPathComponent:name ?: @""]];
         if (!tpl) {
             [self logMsg:@"模板缺失: %@", name];
             return;
         }
         TDMatch *m = TDfindImage(tpl, th, 0.7, 1.3, 4);
         if (!m) {
-            [self logMsg:@"未匹配到 %@ (阈值%.2f)", name, th];
+            [self logMsg:@"没找到 %@ (阈值%.2f)", name, th];
             return;
         }
-        CGPoint j = TDJitter(m.point, cfg.jitterPx);
-        TDtap(j.x, j.y);
-        [self logMsg:@"识图命中 %@ 分数%.3f → 点(%.0f,%.0f)", name, m.score, j.x, j.y];
+        CGPoint p = TDJitter(m.point, cfg.jitterPx);
+        TDtap(p.x, p.y);
+        [self logMsg:@"识图 %.2f → (%.0f,%.0f)", m.score, p.x, p.y];
         usleep((useconds_t)(cfg.intervalMs * 1000));
         return;
     }
-
-    [self logMsg:@"未知步骤类型: %@", t];
 }
 
 @end

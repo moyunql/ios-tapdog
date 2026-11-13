@@ -19,12 +19,13 @@ void TDgesture(NSArray<NSValue *> *points, NSTimeInterval sec);
 BOOL TDcaptureReady(void);
 NSString *TDcaptureStatus(void);
 UIImage * _Nullable TDscreenshot(void);
+/// 屏幕点尺寸 / 像素尺寸 换算比
+CGFloat TDscreenScaleRatio(void);
 
 #pragma mark - 识图（模板匹配）
 
 @class TDMatch;
 
-/// 在当前屏幕上查找模板图，返回最佳匹配；score 为归一化相关度(0~1)
 TDMatch * _Nullable TDfindImage(UIImage *tpl, double threshold, double minScale, double maxScale, int scaleSteps);
 
 @interface TDMatch : NSObject
@@ -33,16 +34,62 @@ TDMatch * _Nullable TDfindImage(UIImage *tpl, double threshold, double minScale,
 @property (nonatomic) CGFloat scale;
 @end
 
-#pragma mark - 脚本引擎
+#pragma mark - 脚本
 
-@class TDEngine;
+/// 一条脚本 = 一串步骤
+/// 步骤格式（均带 gap：与上一步之间的间隔毫秒）：
+///   {"t":"tap","x":207,"y":660,"gap":0}
+///   {"t":"long","x":207,"y":660,"ms":800,"gap":0}
+///   {"t":"swipe","x1":207,"y1":600,"x2":207,"y2":200,"ms":400,"gap":0}
+///   {"t":"wait","ms":500,"gap":0}
+@interface TDScript : NSObject
+@property (nonatomic, copy) NSString *name;
+@property (nonatomic) NSTimeInterval createdAt;
+@property (nonatomic, strong) NSMutableArray<NSDictionary *> *steps;
+
+- (instancetype)initWithName:(NSString *)name;
+- (NSString *)summary;                        // "12 步 · 0:35"
+- (NSTimeInterval)duration;                   // 估算总时长（秒）
+- (NSArray<NSDictionary *> *)engineSteps;     // 把 gap 展开成 wait
++ (NSString *)describeStep:(NSDictionary *)st;
+@end
+
+@interface TDScriptStore : NSObject
++ (instancetype)shared;
+@property (nonatomic, strong, readonly) NSMutableArray<TDScript *> *scripts;
+@property (nonatomic) NSInteger selected;
+- (TDScript *)createScript;
+- (nullable TDScript *)selectedScript;
+- (void)removeAtIndex:(NSInteger)idx;
+- (void)save;
+- (void)load;
+@end
+
+#pragma mark - 录制（系统级触摸监听）
+
+@interface TDRecorder : NSObject
++ (instancetype)shared;
+@property (nonatomic, readonly) BOOL recording;
+@property (nonatomic, readonly) NSInteger eventCount;
+@property (nonatomic, copy, nullable) void (^onChange)(void);
+
+/// 返回 NO 表示系统不给监听（权限/接口不可用），此时只能用手动取点
+- (BOOL)start;
+- (NSMutableArray<NSDictionary *> *)stop;
+- (NSString *)status;
+@end
+
+#pragma mark - 回放引擎
 
 @interface TDEngine : NSObject
 + (instancetype)shared;
 @property (nonatomic, readonly) BOOL running;
+@property (nonatomic, readonly) NSInteger loopsDone;
 @property (nonatomic, copy, nullable) NSString *jetsamStatus;
 @property (nonatomic, copy, nullable) void (^logHandler)(NSString *msg);
-- (void)startWithScript:(NSDictionary *)script;
+@property (nonatomic, copy, nullable) void (^onFinish)(void);
+
+- (void)playSteps:(NSArray<NSDictionary *> *)steps loop:(NSInteger)loops;
 - (void)stop;
 - (void)logMsg:(NSString *)fmt, ...;
 @end
@@ -56,16 +103,8 @@ TDMatch * _Nullable TDfindImage(UIImage *tpl, double threshold, double minScale,
 @property (nonatomic) double threshold;     // 识图相似度阈值
 @property (nonatomic) NSInteger loopCount;  // 0=无限
 + (instancetype)shared;
-- (NSMutableArray<NSMutableDictionary *> *)steps;
 - (void)save;
-- (void)load;
-- (void)addStep:(NSDictionary *)step;
-- (void)removeStepAtIndex:(NSInteger)idx;
-- (void)moveStepFrom:(NSInteger)from to:(NSInteger)to;
 @end
-
-/// 屏幕点尺寸 / 像素尺寸 换算比（用于把截图像素坐标转成点击点坐标）
-CGFloat TDscreenScaleRatio(void);
 
 #pragma mark - 系统级悬浮窗（SpringBoard 托管，可盖在别的 App 上）
 
@@ -73,16 +112,47 @@ CGFloat TDscreenScaleRatio(void);
 @interface TDHUDWindow : UIWindow
 @end
 
-/// 把窗口的 context 交给 SpringBoard 渲染；返回 NO 表示还没就绪，可稍后重试
 BOOL TDHUDRegisterWindow(UIWindow *w);
 void TDHUDUnregisterWindow(UIWindow *w);
 NSString *TDHUDStatus(void);
 
-/// 穿透模式：YES 时悬浮窗完全不接管触摸，手动滑动抖音时打开
+/// 穿透模式：YES 时悬浮球不接管触摸（球也点不了，但完全不挡下面）
 void TDHUDSetPassthrough(BOOL on);
 BOOL TDHUDPassthrough(void);
 
-/// 把自己提升到 critical jetsam 优先级并禁止冻结，切到别的 App 后不被回收
+/// 把自己提到 critical jetsam 优先级并禁止冻结
 NSString *TDBypassJetsam(void);
+
+#pragma mark - 后台保活 / 环境
+
+@interface TDKeepAlive : NSObject
++ (void)start;
++ (NSString *)status;
+@end
+
+NSString *TDSandboxStatus(void);
+
+/// 上一次崩溃的堆栈（没有则返回空字符串）
+NSString *TDcrashLogText(void);
+void TDcrashLogClear(void);
+
+#pragma mark - 全局日志通道（UI 订阅用）
+
+void TDLog(NSString *fmt, ...);
+void TDSetLogHandler(void (^ _Nullable h)(NSString *));
+
+#pragma mark - 数据变更通知（录制完/脚本改了，UI 和悬浮球都跟着刷）
+
+extern NSString * const TDDataChangedNotification;
+
+#pragma mark - 悬浮球
+
+/// AppDelegate 启动时调用一次：建球 + 交给 SpringBoard 托管
+void TDFloatInstall(void);
+void TDFloatSetVisible(BOOL on);
+BOOL TDFloatVisible(void);
+/// 引擎/录制状态变了以后调它，球会换颜色和文字
+void TDFloatRefresh(void);
+void TDFloatResetPosition(void);
 
 NS_ASSUME_NONNULL_END
