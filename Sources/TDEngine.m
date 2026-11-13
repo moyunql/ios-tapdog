@@ -56,7 +56,7 @@ static NSString *TDConfigPath(void) {
     if (j[@"threshold"])self.threshold = [j[@"threshold"] doubleValue];
     if (j[@"loop"])     self.loopCount = [j[@"loop"] integerValue];
     if ([j[@"steps"] isKindOfClass:[NSArray class]]) {
-        self.steps = [NSMutableArray array];
+        _steps = [NSMutableArray array];
         for (id s in j[@"steps"]) {
             if ([s isKindOfClass:[NSDictionary class]]) [self.steps addObject:[s mutableCopy]];
         }
