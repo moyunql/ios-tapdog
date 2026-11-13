@@ -2,84 +2,132 @@
 #import <QuartzCore/QuartzCore.h>
 
 // ---------------------------------------------------------------------------
-// 悬浮球
+// 悬浮条（两个按钮：▶ 开始执行 / ■ 停止执行）
 //
-// ★ 托管窗口必须是「球那么大」，绝不能铺满全屏：
+// ★ 托管窗口必须贴合按钮本身，绝不能铺满全屏：
 //   跨进程托管窗口的触摸命中在窗口服务器侧完成，我们进程里 hitTest 返回
 //   nil 只是「本进程没人接」，触摸会被这个窗口接住后丢弃，不会转发给下面
 //   的抖音。窗口铺满全屏 = 抖音整屏都点不动。
-//   窗口只有 76×76，窗口外的触摸压根不归它管。
+//   现在窗口只有 128×70，窗口外的触摸压根不归它管。
 //
 // 交互：
-//   点一下 = 播放/停止（录制中则停止录制并保存）
-//   长按   = 开始/停止录制
-//   拖动   = 挪位置（位置记在 NSUserDefaults）
+//   点 ▶  = 开始执行选中脚本（录制中则结束录制并保存）
+//   点 ■  = 停止执行 / 停止录制并保存
+//   长按  = 开始/停止录制
+//   拖动  = 挪位置（位置记在 NSUserDefaults）
 // ---------------------------------------------------------------------------
 
 NSString * const TDDataChangedNotification = @"TDDataChangedNotification";
 
-static const CGFloat kTDBallSize    = 56.0;
-static const CGFloat kTDBallPad     = 10.0;
-static const CGFloat kTDOverlaySide = 76.0;
+static const CGFloat kTDBallSize = 54.0;
+static const CGFloat kTDBallGap  = 5.0;
+static const CGFloat kTDOverlayW = 128.0;   // 7 + 54 + 5 + 54 + 8
+static const CGFloat kTDOverlayH = 70.0;    // 8 + 54 + 8
 
 static NSString * const kTDBallPosX = @"tdBallCenterX";
 static NSString * const kTDBallPosY = @"tdBallCenterY";
 
 static TDHUDWindow *gBallWindow = nil;
-static UILabel *gBallLabel = nil;
-static UIView *gBallView = nil;
+static UIView *gStartView = nil;
+static UILabel *gStartLabel = nil;
+static UIView *gStopView = nil;
+static UILabel *gStopLabel = nil;
 
 #pragma mark - 位置
 
 static void TDApplyBallPosition(UIWindow *w) {
     if (!w) return;
     CGRect sb = [UIScreen mainScreen].bounds;
-    CGFloat half = kTDOverlaySide / 2.0;
+    CGFloat hw = kTDOverlayW / 2.0;
+    CGFloat hh = kTDOverlayH / 2.0;
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     double cx = [d doubleForKey:kTDBallPosX];
     double cy = [d doubleForKey:kTDBallPosY];
     if (cx <= 0 || cy <= 0) {
-        cx = sb.size.width - half - 6;
+        cx = sb.size.width - hw - 6;
         cy = sb.size.height * 0.45;
     }
-    cx = MAX(half + 2, MIN(sb.size.width  - half - 2, cx));
-    cy = MAX(half + 30, MIN(sb.size.height - half - 34, cy));
-    w.frame = CGRectMake(cx - half, cy - half, kTDOverlaySide, kTDOverlaySide);
+    cx = MAX(hw + 2, MIN(sb.size.width  - hw - 2, cx));
+    cy = MAX(hh + 30, MIN(sb.size.height - hh - 34, cy));
+    w.frame = CGRectMake(cx - hw, cy - hh, kTDOverlayW, kTDOverlayH);
     TDHUDRegisterWindow(w);
 }
 
 #pragma mark - 状态刷新
 
 void TDFloatRefresh(void) {
-    if (!gBallView) return;
+    if (!gStartView || !gStopView) return;
     TDEngine *e = [TDEngine shared];
     TDRecorder *r = [TDRecorder shared];
 
     if (r.recording) {
-        gBallView.backgroundColor = [UIColor colorWithRed:1.0 green:0.58 blue:0.10 alpha:0.95];
-        gBallLabel.text = @"录";
+        // 录制中：左球变橙显示「录」，右球是「停止录制并保存」
+        gStartView.backgroundColor = [UIColor colorWithRed:1.00 green:0.58 blue:0.10 alpha:0.95];
+        gStartLabel.text = @"录";
+        gStartView.alpha = 1;
+        gStopView.backgroundColor = [UIColor colorWithRed:0.90 green:0.22 blue:0.22 alpha:0.95];
+        gStopLabel.text = @"■";
+        gStopView.alpha = 1;
     } else if (e.running) {
-        gBallView.backgroundColor = [UIColor colorWithRed:0.90 green:0.22 blue:0.22 alpha:0.95];
-        gBallLabel.text = @"停";
+        gStartView.backgroundColor = [UIColor colorWithRed:0.18 green:0.68 blue:0.32 alpha:0.95];
+        gStartLabel.text = @"▶";
+        gStartView.alpha = 0.45;
+        gStopView.backgroundColor = [UIColor colorWithRed:0.90 green:0.22 blue:0.22 alpha:0.95];
+        gStopLabel.text = @"■";
+        gStopView.alpha = 1;
     } else {
-        gBallView.backgroundColor = [UIColor colorWithRed:0.18 green:0.42 blue:0.98 alpha:0.95];
-        gBallLabel.text = @"跑";
+        gStartView.backgroundColor = [UIColor colorWithRed:0.18 green:0.68 blue:0.32 alpha:0.95];
+        gStartLabel.text = @"▶";
+        gStartView.alpha = 1;
+        gStopView.backgroundColor = [UIColor colorWithRed:0.90 green:0.22 blue:0.22 alpha:0.95];
+        gStopLabel.text = @"■";
+        gStopView.alpha = 0.45;
     }
 }
 
 #pragma mark - 动作
+
+/// 结束录制并存成新脚本
+static void TDFloatFinishRecording(void) {
+    TDRecorder *r = [TDRecorder shared];
+    if (!r.recording) return;
+    NSMutableArray<NSDictionary *> *events = [r stop];
+    TDScript *s = [[TDScriptStore shared] createScript];
+    if (events.count) s.steps = events;
+    [[TDScriptStore shared] save];
+    TDLog(@"录制结束：%@（%lu 步）", s.name, (unsigned long)s.steps.count);
+    [[NSNotificationCenter defaultCenter] postNotificationName:TDDataChangedNotification object:nil];
+}
+
+static void TDFloatDoStart(void) {
+    TDRecorder *r = [TDRecorder shared];
+    TDEngine *e = [TDEngine shared];
+
+    if (r.recording) { TDFloatFinishRecording(); TDFloatRefresh(); return; }
+    if (e.running) return;
+
+    TDScript *s = [[TDScriptStore shared] selectedScript];
+    if (!s || s.steps.count == 0) {
+        TDLog(@"选中的脚本是空的，先长按悬浮条录一段");
+        TDFloatRefresh();
+        return;
+    }
+    [e playSteps:[s engineSteps] loop:[TDConfig shared].loopCount];
+    TDFloatRefresh();
+}
+
+static void TDFloatDoStop(void) {
+    if ([TDRecorder shared].recording) TDFloatFinishRecording();
+    [[TDEngine shared] stop];
+    TDFloatRefresh();
+}
 
 static void TDFloatToggleRecord(void) {
     TDRecorder *r = [TDRecorder shared];
     TDEngine *e = [TDEngine shared];
 
     if (r.recording) {
-        NSMutableArray<NSDictionary *> *events = [r stop];
-        TDScript *s = [[TDScriptStore shared] createScript];
-        if (events.count) s.steps = events;
-        [[TDScriptStore shared] save];
-        TDLog(@"录制结束：%@（%lu 步）", s.name, (unsigned long)s.steps.count);
-        [[NSNotificationCenter defaultCenter] postNotificationName:TDDataChangedNotification object:nil];
+        TDFloatFinishRecording();
     } else {
         if (e.running) [e stop];
         if (![r start]) {
@@ -87,26 +135,7 @@ static void TDFloatToggleRecord(void) {
             [[NSNotificationCenter defaultCenter] postNotificationName:TDDataChangedNotification object:nil];
             return;
         }
-        TDLog(@"开始录制，去抖音点几下，再点球停止");
-    }
-    TDFloatRefresh();
-}
-
-static void TDFloatTogglePlay(void) {
-    TDEngine *e = [TDEngine shared];
-    TDRecorder *r = [TDRecorder shared];
-
-    if (r.recording) { TDFloatToggleRecord(); return; }
-
-    if (e.running) {
-        [e stop];
-    } else {
-        TDScript *s = [[TDScriptStore shared] selectedScript];
-        if (!s || s.steps.count == 0) {
-            TDLog(@"选中的脚本是空的");
-        } else {
-            [e playSteps:[s engineSteps] loop:[TDConfig shared].loopCount];
-        }
+        TDLog(@"开始录制，去抖音点几下，再点悬浮条停止");
     }
     TDFloatRefresh();
 }
@@ -122,54 +151,66 @@ static void TDFloatTogglePlay(void) {
 }
 
 - (void)loadView {
-    UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kTDOverlaySide, kTDOverlaySide)];
+    UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kTDOverlayW, kTDOverlayH)];
     v.backgroundColor = [UIColor clearColor];
     self.view = v;
+}
+
+- (UIView *)makeBallAtX:(CGFloat)x {
+    UIView *ball = [[UIView alloc] initWithFrame:CGRectMake(x, 8, kTDBallSize, kTDBallSize)];
+    ball.userInteractionEnabled = YES;
+    ball.layer.cornerRadius = kTDBallSize / 2;
+    ball.layer.borderWidth = 2;
+    ball.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.6].CGColor;
+    ball.layer.shadowColor = [UIColor blackColor].CGColor;
+    ball.layer.shadowOpacity = 0.35;
+    ball.layer.shadowRadius = 6;
+    ball.layer.shadowOffset = CGSizeMake(0, 2);
+    [self.view addSubview:ball];
+
+    UILabel *lb = [[UILabel alloc] initWithFrame:ball.bounds];
+    lb.textColor = [UIColor whiteColor];
+    lb.font = [UIFont boldSystemFontOfSize:22];
+    lb.textAlignment = NSTextAlignmentCenter;
+    lb.userInteractionEnabled = NO;
+    [ball addSubview:lb];
+
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onTap:)];
+    [ball addGestureRecognizer:tap];
+
+    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(onLong:)];
+    lp.minimumPressDuration = 0.7;
+    [ball addGestureRecognizer:lp];
+    [tap requireGestureRecognizerToFail:lp];
+
+    return ball;
 }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor clearColor];
 
-    gBallView = [[UIView alloc] initWithFrame:CGRectMake(kTDBallPad, kTDBallPad, kTDBallSize, kTDBallSize)];
-    gBallView.userInteractionEnabled = YES;
-    gBallView.layer.cornerRadius = kTDBallSize / 2;
-    gBallView.layer.borderWidth = 2;
-    gBallView.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.6].CGColor;
-    gBallView.layer.shadowColor = [UIColor blackColor].CGColor;
-    gBallView.layer.shadowOpacity = 0.35;
-    gBallView.layer.shadowRadius = 6;
-    gBallView.layer.shadowOffset = CGSizeMake(0, 2);
-    [self.view addSubview:gBallView];
+    gStartView = [self makeBallAtX:7];
+    gStartLabel = (UILabel *)gStartView.subviews.firstObject;
+    gStartView.tag = 1;
+    gStartLabel.text = @"▶";
 
-    gBallLabel = [[UILabel alloc] initWithFrame:gBallView.bounds];
-    gBallLabel.text = @"跑";
-    gBallLabel.textColor = [UIColor whiteColor];
-    gBallLabel.font = [UIFont boldSystemFontOfSize:21];
-    gBallLabel.textAlignment = NSTextAlignmentCenter;
-    gBallLabel.userInteractionEnabled = NO;
-    [gBallView addSubview:gBallLabel];
-
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onTap)];
-    [gBallView addGestureRecognizer:tap];
-
-    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(onLong:)];
-    lp.minimumPressDuration = 0.7;
-    [gBallView addGestureRecognizer:lp];
-    [tap requireGestureRecognizerToFail:lp];
+    gStopView = [self makeBallAtX:7 + kTDBallSize + kTDBallGap];
+    gStopLabel = (UILabel *)gStopView.subviews.firstObject;
+    gStopView.tag = 2;
+    gStopLabel.text = @"■";
 
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPan:)];
-    [gBallView addGestureRecognizer:pan];
+    [self.view addGestureRecognizer:pan];
 
     TDFloatRefresh();
 }
 
-- (void)viewDidLayoutSubviews {
-    [super viewDidLayoutSubviews];
-    if (gBallView) gBallView.center = CGPointMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds));
+- (void)onTap:(UITapGestureRecognizer *)g {
+    UIView *v = g.view;
+    if (v.tag == 1) TDFloatDoStart();
+    else if (v.tag == 2) TDFloatDoStop();
 }
-
-- (void)onTap { TDFloatTogglePlay(); }
 
 - (void)onLong:(UILongPressGestureRecognizer *)g {
     if (g.state == UIGestureRecognizerStateBegan) TDFloatToggleRecord();
@@ -193,11 +234,12 @@ static void TDFloatTogglePlay(void) {
     }
     if (g.state == UIGestureRecognizerStateChanged) {
         CGRect sb = [UIScreen mainScreen].bounds;
-        CGFloat half = kTDOverlaySide / 2.0;
+        CGFloat hw = kTDOverlayW / 2.0;
+        CGFloat hh = kTDOverlayH / 2.0;
         CGPoint c = CGPointMake(_dragStartCenter.x + touch.x - _dragStartTouch.x,
                                 _dragStartCenter.y + touch.y - _dragStartTouch.y);
-        c.x = MAX(half + 2, MIN(sb.size.width  - half - 2, c.x));
-        c.y = MAX(half + 30, MIN(sb.size.height - half - 34, c.y));
+        c.x = MAX(hw + 2, MIN(sb.size.width  - hw - 2, c.x));
+        c.y = MAX(hh + 30, MIN(sb.size.height - hh - 34, c.y));
         w.center = c;
         return;
     }
@@ -216,7 +258,7 @@ static void TDFloatTogglePlay(void) {
 void TDFloatInstall(void) {
     if (gBallWindow) return;
 
-    TDHUDWindow *w = [[TDHUDWindow alloc] initWithFrame:CGRectMake(0, 0, kTDOverlaySide, kTDOverlaySide)];
+    TDHUDWindow *w = [[TDHUDWindow alloc] initWithFrame:CGRectMake(0, 0, kTDOverlayW, kTDOverlayH)];
     w.windowLevel = 10000010.0;
     w.backgroundColor = [UIColor clearColor];
     w.rootViewController = [TDBallVC new];
@@ -233,7 +275,7 @@ void TDFloatInstall(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * i * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (gBallWindow) TDHUDRegisterWindow(gBallWindow);
-            if (i == 8) TDLog(@"悬浮球 %@", TDHUDStatus());
+            if (i == 8) TDLog(@"悬浮条 %@", TDHUDStatus());
         });
     }
 }
