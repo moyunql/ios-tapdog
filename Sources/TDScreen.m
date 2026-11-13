@@ -37,7 +37,7 @@ static FnSurfFormat      gSurfGetFormat = NULL;
 
 static BOOL gTriedLoad = NO;
 static NSString *gCapStatus = @"未初始化";
-static CGSize gLastPixelSize = CGSizeZero;
+static CGSize gLastPixelSize = {0, 0};
 
 /// 先查全局符号表（IOMobileFramebuffer 已把 IOSurface 带进进程时可直接命中），
 /// 再依次尝试两个已知路径。
