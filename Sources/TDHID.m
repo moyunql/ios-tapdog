@@ -25,6 +25,13 @@ typedef IOHIDEventSystemClientRef (*TDCreateWithTypeFn)(CFAllocatorRef, uint32_t
 static IOHIDEventSystemClientRef gClient = NULL;
 static int gClientType = -1;          // 1=admin 0=fallback
 
+// 点击反馈回调（TDFloat 实现），以及本次运行累计按下的次数
+static TDInjectFeedbackFn gFeedback = NULL;
+static volatile int32_t gInjectCount = 0;
+
+void TDSetInjectFeedbackHandler(TDInjectFeedbackFn fn) { gFeedback = fn; }
+NSInteger TDInjectCount(void) { return (NSInteger)gInjectCount; }
+
 // 内建触摸屏的 senderID；系统据此认定事件来自真实屏幕
 static const uint64_t kTDSenderID = 0x8000000817319372ULL;
 
@@ -82,6 +89,11 @@ static IOHIDEventRef TDCreateHand(uint32_t mask, uint64_t ts) {
 static void TDEmit(uint32_t mask, BOOL touch, CGFloat x, CGFloat y) {
     IOHIDEventSystemClientRef client = TDhidClient();
     if (!client) return;
+
+    // 点击反馈：把「正要往哪点」画出来，能不能点动是另一回事，位置对不对一眼就看得到
+    BOOL isDown = (mask & kIOHIDDigitizerEventTouch) && touch;
+    if (isDown) __sync_fetch_and_add(&gInjectCount, 1);
+    if (gFeedback) gFeedback(x, y, isDown);
 
     uint64_t ts = mach_absolute_time();
     IOHIDEventRef hand = TDCreateHand(mask, ts);

@@ -281,9 +281,149 @@ static void TDFloatDoTestTap(void) {
 
 @end
 
+#pragma mark - 注入点击反馈（200ms 红圈）
+//
+// 目的：回放的时候能直接看见「它到底点在哪儿」，用不着猜。
+// 做法：一个 64×64 的托管小窗口，每次注入按下就挪到那个点，画一圈涟漪 200ms 后消失。
+//
+// 两个必须守住的点：
+//   1) 窗口不许铺满全屏 —— 跨进程托管窗口会吞掉命中区域内的触摸，
+//      铺满全屏就是之前「抖音整屏点不动」的原因。它只有 64pt。
+//   2) 它必须「只画不吃触摸」—— _ignoresHitTest 恒 YES，
+//      否则脚本连点同一片区域时，反馈窗口会把自己下一次点击挡掉。
+
+static const CGFloat kTDFbSize = 64.0;
+static NSString * const kFbEnabledKey = @"tdInjectFeedback";
+
+@interface TDFeedbackWindow : TDHUDWindow
+@end
+
+@implementation TDFeedbackWindow
+- (BOOL)_ignoresHitTest { return YES; }
+- (BOOL)canBecomeKeyWindow { return NO; }
+@end
+
+static TDFeedbackWindow *gFbWindow = nil;
+static UIView *gFbRing = nil;
+static UIView *gFbCore = nil;
+static NSInteger gFbToken = 0;
+
+BOOL TDInjectFeedbackEnabled(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if ([d objectForKey:kFbEnabledKey] == nil) return YES;   // 默认开
+    return [d boolForKey:kFbEnabledKey];
+}
+
+void TDSetInjectFeedbackEnabled(BOOL on) {
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:kFbEnabledKey];
+    if (!on && gFbWindow) {
+        gFbToken++;
+        gFbWindow.hidden = YES;
+        gFbRing.alpha = 0;
+        gFbCore.alpha = 0;
+    }
+}
+
+static void TDFeedbackEnsureWindow(void) {
+    if (gFbWindow) return;
+
+    TDFeedbackWindow *w = [[TDFeedbackWindow alloc]
+        initWithFrame:CGRectMake(-kTDFbSize, -kTDFbSize, kTDFbSize, kTDFbSize)];
+    w.windowLevel = 10000009.0;          // 比悬浮条(10000010)低，不挡按钮
+    w.backgroundColor = [UIColor clearColor];
+    w.hidden = YES;
+
+    UIViewController *vc = [UIViewController new];
+    vc.view.backgroundColor = [UIColor clearColor];
+    vc.view.frame = CGRectMake(0, 0, kTDFbSize, kTDFbSize);
+    w.rootViewController = vc;
+
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if ([s isKindOfClass:[UIWindowScene class]]) { w.windowScene = (UIWindowScene *)s; break; }
+    }
+
+    // 外圈：红色圆环，从 0.5 倍撑到 1 倍并淡出 —— 一眼就看得到点在哪儿
+    gFbRing = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kTDFbSize, kTDFbSize)];
+    gFbRing.backgroundColor = [UIColor colorWithRed:1.0 green:0.24 blue:0.24 alpha:0.28];
+    gFbRing.layer.cornerRadius = kTDFbSize / 2;
+    gFbRing.layer.borderWidth = 3;
+    gFbRing.layer.borderColor = [UIColor colorWithRed:1.0 green:0.30 blue:0.30 alpha:0.95].CGColor;
+    gFbRing.userInteractionEnabled = NO;
+    gFbRing.alpha = 0;
+    [vc.view addSubview:gFbRing];
+
+    // 中心那个小黄点：标出精确坐标，判断「有没有点偏」就靠它
+    CGFloat cs = 9.0;
+    gFbCore = [[UIView alloc] initWithFrame:CGRectMake((kTDFbSize - cs) / 2,
+                                                      (kTDFbSize - cs) / 2, cs, cs)];
+    gFbCore.backgroundColor = [UIColor colorWithRed:1.0 green:0.96 blue:0.25 alpha:1.0];
+    gFbCore.layer.cornerRadius = cs / 2;
+    gFbCore.userInteractionEnabled = NO;
+    gFbCore.alpha = 0;
+    [vc.view addSubview:gFbCore];
+
+    gFbWindow = w;
+}
+
+static void TDFeedbackShowMain(CGFloat x, CGFloat y, BOOL down) {
+    if (!TDInjectFeedbackEnabled()) return;
+    TDFeedbackEnsureWindow();
+    if (!gFbWindow) return;
+
+    CGFloat half = kTDFbSize / 2.0;
+    CGRect f = CGRectMake(round(x - half), round(y - half), kTDFbSize, kTDFbSize);
+
+    // 位置变了必须重新登记：SpringBoard 那边不重新认一遍，画面还是停在旧位置
+    if (!CGRectEqualToRect(gFbWindow.frame, f)) {
+        gFbWindow.frame = f;
+        TDHUDRegisterTransientWindow(gFbWindow);
+    }
+    gFbWindow.hidden = NO;
+
+    gFbToken++;
+    NSInteger token = gFbToken;
+
+    [gFbRing.layer removeAllAnimations];
+    gFbRing.transform = CGAffineTransformMakeScale(0.5, 0.5);
+    gFbRing.alpha = 1.0;
+    gFbCore.alpha = 1.0;
+
+    [UIView animateWithDuration:0.20
+                          delay:0
+                        options:(UIViewAnimationOptionBeginFromCurrentState |
+                                 UIViewAnimationOptionAllowUserInteraction)
+                     animations:^{
+        gFbRing.transform = CGAffineTransformMakeScale(1.0, 1.0);
+        gFbRing.alpha = 0.0;
+    } completion:nil];
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (token != gFbToken) return;      // 又来了一次点击，交给新的那次收尾
+        gFbWindow.hidden = YES;
+        gFbCore.alpha = 0;
+        gFbRing.alpha = 0;
+    });
+}
+
+/// TDhid 注入时回调进来（跑在引擎队列，不是主线程）
+static void TDFeedbackShow(CGFloat x, CGFloat y, BOOL down) {
+    if (!TDInjectFeedbackEnabled()) return;
+    if ([NSThread isMainThread]) {
+        TDFeedbackShowMain(x, y, down);
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            TDFeedbackShowMain(x, y, down);
+        });
+    }
+}
+
 #pragma mark - 生命周期
 
 void TDFloatInstall(void) {
+    // 注入 → 圆点反馈，一直挂着（有开关控制，关掉就不画）
+    TDSetInjectFeedbackHandler(TDFeedbackShow);
+
     if (gBallWindow) return;
 
     TDHUDWindow *w = [[TDHUDWindow alloc] initWithFrame:CGRectMake(0, 0, kTDOverlayW, kTDOverlayH)];

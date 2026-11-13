@@ -122,6 +122,24 @@ BOOL TDHUDRegisterWindow(UIWindow *w);
 void TDHUDUnregisterWindow(UIWindow *w);
 NSString *TDHUDStatus(void);
 
+/// 临时窗口登记（点击反馈圆点用）：不走缓存、不改全局托管状态。
+/// 同一个窗口位置变了必须重新调一次，否则 SpringBoard 侧几何还是旧的。
+BOOL TDHUDRegisterTransientWindow(UIWindow *w);
+void TDHUDUnregisterTransientWindow(UIWindow *w);
+
+#pragma mark - 注入点击反馈
+
+/// 注入时的可视化回调：x/y = 注入的屏幕坐标，down = 是否是按下那一下
+typedef void (*TDInjectFeedbackFn)(CGFloat x, CGFloat y, BOOL down);
+void TDSetInjectFeedbackHandler(TDInjectFeedbackFn fn);
+
+/// 总开关（默认开），存在 NSUserDefaults 里
+BOOL TDInjectFeedbackEnabled(void);
+void TDSetInjectFeedbackEnabled(BOOL on);
+
+/// 本次运行累计注入了多少次按下（诊断用）
+NSInteger TDInjectCount(void);
+
 /// 穿透模式：YES 时悬浮球不接管触摸（球也点不了，但完全不挡下面）
 void TDHUDSetPassthrough(BOOL on);
 BOOL TDHUDPassthrough(void);

@@ -142,7 +142,7 @@
 
     _titles = @[@"触摸注入", @"截屏", @"悬浮球托管", @"录制（全屏取点）",
                 @"后台保活", @"沙盒 / 权限", @"点击偏移 / 循环",
-                @"注入自检（点得动吗）", @"崩溃日志"];
+                @"注入自检（点得动吗）", @"崩溃日志", @"点击反馈（200ms 红圈）"];
 
     _tv = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
     _tv.dataSource = self;
@@ -184,9 +184,17 @@
     c.detailTextLabel.text = ip.row < (NSInteger)_values.count ? _values[ip.row] : @"";
     c.accessoryType = UITableViewCellAccessoryNone;
     c.selectionStyle = UITableViewCellSelectionStyleNone;
-    if (ip.row == 7 || ip.row == 8) {
-        c.detailTextLabel.text = ip.row == 7 ? @"验证 HID 注入和坐标映射" : @"点开看上次闪退的堆栈";
+    if (ip.row == 7) {
+        c.detailTextLabel.text = [NSString stringWithFormat:@"已注入 %ld 次 · 验证注入和坐标",
+                                  (long)TDInjectCount()];
         c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    } else if (ip.row == 8) {
+        c.detailTextLabel.text = @"点开看上次闪退的堆栈";
+        c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    } else if (ip.row == 9) {
+        BOOL on = TDInjectFeedbackEnabled();
+        c.detailTextLabel.text = on ? @"开 · 每次点击冒一个红圈，能看清点在哪"
+                                    : @"关 · 回放时不显示任何标记";
     }
     return c;
 }
@@ -195,6 +203,9 @@
     [tv deselectRowAtIndexPath:ip animated:YES];
     if (ip.row == 7) {
         [self.navigationController pushViewController:[TDSelfTestVC new] animated:YES];
+    } else if (ip.row == 9) {
+        TDSetInjectFeedbackEnabled(!TDInjectFeedbackEnabled());
+        [tv reloadData];
     } else if (ip.row == 8) {
         NSString *log = TDcrashLogText();
         UIAlertController *a = [UIAlertController alertControllerWithTitle:@"崩溃日志"

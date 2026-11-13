@@ -125,6 +125,44 @@ void TDHUDUnregisterWindow(UIWindow *w) {
     gRegisteredContext = 0;
 }
 
+// ---------------------------------------------------------------------------
+// 临时窗口：点击反馈那个圆点专用
+//
+// 它要跟着点击点到处移动，每次移动都得让 SpringBoard 重新认一遍几何。
+// 但 TDRegisterWindow 内部带「同 ctx 同 level 就不再注册」的缓存（那是给
+// 悬浮条省开销用的），而且改它会污染诊断页显示的 ctx。所以这里单独开一路，
+// 不复用缓存、也不写全局状态。
+// ---------------------------------------------------------------------------
+BOOL TDHUDRegisterTransientWindow(UIWindow *w) {
+    if (!w) return NO;
+    if (!TDLoadHostingFramework()) return NO;
+    if (![w respondsToSelector:@selector(_contextId)]) return NO;
+
+    unsigned int cid = [w _contextId];
+    if (cid == 0) return NO;
+
+    if (!gHostingController) {
+        Class C = objc_getClass("SBSAccessibilityWindowHostingController");
+        if (!C) return NO;
+        gHostingController = [[C alloc] init];
+    }
+    if (![gHostingController respondsToSelector:@selector(registerWindowWithContextID:atLevel:)]) {
+        return NO;
+    }
+    [gHostingController registerWindowWithContextID:cid atLevel:w.windowLevel];
+    return YES;
+}
+
+void TDHUDUnregisterTransientWindow(UIWindow *w) {
+    if (!w || !gHostingController) return;
+    if (![w respondsToSelector:@selector(_contextId)]) return;
+    unsigned int cid = [w _contextId];
+    if (cid == 0) return;
+    if ([gHostingController respondsToSelector:@selector(unregisterWindowWithContextID:)]) {
+        [gHostingController unregisterWindowWithContextID:cid];
+    }
+}
+
 NSString *TDHUDStatus(void) {
     if (!gFrameworkLoaded) TDLoadHostingFramework();
     if (!gHostingClassAvailable) {
