@@ -32,6 +32,7 @@
 @implementation TDSelfTestVC {
     UIView *_target;
     UILabel *_hits;
+    UILabel *_status;
     UILabel *_tip;
     UILabel *_scanLog;
     UIButton *_scanBtn;
@@ -41,7 +42,9 @@
     NSInteger _prevCount;
     NSMutableArray<NSNumber *> *_scanHits;
     NSTimer *_scanTimer;
+    NSTimer *_sampleTimer;
     BOOL _fbWasOn;
+    BOOL _reWasOn;
 }
 
 - (void)viewDidLoad {
@@ -56,6 +59,15 @@
     _hits.textAlignment = NSTextAlignmentCenter;
     _hits.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:_hits];
+
+    _status = [[UILabel alloc] initWithFrame:CGRectZero];
+    _status.text = @"真实事件：未学到";
+    _status.textColor = TD_DIM;
+    _status.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+    _status.textAlignment = NSTextAlignmentCenter;
+    _status.numberOfLines = 2;
+    _status.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:_status];
 
     _target = [[UIView alloc] initWithFrame:CGRectZero];
     _target.backgroundColor = [UIColor colorWithRed:0.25 green:0.30 blue:0.36 alpha:1];
@@ -90,7 +102,7 @@
     [self.view addSubview:go];
 
     _tip = [[UILabel alloc] initWithFrame:CGRectZero];
-    _tip.text = @"3 秒后注入：目标变绿=命中，说明注入和坐标都对。";
+    _tip.text = @"先用手指在方块上点一下（学一次真实触摸），再点下面按钮注入。";
     _tip.textColor = TD_DIM;
     _tip.font = [UIFont systemFontOfSize:13];
     _tip.numberOfLines = 0;
@@ -122,6 +134,11 @@
         [_hits.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
         [_hits.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:24],
 
+        [_status.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [_status.topAnchor constraintEqualToAnchor:_hits.bottomAnchor constant:8],
+        [_status.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:20],
+        [_status.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-20],
+
         [_target.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
         [_target.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor constant:-40],
         [_target.widthAnchor constraintEqualToConstant:200],
@@ -146,6 +163,27 @@
         [_scanLog.topAnchor constraintEqualToAnchor:_target.bottomAnchor constant:16],
         [_scanLog.bottomAnchor constraintEqualToAnchor:_tip.topAnchor constant:-8],
     ]];
+
+    // 开监听：等着用户用手点一下方块，把那次真实触摸复制下来
+    TDHIDSampleStart();
+    __weak typeof(self) ws0 = self;
+    _sampleTimer = [NSTimer scheduledTimerWithTimeInterval:0.4 repeats:YES block:^(NSTimer *t) {
+        [ws0 refreshSampleStatus];
+    }];
+    [self refreshSampleStatus];
+}
+
+- (void)refreshSampleStatus {
+    if (!TDHIDSampleReady()) {
+        _status.textColor = TD_DIM;
+        _status.text = @"真实事件：未学到\n请用手指在这个灰色方块上点一下";
+        return;
+    }
+    uint64_t sid = TDHIDSampleSenderID();
+    _status.textColor = TD_GREEN;
+    _status.text = [NSString stringWithFormat:@"真实事件：已学到%@\nsenderID 0x%llx",
+                    TDHIDSampleHasUp() ? @" down+up" : @" down（缺 up）",
+                    sid];
 }
 
 #pragma mark - 自动扫描
@@ -162,6 +200,9 @@
     // 扫描期间关掉红圈反馈：每 0.85 秒动一次托管窗口，会干扰注入序列
     _fbWasOn = TDInjectFeedbackEnabled();
     TDSetInjectFeedbackEnabled(NO);
+    // 矩阵扫描必须走合成事件，否则 16 组都会变成同一个真实事件副本
+    _reWasOn = TDUseRealEvents();
+    TDSetUseRealEvents(NO);
     [self scanStep];
 }
 
@@ -201,6 +242,7 @@
 - (void)finishScan {
     if (_scanTimer) { [_scanTimer invalidate]; _scanTimer = nil; }
     TDSetInjectFeedbackEnabled(_fbWasOn);
+    TDSetUseRealEvents(_reWasOn);
     _scanBtn.enabled = YES;
     _scanBtn.alpha = 1;
     [_scanBtn setTitle:@"再扫一遍" forState:UIControlStateNormal];
@@ -223,12 +265,14 @@
 - (void)viewWillDisappear:(BOOL)animated {
     [super viewWillDisappear:animated];
     if (_scanTimer) { [_scanTimer invalidate]; _scanTimer = nil; }
+    if (_sampleTimer) { [_sampleTimer invalidate]; _sampleTimer = nil; }
     if (_scanBtn && !_scanBtn.enabled) TDSetInjectFeedbackEnabled(_fbWasOn);
 }
 
 - (void)hit {
     _count++;
     _hits.text = [NSString stringWithFormat:@"被点中 %ld 次", (long)_count];
+    [self refreshSampleStatus];
     [UIView animateWithDuration:0.18 animations:^{
         self->_target.backgroundColor = TD_GREEN;
     } completion:^(BOOL f) {
@@ -241,10 +285,13 @@
 - (void)fire {
     // 目标中心换算成屏幕坐标
     CGPoint c = [_target.superview convertPoint:_target.center toView:nil];
-    _tip.text = [NSString stringWithFormat:@"注入 (%.0f, %.0f)…", c.x, c.y];
+    BOOL real = TDHIDSampleReady() && TDUseRealEvents();
+    _tip.text = [NSString stringWithFormat:@"%@ (%.0f, %.0f)… 3 秒后注入",
+                 real ? @"用真实事件副本" : @"（没学到真实事件）用合成事件", c.x, c.y];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         TDtap(c.x, c.y);
-        self->_tip.text = [NSString stringWithFormat:@"已注入 (%.0f, %.0f) · %@", c.x, c.y, TDhidStatus()];
+        self->_tip.text = [NSString stringWithFormat:@"已注入 (%.0f, %.0f) · %@",
+                           c.x, c.y, real ? @"真实事件副本" : TDhidStatus()];
     });
 }
 

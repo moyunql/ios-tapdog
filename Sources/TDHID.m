@@ -468,7 +468,168 @@ void TDReleaseAllTouches(void) {
     gActiveIdentity = 0;
 }
 
+// ---------------------------------------------------------------------------
+// 真实事件采样（照 AutoTap 的做法）
+//
+// 逆向 AutoTap_v1.0.3 的二进制，注入链是：
+//   IOHIDEventSystemClientRegisterEventFilterBlock / RegisterEventCallback 先监听
+//   物理触摸 → IOHIDEventCreateCopy 复制一份 → 改坐标/时间戳 → IOHIDEventSetSenderID
+//   → BKSHIDEventSetDigitizerInfo → DispatchEvent。
+// 它甚至有个校验方法 senderBelongsToCurrentSession: —— 说明系统会核对
+// **senderID 是不是本会话里的真实数字转换器**。自己凭空造的 senderID 必然过不了，
+// 这也是我们前面十几版都点不动的原因：事件字段齐不齐是次要的，关键是「来路」。
+//
+// 所以这里改成：让用户用手在屏幕上点一下，把那次真实事件（down / up）复制下来存档，
+// 之后每一次注入都是「真实事件改坐标」，senderID 和全部隐藏字段天然一致。
+// ---------------------------------------------------------------------------
+
+static NSString * const kUseRealEventsKey = @"tdUseRealEvents";
+
+BOOL TDUseRealEvents(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if ([d objectForKey:kUseRealEventsKey] == nil) return YES;
+    return [d boolForKey:kUseRealEventsKey];
+}
+void TDSetUseRealEvents(BOOL on) {
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:kUseRealEventsKey];
+}
+
+static IOHIDEventSystemClientRef gMon = NULL;
+static IOHIDEventRef gSampleDown = NULL;
+static IOHIDEventRef gSampleUp = NULL;
+static uint64_t gSampleSender = 0;
+static volatile int gSampleLock = 0;
+
+static void TDSampleLock(void) { while (__sync_lock_test_and_set(&gSampleLock, 1)) usleep(200); }
+static void TDSampleUnlock(void) { __sync_lock_release(&gSampleLock); }
+
+// 父事件下面的第一个数字转换器子事件（手指）
+static IOHIDEventRef TDFingerOf(IOHIDEventRef hand) {
+    CFArrayRef kids = IOHIDEventGetChildren(hand);
+    if (!kids) return NULL;
+    for (CFIndex i = 0; i < CFArrayGetCount(kids); i++) {
+        IOHIDEventRef k = (IOHIDEventRef)CFArrayGetValueAtIndex(kids, i);
+        if (IOHIDEventGetType(k) == kIOHIDEventTypeDigitizer) return k;
+    }
+    return NULL;
+}
+
+// 纯 C：不碰 ObjC、不动 UIKit
+static void TDSampleHandler(void *target, void *refcon, IOHIDEventQueueRef q, IOHIDEventRef e) {
+    if (!e) return;
+    if (IOHIDEventGetType(e) != kIOHIDEventTypeDigitizer) return;
+    IOHIDEventRef finger = TDFingerOf(e);
+    if (!finger) return;
+
+    int touching = IOHIDEventGetIntegerValue(finger, kIOHIDEventFieldDigitizerTouch);
+    IOHIDEventRef copy = IOHIDEventCreateCopy(kCFAllocatorDefault, e);
+    if (!copy) return;
+
+    TDSampleLock();
+    if (touching) {
+        if (gSampleDown) CFRelease(gSampleDown);
+        gSampleDown = copy;
+    } else {
+        if (gSampleUp) CFRelease(gSampleUp);
+        gSampleUp = copy;
+    }
+    gSampleSender = IOHIDEventGetSenderID(e);
+    TDSampleUnlock();
+}
+
+BOOL TDHIDSampleStart(void) {
+    if (gMon) return YES;
+    gMon = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+    if (!gMon) return NO;
+    IOHIDEventSystemClientRegisterEventCallback(gMon, TDSampleHandler, NULL, NULL);
+    IOHIDEventSystemClientScheduleWithRunLoop(gMon, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+    return YES;
+}
+
+void TDHIDSampleStop(void) {
+    if (!gMon) return;
+    IOHIDEventSystemClientUnregisterEventCallback(gMon);
+    IOHIDEventSystemClientUnscheduleWithRunLoop(gMon, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+    CFRelease(gMon);
+    gMon = NULL;
+}
+
+BOOL TDHIDSampleReady(void) {
+    TDSampleLock();
+    BOOL ok = (gSampleDown != NULL);
+    TDSampleUnlock();
+    return ok;
+}
+
+BOOL TDHIDSampleHasUp(void) {
+    TDSampleLock();
+    BOOL ok = (gSampleUp != NULL);
+    TDSampleUnlock();
+    return ok;
+}
+
+uint64_t TDHIDSampleSenderID(void) { return gSampleSender; }
+
+/// 把存档的真实事件复制一份，换掉坐标和时间戳再发出去
+static void TDReplayOne(IOHIDEventRef tmpl, CGFloat x, CGFloat y, BOOL down) {
+    if (!tmpl) return;
+    IOHIDEventRef e = IOHIDEventCreateCopy(kCFAllocatorDefault, tmpl);
+    if (!e) return;
+
+    uint64_t ts = mach_absolute_time();
+    IOHIDEventSetTimeStamp(e, ts);
+    IOHIDEventSetFloatValue(e, kIOHIDEventFieldDigitizerX, (IOHIDFloat)x);
+    IOHIDEventSetFloatValue(e, kIOHIDEventFieldDigitizerY, (IOHIDFloat)y);
+    IOHIDEventSetIntegerValue(e, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
+
+    CFArrayRef kids = IOHIDEventGetChildren(e);
+    if (kids) {
+        for (CFIndex i = 0; i < CFArrayGetCount(kids); i++) {
+            IOHIDEventRef k = (IOHIDEventRef)CFArrayGetValueAtIndex(kids, i);
+            IOHIDEventSetTimeStamp(k, ts);
+            IOHIDEventSetFloatValue(k, kIOHIDEventFieldDigitizerX, (IOHIDFloat)x);
+            IOHIDEventSetFloatValue(k, kIOHIDEventFieldDigitizerY, (IOHIDFloat)y);
+            IOHIDEventSetIntegerValue(k, kIOHIDEventFieldDigitizerTouch, down ? 1 : 0);
+            IOHIDEventSetIntegerValue(k, kIOHIDEventFieldDigitizerRange, down ? 1 : 0);
+            IOHIDEventSetIntegerValue(k, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
+        }
+    }
+
+    // 父事件：「手」始终在屏幕上（和真实触摸一致），否则 up 会被拒、手指卡死
+    IOHIDEventSetIntegerValue(e, kIOHIDEventFieldDigitizerTouch, 1);
+    IOHIDEventSetIntegerValue(e, kIOHIDEventFieldDigitizerRange, 1);
+
+    if (gSampleSender) IOHIDEventSetSenderID(e, gSampleSender);
+
+    IOHIDEventSystemClientRef c = TDhidClient();
+    if (c) IOHIDEventSystemClientDispatchEvent(c, e);
+    CFRelease(e);
+}
+
+void TDHIDReplayTap(CGPoint p) {
+    TDSampleLock();
+    IOHIDEventRef down = gSampleDown ? (IOHIDEventRef)CFRetain(gSampleDown) : NULL;
+    IOHIDEventRef up = gSampleUp ? (IOHIDEventRef)CFRetain(gSampleUp) : (down ? (IOHIDEventRef)CFRetain(down) : NULL);
+    TDSampleUnlock();
+    if (!down) return;
+
+    TDReplayOne(down, p.x, p.y, YES);
+    usleep(45000);
+    TDReplayOne(up, p.x, p.y, NO);
+
+    CFRelease(down);
+    if (up) CFRelease(up);
+}
+
 void TDtap(CGFloat x, CGFloat y) {
+    // 学到过真实触摸时优先走「真实事件副本」这条路：
+    // 物理事件的字段（senderID、quality、pressure、display 信息…）全都齐，
+    // 系统不会当成伪造输入丢掉；我们自己拼的那份永远缺东西。
+    if (TDHIDSampleReady() && TDUseRealEvents()) {
+        TDHIDReplayTap(CGPointMake(x, y));
+        TDShowFeedback(x, y);
+        return;
+    }
     uint32_t ident = TDNextIdentity();
     TDEmit(kMaskDown, YES, x, y, ident);
     // 一帧静止 move：真实触摸在按住期间 HID 也会持续上报位置，

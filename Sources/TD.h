@@ -22,6 +22,20 @@ BOOL TDHasStuckTouch(void);
 /// 盲扫 identity 1..64 发抬起，清掉可能残留的幽灵手指（启动时用）
 void TDReleaseAllTouches(void);
 
+#pragma mark - 真实事件采样（AutoTap 同款思路）
+
+/// 开始监听物理触摸（学到一次真实 down/up 之后才能复制注入）
+BOOL TDHIDSampleStart(void);
+void TDHIDSampleStop(void);
+BOOL TDHIDSampleReady(void);
+BOOL TDHIDSampleHasUp(void);
+uint64_t TDHIDSampleSenderID(void);
+/// 用复制来的真实事件往 p 注入一次点击
+void TDHIDReplayTap(CGPoint p);
+/// 默认开：学到真实事件后，所有注入都改走「真实事件副本」
+BOOL TDUseRealEvents(void);
+void TDSetUseRealEvents(BOOL on);
+
 #pragma mark - 截屏
 
 BOOL TDcaptureReady(void);
