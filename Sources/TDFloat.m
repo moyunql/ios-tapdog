@@ -2,42 +2,123 @@
 #import <QuartzCore/QuartzCore.h>
 
 // ---------------------------------------------------------------------------
-// 悬浮条（两个按钮：▶ 开始执行 / ■ 停止执行）
+// 悬浮窗（v1.14：三个按钮 + 一扇日志窗）
 //
-// ◎ 那个注入自检球已经去掉：录制改用音量键（上录下停），按键验证有注入自检页，
-// 它在屏幕上只剩「被误点」这一个作用，留着反而碍事。
+// ● 录制  点一次开始穿透录制，再点一次结束并保存（和音量上/下是同一个开关）
+// ▶ 播放  开始执行选中脚本；录制中按它等于结束录制
+// ■ 停止  停回放 / 停录制
+// ▤ 日志  按钮条顶上那条 17pt 的把手，开关右边那扇日志窗
+//
+// 日志窗显示最近三行回放日志：识图命中/没找到、判断有没有触发、粘没粘贴、第几轮。
+// 它为什么单独开一个窗口：
+//   ★ 跨进程托管窗口会吞掉命中区域里的触摸（下面这条铁律）。
+//   按钮窗只有 156×66，挡住的区域有限；日志窗 252×86，如果它也接收触摸，
+//   回放时目标点落在它下面就会「点得到但没反应」。
+//   所以日志窗和录制蒙版一样 _ignoresHitTest 恒 YES —— 只画，不吃触摸。
 //
 // ★ 托管窗口必须贴合按钮本身，绝不能铺满全屏：
 //   跨进程托管窗口的触摸命中在窗口服务器侧完成，我们进程里 hitTest 返回
 //   nil 只是「本进程没人接」，触摸会被这个窗口接住后丢弃，不会转发给下面
 //   的抖音。窗口铺满全屏 = 抖音整屏都点不动。
-//   现在窗口只有 128×70，窗口外的触摸压根不归它管。
 //
 // 交互：
+//   点 ●  = 开始 / 结束录制（穿透录制，抖音照常能点）
 //   点 ▶  = 开始执行选中脚本（录制中则结束录制并保存）
 //   点 ■  = 停止执行 / 停止录制并保存
-//   长按 ▶ = 穿透录制：蒙版不拦触摸，边刷抖音边录（推荐）
-//   长按 ■ = 取点录制：全屏取样，抖音会被挡住，纯标点用
+//   长按 ▶ = 取点录制：全屏取样，抖音会被挡住，纯标点用
 //   拖动  = 挪位置（位置记在 NSUserDefaults；取点模式下自动禁用，否则会把取点层拖走）
 // ---------------------------------------------------------------------------
 
 NSString * const TDDataChangedNotification = @"TDDataChangedNotification";
 
-static const CGFloat kTDBallSize = 54.0;
-static const CGFloat kTDBallGap  = 5.0;
-static const CGFloat kTDOverlayW = 128.0;   // 7 + 54 + 5 + 54 + 8
-static const CGFloat kTDOverlayH = 70.0;    // 8 + 54 + 8
+// 三个球：● 录 / ▶ 播放 / ■ 停止。44pt 刚好排成一条。
+static const CGFloat kTDBallSize  = 44.0;
+static const CGFloat kTDBallGap   = 4.0;
+static const CGFloat kTDStripH    = 17.0;   // 顶部「▤ 日志」把手
+static const CGFloat kTDOverlayW  = 156.0;  // 7 + 44×3 + 4×2 + 7
+static const CGFloat kTDOverlayH  = 66.0;   // 17 把手 + 44 球 + 5
+static const CGFloat kTDLogW      = 252.0;  // 日志窗
+static const CGFloat kTDLogH      = 86.0;
 
 static NSString * const kTDBallPosX = @"tdBallCenterX";
 static NSString * const kTDBallPosY = @"tdBallCenterY";
+static NSString * const kTDLogOpenKey = @"tdFloatLogOpen";
 
 static TDHUDWindow *gBallWindow = nil;
 static BOOL gFullScreen = NO;      // 取点模式下窗口铺满全屏
 static UIPanGestureRecognizer *gPan = nil;   // 拖动悬浮条；取点模式下必须关掉
+static UIView *gRecView = nil;     // ● 录制（点一次开始 / 再点一次结束）
+static UILabel *gRecLabel = nil;
 static UIView *gStartView = nil;
 static UILabel *gStartLabel = nil;
 static UIView *gStopView = nil;
 static UILabel *gStopLabel = nil;
+
+static UIView *gLogPanel = nil;
+static UILabel *gLogHead = nil;
+static UILabel *gLogBody = nil;
+static UIView *gToggleView = nil;
+static UILabel *gToggleLabel = nil;
+static BOOL gLogOpen = YES;
+
+static void TDFloatLayoutBalls(void);
+static void TDFloatPlaceLogWindow(void);
+static void TDFloatSetLogVisible(BOOL on);
+
+/// 日志窗必须是「只画不吃触摸」的窗口。
+///
+/// 这是这一版最关键的一条：按钮窗只有 156×66，挡住的区域有限；
+/// 日志窗有 252×86，如果它也接收触摸，抖音那一大片就点不动了 ——
+/// 回放时目标点正好落在日志下面，就会出现「点得到但没反应」。
+/// 所以它和录制蒙版一样，_ignoresHitTest 恒 YES，纯粹是块显示屏。
+@interface TDLogWindow : TDHUDWindow
+@end
+
+@implementation TDLogWindow
+- (BOOL)_ignoresHitTest { return YES; }
+- (BOOL)canBecomeKeyWindow { return NO; }
+@end
+
+static TDLogWindow *gLogWindow = nil;
+
+static void TDFloatLayoutBalls(void) {
+    if (!gStartView || !gStopView) return;
+    CGFloat y = kTDStripH + 4;
+    UIView *balls[3] = { gRecView, gStartView, gStopView };
+    UILabel *labels[3] = { gRecLabel, gStartLabel, gStopLabel };
+    for (int i = 0; i < 3; i++) {
+        UIView *b = balls[i];
+        if (!b) continue;
+        b.frame = CGRectMake(7 + i * (kTDBallSize + kTDBallGap), y,
+                             kTDBallSize, kTDBallSize);
+        b.layer.cornerRadius = kTDBallSize / 2.0;
+        UILabel *lb = labels[i];
+        lb.frame = b.bounds;
+        lb.font = [UIFont boldSystemFontOfSize:17];
+    }
+}
+
+/// 把日志窗贴着按钮窗放：优先放上面，上面没地方就放下面，横向右对齐并夹进屏幕。
+/// 拖动按钮时也要跟着重算，不然会各走各的。
+static void TDFloatPlaceLogWindow(void) {
+    if (!gLogWindow || gLogWindow.hidden || !gBallWindow) return;
+    if (gFullScreen) return;
+    CGRect sb = [UIScreen mainScreen].bounds;
+    CGRect bf = gBallWindow.frame;
+
+    CGFloat x = CGRectGetMaxX(bf) - kTDLogW;
+    x = MAX(6, MIN(sb.size.width - kTDLogW - 6, x));
+    CGFloat y = bf.origin.y - kTDLogH - 6;
+    if (y < 22) y = CGRectGetMaxY(bf) + 6;
+    y = MAX(22, MIN(sb.size.height - kTDLogH - 8, y));
+
+    gLogWindow.frame = CGRectMake(round(x), round(y), kTDLogW, kTDLogH);
+    TDHUDRegisterWindow(gLogWindow);
+}
+
+/// 日志最多留 3 行（面板就那么高），新的在最上面
+static NSMutableArray<NSString *> *gLogLines = nil;
+static void TDFloatAppendLog(NSString *msg);
 
 #pragma mark - 位置
 
@@ -62,20 +143,61 @@ static void TDApplyBallPosition(UIWindow *w) {
     cy = MAX(hh + 30, MIN(sb.size.height - hh - 34, cy));
     w.frame = CGRectMake(cx - hw, cy - hh, kTDOverlayW, kTDOverlayH);
     TDHUDRegisterWindow(w);
+    TDFloatPlaceLogWindow();
 }
 
 #pragma mark - 状态刷新
+
+/// 面板顶上那行状态：空闲 / 运行中（第几轮） / 录制中
+static void TDFloatRefreshHead(void) {
+    if (!gLogHead) return;
+    TDEngine *e = [TDEngine shared];
+    TDRecorder *r = [TDRecorder shared];
+    UIColor *c;
+    NSString *state;
+    if (r.recording) {
+        state = @"录制中";
+        c = [UIColor colorWithRed:1.00 green:0.62 blue:0.15 alpha:1];
+    } else if (e.running) {
+        state = [NSString stringWithFormat:@"运行中 · 第 %ld 轮", (long)MAX(1, e.loopsDone)];
+        c = [UIColor colorWithRed:0.30 green:0.82 blue:0.48 alpha:1];
+    } else {
+        state = @"空闲";
+        c = [UIColor colorWithWhite:0.62 alpha:1];
+    }
+    gLogHead.attributedText = [[NSAttributedString alloc]
+        initWithString:[NSString stringWithFormat:@"● %@", state]
+            attributes:@{NSFontAttributeName: [UIFont monospacedDigitSystemFontOfSize:11
+                                                                           weight:UIFontWeightSemibold],
+                         NSForegroundColorAttributeName: c}];
+    if (gToggleLabel) gToggleLabel.text = gLogOpen ? @"▤ 日志 ▾" : @"▤ 日志 ▸";
+}
 
 void TDFloatRefresh(void) {
     if (!gStartView || !gStopView) return;
     TDEngine *e = [TDEngine shared];
     TDRecorder *r = [TDRecorder shared];
 
+    // ● 录制球：没录时暗红，录制中亮红 —— 点一次开始、再点一次结束，
+    // 和音量上/下是同一个开关，两条路都指向 TDRecorder，不会打架。
+    if (gRecView) {
+        gRecLabel.text = @"●";
+        if (r.recording) {
+            gRecView.backgroundColor = [UIColor colorWithRed:1.00 green:0.26 blue:0.26 alpha:0.98];
+            gRecLabel.textColor = UIColor.whiteColor;
+            gRecView.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.9].CGColor;
+        } else {
+            gRecView.backgroundColor = [UIColor colorWithRed:0.34 green:0.15 blue:0.16 alpha:0.94];
+            gRecLabel.textColor = [UIColor colorWithRed:1.00 green:0.42 blue:0.42 alpha:1];
+            gRecView.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.45].CGColor;
+        }
+    }
+
     if (r.recording) {
-        // 录制中：左球变橙显示「录」，右球是「停止录制并保存」
-        gStartView.backgroundColor = [UIColor colorWithRed:1.00 green:0.58 blue:0.10 alpha:0.95];
-        gStartLabel.text = @"录";
-        gStartView.alpha = 1;
+        // 录制中：▶ 让位（点它也只是结束录制），真正在闪的是左边那个 ●
+        gStartView.backgroundColor = [UIColor colorWithRed:0.18 green:0.68 blue:0.32 alpha:0.95];
+        gStartLabel.text = @"▶";
+        gStartView.alpha = 0.35;
         gStopView.backgroundColor = [UIColor colorWithRed:0.90 green:0.22 blue:0.22 alpha:0.95];
         gStopLabel.text = @"■";
         gStopView.alpha = 1;
@@ -93,6 +215,127 @@ void TDFloatRefresh(void) {
         gStopView.backgroundColor = [UIColor colorWithRed:0.90 green:0.22 blue:0.22 alpha:0.95];
         gStopLabel.text = @"■";
         gStopView.alpha = 0.45;
+    }
+    TDFloatRefreshHead();
+}
+
+#pragma mark - 日志面板内容
+//
+// 为什么把悬浮条改成日志窗：回放的时候人在抖音里，看不清到底「识别到了没有」。
+// 只放两个按钮等于闭着眼睛跑 —— 识图命中/没找到、判断有没有触发、粘没粘贴，
+// 这些都得能当场看见。所以这里接一份引擎日志，最近三行常驻显示。
+
+/// 按内容上色，一眼分得清：命中=绿，没命中=红，判断/兜底=黄，粘贴=蓝，其它=灰
+static UIColor *TDFloatLogColor(NSString *m) {
+    if ([m containsString:@"没找到"] || [m containsString:@"不见了"] ||
+        [m containsString:@"起不来"] || [m containsString:@"空的"]) {
+        return [UIColor colorWithRed:1.00 green:0.45 blue:0.42 alpha:1];
+    }
+    if ([m containsString:@"→ 点"] || [m containsString:@"命中"] ||
+        [m containsString:@"靠尺度扫描"]) {
+        return [UIColor colorWithRed:0.40 green:0.88 blue:0.55 alpha:1];
+    }
+    if ([m containsString:@"判断"] || [m containsString:@"兜底"]) {
+        return [UIColor colorWithRed:1.00 green:0.80 blue:0.35 alpha:1];
+    }
+    if ([m containsString:@"粘贴"]) {
+        return [UIColor colorWithRed:0.45 green:0.72 blue:1.00 alpha:1];
+    }
+    return [UIColor colorWithWhite:0.80 alpha:1];
+}
+
+static void TDFloatRenderLog(void) {
+    if (!gLogBody) return;
+    NSMutableAttributedString *as = [[NSMutableAttributedString alloc] initWithString:@""];
+    NSInteger n = MIN(3, (NSInteger)gLogLines.count);
+    for (NSInteger i = 0; i < n; i++) {
+        NSString *line = gLogLines[i];
+        if ([line containsString:@"： "]) line = [line stringByReplacingOccurrencesOfString:@"： " withString:@"："];
+        NSAttributedString *one = [[NSAttributedString alloc]
+            initWithString:(i == 0 ? line : [@"\n" stringByAppendingString:line])
+                attributes:@{NSFontAttributeName: [UIFont monospacedSystemFontOfSize:9.5
+                                                                                weight:UIFontWeightRegular],
+                             NSForegroundColorAttributeName: TDFloatLogColor(line)}];
+        [as appendAttributedString:one];
+    }
+    if (n == 0) {
+        [as appendAttributedString:[[NSAttributedString alloc]
+            initWithString:@"（还没开始跑，点 ▶ 后这里会显示识图结果）"
+                attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:9.5],
+                             NSForegroundColorAttributeName: [UIColor colorWithWhite:0.55 alpha:1]}]];
+    }
+    gLogBody.attributedText = as;
+}
+
+static void TDFloatAppendLog(NSString *msg) {
+    if (!msg.length) return;
+    if (!gLogLines) gLogLines = [NSMutableArray array];
+    [gLogLines insertObject:msg atIndex:0];
+    while (gLogLines.count > 30) [gLogLines removeLastObject];
+    TDFloatRenderLog();
+}
+
+#pragma mark - 日志窗（独立、不吃触摸）
+
+static void TDFloatEnsureLogWindow(void) {
+    if (gLogWindow) return;
+    CGRect r = CGRectMake(0, 0, kTDLogW, kTDLogH);
+    TDLogWindow *w = [[TDLogWindow alloc] initWithFrame:r];
+    w.windowLevel = 10000011.0;      // 比按钮窗高一档，视觉上连成一块
+    w.backgroundColor = [UIColor clearColor];
+    w.hidden = YES;
+
+    UIViewController *vc = [UIViewController new];
+    vc.view.backgroundColor = [UIColor clearColor];
+    vc.view.frame = r;
+    w.rootViewController = vc;
+
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if ([s isKindOfClass:[UIWindowScene class]]) { w.windowScene = (UIWindowScene *)s; break; }
+    }
+
+    gLogPanel = [[UIView alloc] initWithFrame:r];
+    gLogPanel.backgroundColor = [UIColor colorWithWhite:0 alpha:0.70];
+    gLogPanel.layer.cornerRadius = 12;
+    gLogPanel.layer.borderWidth = 1;
+    gLogPanel.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.14].CGColor;
+    gLogPanel.userInteractionEnabled = NO;
+    [vc.view addSubview:gLogPanel];
+
+    gLogHead = [[UILabel alloc] initWithFrame:CGRectMake(12, 7, kTDLogW - 24, 15)];
+    gLogHead.numberOfLines = 1;
+    [gLogPanel addSubview:gLogHead];
+
+    gLogBody = [[UILabel alloc] initWithFrame:CGRectMake(11, 25, kTDLogW - 20, 54)];
+    gLogBody.numberOfLines = 3;
+    gLogBody.lineBreakMode = NSLineBreakByTruncatingTail;
+    [gLogPanel addSubview:gLogBody];
+
+    gLogWindow = w;
+    TDFloatRenderLog();
+}
+
+static void TDFloatSetLogVisible(BOOL on) {
+    gLogOpen = on;
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:kTDLogOpenKey];
+    if (on) TDFloatEnsureLogWindow();
+    if (!gLogWindow) return;
+
+    if (!on) {
+        gLogWindow.hidden = YES;
+        TDHUDUnregisterWindow(gLogWindow);
+        return;
+    }
+    gLogWindow.hidden = NO;
+    TDFloatRenderLog();
+    TDFloatPlaceLogWindow();
+
+    // 跨进程窗口的几何注册有时候要等几帧才生效（和蒙版一个道理）
+    for (int i = 1; i <= 4; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * i * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (gLogWindow && !gLogWindow.hidden) TDFloatPlaceLogWindow();
+        });
     }
 }
 
@@ -118,7 +361,7 @@ static void TDFloatDoStart(void) {
         TDFloatRefresh();
         return;
     }
-    [e playSteps:[s engineSteps] loop:[TDConfig shared].loopCount];
+    [e playScript:s];
     TDFloatRefresh();
 }
 
@@ -161,13 +404,16 @@ static void TDFloatStartLiveRecord(void) {
         TDFloatRefresh();
         return;
     }
-    TDLog(@"穿透录制开始：直接在抖音里点/滑，录完点 ■ 或再长按 ▶");
+    TDLog(@"穿透录制开始：直接在抖音里点/滑，再点一次 ● 或按音量下结束");
     TDFloatRefresh();
 }
 
 #pragma mark - 球体视图
 
 @interface TDBallVC : UIViewController <UIGestureRecognizerDelegate>
+- (void)buildToggle;
+- (void)refreshToggle;
+- (void)onToggleLog;
 @end
 
 @implementation TDBallVC {
@@ -178,6 +424,7 @@ static void TDFloatStartLiveRecord(void) {
 - (void)loadView {
     UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kTDOverlayW, kTDOverlayH)];
     v.backgroundColor = [UIColor clearColor];
+    v.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     self.view = v;
 }
 
@@ -215,15 +462,29 @@ static void TDFloatStartLiveRecord(void) {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor clearColor];
 
-    gStartView = [self makeBallAtX:7];
+    // 日志窗默认开着：用户要的是「能看见识别到没有」。
+    // 关掉只剩三个球，位置和状态都会记住（▤ 日志 开关）。
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    gLogOpen = ([d objectForKey:kTDLogOpenKey] == nil) ? YES : [d boolForKey:kTDLogOpenKey];
+
+    [self buildToggle];
+
+    gStartView = [self makeBallAtX:0];
     gStartLabel = (UILabel *)gStartView.subviews.firstObject;
     gStartView.tag = 1;
     gStartLabel.text = @"▶";
 
-    gStopView = [self makeBallAtX:7 + kTDBallSize + kTDBallGap];
+    gStopView = [self makeBallAtX:0];
     gStopLabel = (UILabel *)gStopView.subviews.firstObject;
     gStopView.tag = 2;
     gStopLabel.text = @"■";
+
+    // ● 录制球：点一次开始穿透录制，再点一次结束并保存。
+    // 以前录制只能靠音量键或长按 ▶，手边没按键时很别扭。
+    gRecView = [self makeBallAtX:0];
+    gRecLabel = (UILabel *)gRecView.subviews.firstObject;
+    gRecView.tag = 3;
+    gRecLabel.text = @"●";
 
     // 拖动挪位置。这一条只在「悬浮条」形态下成立：
     // 取点模式窗口是铺满全屏的，pan 会认全屏任意一处滑动，把整个窗口
@@ -234,6 +495,44 @@ static void TDFloatStartLiveRecord(void) {
     gPan.enabled = !gFullScreen;
     [self.view addGestureRecognizer:gPan];
 
+    TDFloatLayoutBalls();
+    TDFloatSetLogVisible(gLogOpen);
+    TDFloatRefresh();
+}
+
+#pragma mark 日志开关
+
+/// 顶部那条 17pt 的把手：只负责开/关日志窗，不承载别的操作
+- (void)buildToggle {
+    gToggleView = [[UIView alloc] initWithFrame:CGRectZero];
+    gToggleView.userInteractionEnabled = YES;
+    gToggleView.backgroundColor = [UIColor colorWithWhite:0 alpha:0.68];
+    gToggleView.layer.cornerRadius = 8;
+    [gToggleView addGestureRecognizer:
+        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onToggleLog)]];
+    [self.view addSubview:gToggleView];
+
+    gToggleLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    gToggleLabel.font = [UIFont systemFontOfSize:10.5 weight:UIFontWeightSemibold];
+    gToggleLabel.textColor = [UIColor colorWithWhite:0.86 alpha:1];
+    gToggleLabel.textAlignment = NSTextAlignmentCenter;
+    gToggleLabel.userInteractionEnabled = NO;
+    [gToggleView addSubview:gToggleLabel];
+
+    [self refreshToggle];
+}
+
+- (void)refreshToggle {
+    gToggleView.frame = CGRectMake(0, 0, kTDOverlayW, kTDStripH);
+    gToggleLabel.frame = gToggleView.bounds;
+    gToggleLabel.text = gLogOpen ? @"▤ 日志 ▾" : @"▤ 日志 ▸";
+    gToggleLabel.textColor = gLogOpen ? [UIColor colorWithWhite:0.92 alpha:1]
+                                      : [UIColor colorWithWhite:0.68 alpha:1];
+}
+
+- (void)onToggleLog {
+    TDFloatSetLogVisible(!gLogOpen);
+    [self refreshToggle];
     TDFloatRefresh();
 }
 
@@ -241,19 +540,18 @@ static void TDFloatStartLiveRecord(void) {
     UIView *v = g.view;
     if (v.tag == 1) TDFloatDoStart();
     else if (v.tag == 2) TDFloatDoStop();
+    else if (v.tag == 3) TDFloatStartLiveRecord();   // ● 录：一次开始，再点一次结束
 }
 
 - (void)onLong:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) return;
 
-    // 录制中长按任何一个球 = 结束录制（这时屏幕上主要就剩这三个球可点）
+    // 录制中长按任何一个球 = 结束录制（这时屏幕上主要就剩这几个球可点）
     if ([TDRecorder shared].recording) { TDFloatFinishRecording(); TDFloatRefresh(); return; }
 
-    // ▶ = 穿透录制（边操作边录，推荐）
-    // ■ = 取点录制（全屏取样，抖音会被挡住）
-    NSInteger tag = g.view.tag;
-    if (tag == 1)      TDFloatStartLiveRecord();
-    else if (tag == 2) TDFloatToggleRecord();
+    // 长按 ▶ = 取点录制（全屏取样，抖音会被挡住）。
+    // 日常用 ● 就够了；这一条只在「需要绝对坐标」或 HID 监听起不来时兜底。
+    if (g.view.tag == 1) TDFloatToggleRecord();
 }
 
 /// 屏幕坐标（用 windowScene 坐标系，窗口移动时不会被抵消）
@@ -288,6 +586,8 @@ static void TDFloatStartLiveRecord(void) {
         c.x = MAX(hw + 2, MIN(sb.size.width  - hw - 2, c.x));
         c.y = MAX(hh + 30, MIN(sb.size.height - hh - 34, c.y));
         w.center = c;
+        // 拖的过程中日志窗跟着走，松手前也能看见自己拖到哪儿了
+        TDFloatPlaceLogWindow();
         return;
     }
     if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled) {
@@ -295,6 +595,7 @@ static void TDFloatStartLiveRecord(void) {
         [d setDouble:w.center.x forKey:kTDBallPosX];
         [d setDouble:w.center.y forKey:kTDBallPosY];
         TDHUDRegisterWindow(w);
+        TDFloatPlaceLogWindow();
     }
 }
 
@@ -443,6 +744,14 @@ void TDFloatInstall(void) {
     // 注入 → 圆点反馈，一直挂着（有开关控制，关掉就不画）
     TDSetInjectFeedbackHandler(TDFeedbackShow);
 
+    // 引擎日志分一路到悬浮窗：识别到没有、判断触发没有、粘没粘贴，当场就能看见。
+    // 用 log tap 而不是 TDSetLogHandler，是因为那个位置已经被主界面的日志框占着了。
+    static BOOL tapAdded = NO;
+    if (!tapAdded) {
+        tapAdded = YES;
+        TDAddLogTap(^(NSString *m) { TDFloatAppendLog(m); });
+    }
+
     if (gBallWindow) return;
 
     TDHUDWindow *w = [[TDHUDWindow alloc] initWithFrame:CGRectMake(0, 0, kTDOverlayW, kTDOverlayH)];
@@ -456,12 +765,14 @@ void TDFloatInstall(void) {
     }
     w.hidden = NO;
     TDApplyBallPosition(w);
+    TDFloatSetLogVisible(gLogOpen);
 
     // contextID 要等几帧才建出来，隔一会儿重试
     for (int i = 1; i <= 8; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * i * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (gBallWindow) TDHUDRegisterWindow(gBallWindow);
+            TDFloatPlaceLogWindow();
             if (i == 8) TDLog(@"悬浮条 %@", TDHUDStatus());
         });
     }
@@ -475,9 +786,14 @@ void TDFloatSetVisible(BOOL on) {
     if (on) {
         gBallWindow.hidden = NO;
         TDApplyBallPosition(gBallWindow);
+        TDFloatSetLogVisible(gLogOpen);
     } else {
         gBallWindow.hidden = YES;
         TDHUDUnregisterWindow(gBallWindow);
+        if (gLogWindow) {
+            gLogWindow.hidden = YES;
+            TDHUDUnregisterWindow(gLogWindow);
+        }
     }
 }
 
@@ -522,6 +838,10 @@ void TDFloatSetFullScreen(BOOL on) {
     if (on) {
         gStartView.hidden = YES;
         gStopView.hidden = YES;
+        gRecView.hidden = YES;
+        // 取点层要全屏接触摸，日志面板和把手都必须让开
+        if (gLogWindow) { gLogWindow.hidden = YES; TDHUDUnregisterWindow(gLogWindow); }
+        gToggleView.hidden = YES;
         // 换一个 level，逼 TDHUD 重新向 SpringBoard 注册新几何
         gBallWindow.windowLevel = 10000012.0;
         gBallWindow.frame = [UIScreen mainScreen].bounds;
@@ -532,8 +852,13 @@ void TDFloatSetFullScreen(BOOL on) {
         gBallWindow.windowLevel = 10000010.0;
         gStartView.hidden = NO;
         gStopView.hidden = NO;
+        gRecView.hidden = NO;
+        if (gLogWindow && !gLogOpen) gLogWindow.hidden = YES;
+        if (gLogWindow && gLogOpen) { gLogWindow.hidden = NO; TDFloatPlaceLogWindow(); }
+        gToggleView.hidden = NO;
         TDApplyBallPosition(gBallWindow);
         [gBallWindow layoutIfNeeded];
+        TDFloatLayoutBalls();
         TDLog(@"退出取点模式");
     }
     TDFloatRefresh();

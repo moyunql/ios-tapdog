@@ -66,6 +66,17 @@ void TDSetLogHandler(void (^h)(NSString *)) {
     [TDEngine shared].logHandler = h;
 }
 
+// 额外订阅者。悬浮窗的日志面板靠它拿日志 ——
+// 单独的 logHandler 只有一个位置，被主界面占了，再覆盖就会互相顶掉。
+static NSMutableArray *gLogTaps = nil;
+
+void TDAddLogTap(void (^h)(NSString *)) {
+    if (!h) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ gLogTaps = [NSMutableArray array]; });
+    [gLogTaps addObject:[h copy]];
+}
+
 void TDLog(NSString *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -80,6 +91,10 @@ void TDLog(NSString *fmt, ...) {
     NSInteger _loopsDone;
     NSString *_jetsamStatus;
     NSArray *_currentPlan;      // 当前这一轮要跑的步骤，日志里用来取序号
+    NSDictionary *_failsafe;    // 本次运行的「判断」配置（nil = 关）
+    BOOL _failsafeFired;        // 这次运行有没有已经兜过底（once 用）
+    BOOL _inFailsafe;           // 正在跑兜底动作（防止兜底里再套兜底）
+    NSInteger _fbIndex;         // 兜底动作跑到第几步（只为日志）
 }
 
 + (instancetype)shared {
@@ -103,7 +118,13 @@ void TDLog(NSString *fmt, ...) {
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     void (^h)(NSString *) = self.logHandler;
-    if (h) dispatch_async(dispatch_get_main_queue(), ^{ h(s); });
+    NSArray *taps = gLogTaps.count ? [gLogTaps copy] : nil;
+    if (h || taps.count) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (h) h(s);
+            for (void (^t)(NSString *) in taps) t(s);
+        });
+    }
 #ifdef DEBUG
     NSLog(@"[tapdog] %@", s);
 #endif
@@ -126,6 +147,32 @@ static CGPoint TDJitter(CGPoint p, double r) {
 }
 
 - (void)playSteps:(NSArray<NSDictionary *> *)steps loop:(NSInteger)loops {
+    [self startPlan:steps loops:loops failsafe:nil loopGap:0];
+}
+
+/// 跑一条脚本：循环次数、每轮间隔、识图失败兜底全部按脚本自己的配置。
+- (void)playScript:(TDScript *)script {
+    if (!script) {
+        [self logMsg:@"没有选中的脚本"];
+        return;
+    }
+    NSArray *plan = [script engineSteps];
+    NSInteger loops = 1;
+    double gap = 0;
+    if ([script.loop[@"on"] boolValue]) {
+        // count：0 或负数 = 无限，和悬浮球那边的约定一致
+        loops = [script.loop[@"count"] integerValue];
+        if (loops < 0) loops = 0;
+        gap = MAX(0.0, [script.loop[@"gap"] doubleValue]);
+    }
+    NSDictionary *fs = [script failsafeEnabled] ? script.failsafe : nil;
+    [self startPlan:plan loops:loops failsafe:fs loopGap:gap];
+}
+
+- (void)startPlan:(NSArray<NSDictionary *> *)steps
+            loops:(NSInteger)loops
+         failsafe:(NSDictionary *)failsafe
+          loopGap:(double)loopGap {
     if (_running) {
         [self logMsg:@"已经在跑了"];
         return;
@@ -136,11 +183,24 @@ static CGPoint TDJitter(CGPoint p, double r) {
     }
     _running = YES;
     _loopsDone = 0;
+    _failsafe = failsafe;
+    _failsafeFired = NO;
+    _inFailsafe = NO;
+    _fbIndex = 0;
     NSArray *plan = [steps copy];
     _currentPlan = plan;
 
-    [self logMsg:@"开始：%lu 步，循环 %@", (unsigned long)plan.count,
-                  loops == 0 ? @"无限" : [NSString stringWithFormat:@"%ld 次", (long)loops]];
+    [self logMsg:@"开始：%lu 步，循环 %@%@", (unsigned long)plan.count,
+                  loops == 0 ? @"无限" : [NSString stringWithFormat:@"%ld 次", (long)loops],
+                  loopGap > 0 ? [NSString stringWithFormat:@"，每轮间隔 %.0fms", loopGap] : @""];
+    if (failsafe) {
+        NSArray *fsteps = failsafe[@"steps"];
+        NSString *tpl = [failsafe[@"tpl"] isKindOfClass:[NSString class]] ? failsafe[@"tpl"] : @"";
+        [self logMsg:@"判断已开：识图%@找不到时跑 %lu 步兜底动作（%@）",
+                      tpl.length ? tpl : @"任意",
+                      (unsigned long)fsteps.count,
+                      [failsafe[@"once"] boolValue] ? @"只第一次触发" : @"每次都触发"];
+    }
 
     dispatch_async(_q, ^{
         NSInteger round = 0;
@@ -153,6 +213,8 @@ static CGPoint TDJitter(CGPoint p, double r) {
             round++;
             self->_loopsDone = round;
             if (loops > 0 && round >= loops) break;
+            // 每轮之间歇一下：整段播完立刻从头再点，节奏比人快得多
+            if (loopGap > 0) usleep((useconds_t)(MIN(loopGap, 30000.0) * 1000));
         }
         self->_running = NO;
         [self logMsg:@"结束，跑了 %ld 轮", (long)round];
@@ -174,8 +236,7 @@ static CGPoint TDJitter(CGPoint p, double r) {
     if (st[@"run"]) {
         double run = [st[@"run"] doubleValue];
         if (run < 0.999 && TDRand01() > run) {
-            [self logMsg:@"第 %ld 步按概率跳过（run=%.0f%%）",
-                   (long)[self stepOrdinal:st], run * 100];
+            [self logMsg:@"%@按概率跳过（run=%.0f%%）", [self stepTag:st], run * 100];
             if ([t isEqualToString:@"wait"]) usleep((useconds_t)([st[@"ms"] doubleValue] * 1000));
             return;
         }
@@ -248,6 +309,23 @@ static CGPoint TDJitter(CGPoint p, double r) {
         return;
     }
 
+    // 粘贴：把评论话术塞进「当前有焦点」的输入框。
+    // 取文本 → 写剪贴板 → Cmd+V。前面的步骤要先把输入框点开（这一步不管焦点）。
+    if ([t isEqualToString:@"paste"]) {
+        NSString *txt = [st[@"text"] isKindOfClass:[NSString class]] ? [st[@"text"] copy] : nil;
+        BOOL fromPool = (txt.length == 0);
+        if (fromPool) txt = TDCommentPick();
+        if (txt.length == 0) {
+            [self logMsg:@"%@ 要粘贴，但评论池是空的（去脚本编辑页加几条话术）", [self stepTag:st]];
+            return;
+        }
+        TDPasteText(txt);
+        NSString *show = txt.length > 12 ? [[txt substringToIndex:12] stringByAppendingString:@"…"] : txt;
+        [self logMsg:@"粘贴%@：%@", fromPool ? @"（池随机）" : @"", show];
+        usleep((useconds_t)(interval * 1000));
+        return;
+    }
+
     if ([t isEqualToString:@"long"]) {
         CGPoint p = TDJitter(CGPointMake([st[@"x"] doubleValue], [st[@"y"] doubleValue]), jitter);
         double ms = st[@"ms"] ? [st[@"ms"] doubleValue] : 800;
@@ -285,7 +363,7 @@ static CGPoint TDJitter(CGPoint p, double r) {
     if ([t isEqualToString:@"find"]) {
         NSString *name = st[@"tpl"];
         if (name.length == 0) {
-            [self logMsg:@"第 %ld 步是识图，但还没选模板", (long)[self stepOrdinal:st]];
+            [self logMsg:@"%@是识图，但还没选模板", [self stepTag:st]];
             return;
         }
         double th = st[@"th"] ? [st[@"th"] doubleValue] : cfg.threshold;
@@ -297,6 +375,7 @@ static CGPoint TDJitter(CGPoint p, double r) {
         UIImage *tpl = [UIImage imageWithContentsOfFile:[dir stringByAppendingPathComponent:name]];
         if (!tpl) {
             [self logMsg:@"模板文件不见了：%@", name];
+            [self runFailsafeFor:name];
             return;
         }
 
@@ -318,6 +397,7 @@ static CGPoint TDJitter(CGPoint p, double r) {
 
         if (!m) {
             [self logMsg:@"识图没找到 %@（阈值 %.2f，试了 %ld 次）", name, th, (long)tries];
+            [self runFailsafeFor:name];
             return;
         }
         if (scaledHit) {
@@ -335,6 +415,57 @@ static CGPoint TDJitter(CGPoint p, double r) {
         usleep((useconds_t)(interval * 1000));
         return;
     }
+}
+
+/// 步骤序号（只为日志好读：能对上编辑页里的第几行）。
+/// 兜底动作不在主计划里，单独编号，免得日志里冒出「第 1 步」这种误导。
+- (NSString *)stepTag:(NSDictionary *)st {
+    if (_inFailsafe) return [NSString stringWithFormat:@"兜底第 %ld 步", (long)_fbIndex];
+    return [NSString stringWithFormat:@"第 %ld 步", (long)[self stepOrdinal:st]];
+}
+
+/// 判断：识图找不到时做什么。
+///
+/// 只在「配置开 + 模板对得上（空=任意）+ 没超次数」时执行；
+/// 兜底动作本身也走 execStep，所以每一步的随机率、位置半径、压力范围全都照常生效 ——
+/// 录完以后在编辑页里给这几步加随机，就等于「兜底操作也带随机屏幕参数」。
+- (void)runFailsafeFor:(NSString *)tpl {
+    NSDictionary *fs = _failsafe;
+    if (!fs || _inFailsafe || !_running) return;
+    if (![fs[@"on"] boolValue]) return;
+
+    NSString *want = [fs[@"tpl"] isKindOfClass:[NSString class]] ? fs[@"tpl"] : @"";
+    if (want.length && ![want isEqualToString:tpl]) {
+        [self logMsg:@"判断只对 %@ 生效，这次失败的是 %@", want, tpl];
+        return;
+    }
+    if ([fs[@"once"] boolValue] && _failsafeFired) {
+        [self logMsg:@"判断设了「只触发一次」，已经用过就不再兜底"];
+        return;
+    }
+    NSArray *steps = [fs[@"steps"] isKindOfClass:[NSArray class]] ? fs[@"steps"] : nil;
+    if (steps.count == 0) {
+        [self logMsg:@"判断命中了，但兜底动作是空的（去「判断编辑」里录一段）"];
+        return;
+    }
+
+    _failsafeFired = YES;
+    _inFailsafe = YES;
+    [self logMsg:@"判断触发：%@ 没找到 → 执行 %lu 步兜底动作",
+                  tpl.length ? tpl : @"识图", (unsigned long)steps.count];
+
+    _fbIndex = 0;
+    for (NSDictionary *st in steps) {
+        if (!_running) break;
+        _fbIndex++;
+        // 兜底步骤的 gap 没人帮它展开（engineSteps 只处理主计划），这里自己歇
+        double g = [st[@"gap"] doubleValue];
+        if (g > 30) usleep((useconds_t)(MIN(g, 8000.0) * 1000));
+        @autoreleasepool { [self execStep:st]; }
+    }
+    _fbIndex = 0;
+    _inFailsafe = NO;
+    [self logMsg:@"兜底动作跑完，回到主脚本"];
 }
 
 /// 步骤序号（只为日志好读：能对上编辑页里的第几行）

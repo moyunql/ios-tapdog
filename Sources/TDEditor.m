@@ -410,9 +410,9 @@ didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> 
 
 #pragma mark - 单步编辑
 
-typedef NS_ENUM(NSInteger, TDStepKind) { KTap = 0, KLong, KSwipe, KWait };
+typedef NS_ENUM(NSInteger, TDStepKind) { KTap = 0, KLong, KSwipe, KWait, KPaste };
 typedef NS_ENUM(NSInteger, TDRowKind) {
-    RKind = 0, RMode, RNum, RTpl, RTest, RPhys, RDelete, RNote
+    RKind = 0, RMode, RNum, RTpl, RTest, RPhys, RDelete, RNote, RText, RPool, RPasteTest
 };
 typedef NS_ENUM(NSInteger, TDField) {
     F_X = 0, F_Y, F_X1, F_Y1, F_X2, F_Y2, F_MS, F_GAP,
@@ -443,6 +443,9 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
 - (void)chooseTemplate;
 - (void)runTest;
 - (void)confirmDelete;
+- (void)poolModeChanged:(UISegmentedControl *)seg;
+- (void)textChanged:(UITextField *)tf;
+- (void)tryPaste;
 @end
 
 @implementation TDStepEditVC {
@@ -455,6 +458,9 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
     BOOL _imgMode;
     NSString *_tpl;
     BOOL _physOn;
+    // 粘贴步骤：文本为空 = 从评论池随机取
+    NSString *_pasteText;
+    BOOL _pasteFixed;          // YES = 用下面这句写死的话，NO = 池里随机
 
     double _v[F_COUNT];
     NSArray<NSArray<NSDictionary *> *> *_plan;
@@ -480,8 +486,11 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
           : [t isEqualToString:@"swipe"] ? KSwipe
           : [t isEqualToString:@"gesture"] ? KSwipe
           : [t isEqualToString:@"wait"] ? KWait
+          : [t isEqualToString:@"paste"] ? KPaste
           : KTap;
     _imgMode = [t isEqualToString:@"find"];
+    _pasteText = [_d[@"text"] isKindOfClass:[NSString class]] ? [_d[@"text"] copy] : @"";
+    _pasteFixed = (_pasteText.length > 0);
 
     _v[F_X]  = [_d[@"x"] doubleValue];
     _v[F_Y]  = [_d[@"y"] doubleValue];
@@ -553,7 +562,12 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
     if (_kind == KTap || _kind == KLong) [sec0 addObject:@{@"k": @(RMode)}];
 
     NSMutableArray *sec1 = [NSMutableArray array];
-    if (_imgMode) {
+    if (_kind == KPaste) {
+        // 粘贴：文本从评论池随机取，或者写死一句
+        [sec1 addObject:@{@"k": @(RPool)}];
+        if (_pasteFixed) [sec1 addObject:@{@"k": @(RText)}];
+        [sec1 addObject:@{@"k": @(RPasteTest)}];
+    } else if (_imgMode) {
         [sec1 addObject:@{@"k": @(RTpl)}];
         [sec1 addObject:RowNum(F_TH, @"相似度阈值", @"0~1", YES)];
         [sec1 addObject:RowNum(F_DX, @"落点偏移 X", @"点", NO)];
@@ -621,7 +635,7 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
     switch (s) {
         case 0: return @"动作";
-        case 1: return _imgMode ? @"识图参数" : @"位置";
+        case 1: return _kind == KPaste ? @"粘贴内容" : (_imgMode ? @"识图参数" : @"位置");
         case 2: return @"随机化";
         case 3: return @"节奏";
         default: return nil;
@@ -630,6 +644,9 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
     if (s == 2) return @"压力/半径默认关：之前实测这台机器只认「压力 0 / 半径 0.04」，开了可能点不动。";
+    if (s == 1 && _kind == KPaste)
+        return @"「粘贴」是写剪贴板 + 发 Cmd+V，所以前面必须先有一步把评论框点开（获取焦点）。"
+                "文本留空就用评论池里随机的一条 —— 话术池在脚本编辑页的「评论池」里维护。";
     if (s == 1 && _imgMode)
         return @"模板可以截屏框选，也可以从相册传一张截图；画面会变的（直播/视频）尽量框静态按钮。";
     return nil;
@@ -651,10 +668,12 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
 
     if (k == RKind) {
         UITableViewCell *c = [self baseCell:@"kind"];
-        UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"点击", @"长按", @"滑动", @"等待"]];
-        seg.frame = CGRectMake(0, 0, 232, 30);
+        UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"点击", @"长按", @"滑动", @"等待", @"粘贴"]];
+        seg.frame = CGRectMake(0, 0, 246, 30);
         seg.selectedSegmentIndex = _kind;
         seg.tintColor = ED_ACCENT;
+        [seg setTitleTextAttributes:@{NSFontAttributeName: [UIFont systemFontOfSize:11.5]}
+                           forState:UIControlStateNormal];
         [seg addTarget:self action:@selector(kindChanged:) forControlEvents:UIControlEventValueChanged];
         c.accessoryView = seg;
         c.textLabel.text = @"类型";
@@ -730,6 +749,45 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
         return c;
     }
 
+    if (k == RPool) {
+        UITableViewCell *c = [self baseCell:@"pool"];
+        UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"评论池随机", @"固定一句"]];
+        seg.frame = CGRectMake(0, 0, 190, 30);
+        seg.selectedSegmentIndex = _pasteFixed ? 1 : 0;
+        seg.tintColor = ED_GREEN;
+        [seg addTarget:self action:@selector(poolModeChanged:) forControlEvents:UIControlEventValueChanged];
+        c.accessoryView = seg;
+        c.textLabel.text = @"文本来源";
+        c.detailTextLabel.text = [NSString stringWithFormat:@"池里 %ld 条", (long)TDCommentPoolCount()];
+        return c;
+    }
+
+    if (k == RText) {
+        UITableViewCell *c = [self baseCell:@"text"];
+        c.textLabel.text = @"话术";
+        UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, 190, 30)];
+        tf.textAlignment = NSTextAlignmentRight;
+        tf.textColor = ED_GREEN;
+        tf.font = [UIFont systemFontOfSize:14];
+        tf.returnKeyType = UIReturnKeyDone;
+        tf.delegate = self;
+        tf.tag = -1;                       // -1 = 话术输入框（不是数值）
+        tf.text = _pasteText;
+        tf.placeholder = @"要粘贴的这句话";
+        [tf addTarget:self action:@selector(textChanged:) forControlEvents:UIControlEventEditingChanged];
+        c.accessoryView = tf;
+        return c;
+    }
+
+    if (k == RPasteTest) {
+        UITableViewCell *c = [self baseCell:@"ptest"];
+        c.textLabel.text = @"试粘贴一次（会真发 Cmd+V）";
+        c.textLabel.textColor = ED_ACCENT;
+        c.textLabel.textAlignment = NSTextAlignmentCenter;
+        c.selectionStyle = UITableViewCellSelectionStyleDefault;
+        return c;
+    }
+
     if (k == RDelete) {
         UITableViewCell *c = [self baseCell:@"del"];
         c.textLabel.text = @"删除这个事件";
@@ -767,9 +825,62 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
 
 - (void)kindChanged:(UISegmentedControl *)seg {
     _kind = (TDStepKind)seg.selectedSegmentIndex;
-    if (_kind == KSwipe || _kind == KWait) _imgMode = NO;
+    if (_kind == KSwipe || _kind == KWait || _kind == KPaste) _imgMode = NO;
     if (_kind == KWait && _v[F_MS] < 100) _v[F_MS] = 500;
     [self rebuildPlan];
+}
+
+- (void)poolModeChanged:(UISegmentedControl *)seg {
+    if (seg.selectedSegmentIndex == 1) {
+        _pasteFixed = YES;
+        [self rebuildPlan];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            // 让输入框直接进入编辑状态，省一次点击
+            for (UITableViewCell *c in self.tableView.visibleCells) {
+                if ([c.accessoryView isKindOfClass:[UITextField class]] &&
+                    c.accessoryView.tag == -1) {
+                    [c.accessoryView becomeFirstResponder];
+                    break;
+                }
+            }
+        });
+    } else {
+        _pasteFixed = NO;
+        _pasteText = @"";
+        [self rebuildPlan];
+    }
+}
+
+- (void)textChanged:(UITextField *)tf {
+    if (tf.tag == -1) _pasteText = [tf.text copy] ?: @"";
+}
+
+/// 现场试一次粘贴：把这句话写进剪贴板再发 Cmd+V。
+/// 让用户在抖音评论框里先点开输入框，回来按这个，看字有没有进去 ——
+/// 这一步能把「键盘通道通不通」和「脚本写错没错」彻底分开。
+- (void)tryPaste {
+    [self.view endEditing:YES];
+    NSString *txt = _pasteText.length ? _pasteText : TDCommentPick();
+    if (txt.length == 0) {
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"没有可粘的内容"
+                                                                  message:@"评论池是空的，先写死一句，或者去「评论池」里加几条"
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+        return;
+    }
+    TDPasteText(txt);
+    NSString *msg = [NSString stringWithFormat:
+                     @"已写剪贴板并发了一次 Cmd+V：\n「%@」\n\n"
+                      "发送方式：%@\n"
+                      "如果抖音输入框里没出现这段字，去「评论池」页换一种发送方式再试。",
+                     txt, TDPasteVariantDesc()];
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"已尝试粘贴"
+                                                              message:msg
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 - (void)modeChanged:(UISegmentedControl *)seg {
@@ -802,6 +913,7 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
 
     if (k == RTpl) { [self pickTemplate]; return; }
     if (k == RTest) { [self runTest]; return; }
+    if (k == RPasteTest) { [self tryPaste]; return; }
     if (k == RDelete) { [self confirmDelete]; return; }
 }
 
@@ -1027,6 +1139,10 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
         _d[@"x2"] = @((NSInteger)lround(_v[F_X2]));
         _d[@"y2"] = @((NSInteger)lround(_v[F_Y2]));
         _d[@"ms"] = @((NSInteger)MAX(120, lround(_v[F_MS])));
+    } else if (_kind == KPaste) {
+        _d[@"t"] = @"paste";
+        // 不写 text 键 = 从评论池随机取（引擎就是这么判的）
+        if (_pasteFixed && _pasteText.length) _d[@"text"] = [_pasteText copy];
     } else if (_imgMode) {
         _d[@"t"] = @"find";
         _d[@"tpl"] = _tpl ?: @"";
@@ -1191,6 +1307,589 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
 
 @end
 
+#pragma mark - 通用：新建步骤 / 打开单步编辑
+
+static NSArray<NSString *> *TDStepKindTitles(void) {
+    return @[@"点击（坐标）", @"长按（坐标）", @"滑动", @"等待", @"识图点击", @"粘贴话术"];
+}
+
+/// 按类型造一个默认步骤。k 的序号和上面的标题一一对应。
+/// 主脚本编辑页和「判断」页共用同一套默认值，免得两处各写一份、改了一处忘另一处。
+static NSMutableDictionary *TDNewStepOfKind(NSInteger k) {
+    CGSize sb = [UIScreen mainScreen].bounds.size;
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"gap"] = @(300);
+
+    switch (k) {
+        case 0:
+            d[@"t"] = @"tap";
+            d[@"x"] = @((NSInteger)(sb.width / 2));
+            d[@"y"] = @((NSInteger)(sb.height * 0.62));
+            break;
+        case 1:
+            d[@"t"] = @"long";
+            d[@"x"] = @((NSInteger)(sb.width / 2));
+            d[@"y"] = @((NSInteger)(sb.height * 0.62));
+            d[@"ms"] = @(800);
+            break;
+        case 2:
+            d[@"t"] = @"swipe";
+            d[@"x1"] = @((NSInteger)(sb.width / 2));
+            d[@"y1"] = @((NSInteger)(sb.height * 0.72));
+            d[@"x2"] = @((NSInteger)(sb.width / 2));
+            d[@"y2"] = @((NSInteger)(sb.height * 0.28));
+            d[@"ms"] = @(400);
+            break;
+        case 3:
+            d[@"t"] = @"wait";
+            d[@"ms"] = @(1000);
+            break;
+        case 5:
+            // 粘贴：不写 text = 从评论池随机取一条
+            d[@"t"] = @"paste";
+            break;
+        default:
+            d[@"t"] = @"find";
+            d[@"tpl"] = @"";
+            d[@"th"] = @([TDConfig shared].threshold);
+            d[@"dx"] = @0;
+            d[@"dy"] = @0;
+            d[@"to"] = @(1500);
+            break;
+    }
+    return d;
+}
+
+static void TDPresentStepEditor(UIViewController *host, NSMutableDictionary *d, BOOL isNew,
+                                void (^onSave)(void), void (^onDelete)(void)) {
+    TDStepEditVC *vc = [[TDStepEditVC alloc] initWithStep:d isNew:isNew
+                                                   onSave:onSave onDelete:onDelete];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    [host presentViewController:nav animated:YES completion:nil];
+}
+
+/// 弹「加什么事件」，选完回调类型序号（取消不回调）
+static void TDPresentKindSheet(UIViewController *host, NSString *title, void (^pick)(NSInteger k)) {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:title message:nil
+                                                       preferredStyle:UIAlertControllerStyleActionSheet];
+    NSArray<NSString *> *titles = TDStepKindTitles();
+    for (NSInteger i = 0; i < (NSInteger)titles.count; i++) {
+        [a addAction:[UIAlertAction actionWithTitle:titles[i] style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *x) { if (pick) pick(i); }]];
+    }
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    a.popoverPresentationController.sourceView = host.view;
+    a.popoverPresentationController.sourceRect =
+        CGRectMake(host.view.bounds.size.width / 2, 200, 1, 1);
+    [host presentViewController:a animated:YES completion:nil];
+}
+
+/// 兜底动作的默认随机：位置撒 8pt、时长抖 20%、间隔抖 30%。
+/// 录出来的动作坐标是死的，同一个位置连点几十次最容易被看出来，
+/// 所以判断里录完就自动把它加上，用户不用一步步去开。
+static NSDictionary *TDDefaultFailsafeRnd(void) {
+    return @{@"p": @1.0, @"px": @8, @"ms": @0.2, @"gap": @0.3};
+}
+
+#pragma mark - 循环设置
+
+@interface TDLoopVC : UITableViewController
+@property (nonatomic, strong) TDScript *script;
+@end
+
+@implementation TDLoopVC
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"循环";
+    self.tableView.backgroundColor = ED_BG;
+    self.tableView.separatorColor = ED_LINE;
+    self.navigationController.navigationBar.tintColor = ED_GREEN;
+}
+
+- (void)commit {
+    [[TDScriptStore shared] save];
+    [[NSNotificationCenter defaultCenter] postNotificationName:TDDataChangedNotification object:nil];
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 1; }
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return 3; }
+
+- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
+    return @"循环 0 = 一直跑，直到手动停。\n"
+            "「每轮间隔」是整条脚本跑完一遍后歇多久再从头开始。\n"
+            "循环关掉 = 只跑一遍。";
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    UITableViewCell *c = [tv dequeueReusableCellWithIdentifier:@"c"];
+    if (!c) c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:@"c"];
+    c.backgroundColor = ED_CARD;
+    c.textLabel.textColor = ED_TEXT;
+    c.detailTextLabel.textColor = ED_DIM;
+    c.selectionStyle = UITableViewCellSelectionStyleNone;
+
+    NSMutableDictionary *lp = self.script.loop;
+    if (ip.row == 0) {
+        c.textLabel.text = @"循环整个脚本";
+        UISwitch *sw = [[UISwitch alloc] init];
+        sw.on = [lp[@"on"] boolValue];
+        sw.onTintColor = ED_GREEN;
+        [sw addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
+        c.accessoryView = sw;
+    } else if (ip.row == 1) {
+        c.textLabel.text = @"循环次数";
+        UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, 110, 30)];
+        tf.textAlignment = NSTextAlignmentRight;
+        tf.textColor = ED_GREEN;
+        tf.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightMedium];
+        tf.keyboardType = UIKeyboardTypeNumberPad;
+        tf.tag = 1;
+        tf.text = [NSString stringWithFormat:@"%ld", (long)[lp[@"count"] integerValue]];
+        tf.placeholder = @"0 = 无限";
+        [tf addTarget:self action:@selector(numChanged:) forControlEvents:UIControlEventEditingChanged];
+        c.accessoryView = tf;
+    } else {
+        c.textLabel.text = @"每轮间隔";
+        UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, 110, 30)];
+        tf.textAlignment = NSTextAlignmentRight;
+        tf.textColor = ED_GREEN;
+        tf.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightMedium];
+        tf.keyboardType = UIKeyboardTypeNumberPad;
+        tf.tag = 2;
+        tf.text = [NSString stringWithFormat:@"%.0f", [lp[@"gap"] doubleValue]];
+        tf.placeholder = @"毫秒";
+        [tf addTarget:self action:@selector(numChanged:) forControlEvents:UIControlEventEditingChanged];
+        c.accessoryView = tf;
+    }
+    return c;
+}
+
+- (void)switchChanged:(UISwitch *)sw {
+    self.script.loop[@"on"] = @(sw.on);
+    [self commit];
+    [self.tableView reloadData];
+}
+
+- (void)numChanged:(UITextField *)tf {
+    if (tf.tag == 1) self.script.loop[@"count"] = @([tf.text integerValue]);
+    else             self.script.loop[@"gap"] = @(MAX(0, [tf.text doubleValue]));
+    [self commit];
+}
+
+@end
+
+#pragma mark - 判断编辑（识图找不到时做什么）
+
+@interface TDFailsafeVC : UITableViewController
+@property (nonatomic, strong) TDScript *script;
+@end
+
+@implementation TDFailsafeVC
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"判断";
+    self.tableView.backgroundColor = ED_BG;
+    self.tableView.separatorColor = ED_LINE;
+    self.navigationController.navigationBar.tintColor = ED_GREEN;
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(onDataChanged)
+                                                 name:TDDataChangedNotification
+                                               object:nil];
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    // 留着回调没清，下一次「正常录制」会把步骤喂给一个已经没了的页面，
+    // 结果就是录完什么都没存下来。没在录 = 这个回调一定是废的。
+    TDRecorder *r = [TDRecorder shared];
+    if (r.onStepsReady && !r.recording) r.onStepsReady = nil;
+}
+
+- (void)onDataChanged {
+    // 录兜底动作是在抖音里结束的，回来这一页要自己刷新
+    [self.tableView reloadData];
+}
+
+- (NSMutableDictionary *)fs { return self.script.failsafe; }
+- (BOOL)on { return [[self fs][@"on"] boolValue]; }
+
+- (NSMutableArray *)steps {
+    id a = [self fs][@"steps"];
+    if (![a isKindOfClass:[NSMutableArray class]]) {
+        NSMutableArray *m = [NSMutableArray array];
+        [self fs][@"steps"] = m;
+        return m;
+    }
+    return a;
+}
+
+- (void)commit {
+    [[TDScriptStore shared] save];
+    [self.tableView reloadData];
+    [[NSNotificationCenter defaultCenter] postNotificationName:TDDataChangedNotification object:nil];
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 3; }
+
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
+    if (s == 0) return 2;              // 启用 + 只触发一次
+    if (s == 1) return [self on] ? 3 : 0;
+    return [self on] ? (NSInteger)[self steps].count : 0;
+}
+
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
+    if (s == 0) return @"判断";
+    if (s == 1) return @"找不到图时做这些（兜底动作）";
+    return [self steps].count ? @"兜底步骤 · 点一行改它，左滑删" : nil;
+}
+
+- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
+    if (s == 0) {
+        return @"「找不到自定义识图图片」时不再只是跳过：会先跑一遍下面的兜底动作，再继续主脚本。\n"
+                "目标模板留空 = 任何一个识图失败都算。";
+    }
+    if (s == 1) {
+        return @"兜底动作就是你录下来的真实操作，录完会自动带上随机（位置 ±8pt / 时长 ±20% / 间隔 ±30%）。\n"
+                "录的时候按音量上开始、音量下结束，人在抖音里正常做动作就行。";
+    }
+    return nil;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    UITableViewCell *c = [tv dequeueReusableCellWithIdentifier:@"c"];
+    if (!c) c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"c"];
+    c.backgroundColor = ED_CARD;
+    c.textLabel.textColor = ED_TEXT;
+    c.detailTextLabel.textColor = ED_DIM;
+    c.accessoryView = nil;
+    c.accessoryType = UITableViewCellAccessoryNone;
+    c.selectionStyle = UITableViewCellSelectionStyleNone;
+
+    if (ip.section == 0) {
+        if (ip.row == 0) {
+            c.textLabel.text = @"启用判断";
+            UISwitch *sw = [[UISwitch alloc] init];
+            sw.on = [self on];
+            sw.onTintColor = ED_GREEN;
+            [sw addTarget:self action:@selector(onChanged:) forControlEvents:UIControlEventValueChanged];
+            c.accessoryView = sw;
+        } else {
+            c.textLabel.text = @"只触发一次";
+            UISwitch *sw = [[UISwitch alloc] init];
+            sw.on = [[self fs][@"once"] boolValue];
+            sw.onTintColor = ED_YELL;
+            [sw addTarget:self action:@selector(onceChanged:) forControlEvents:UIControlEventValueChanged];
+            c.accessoryView = sw;
+            c.detailTextLabel.text = @"关 = 每次找不到都兜底";
+        }
+        return c;
+    }
+
+    if (ip.section == 1) {
+        c.selectionStyle = UITableViewCellSelectionStyleDefault;
+        if (ip.row == 0) {
+            c.textLabel.text = @"● 录一段兜底动作";
+            c.textLabel.textColor = ED_RED;
+            c.detailTextLabel.text = [NSString stringWithFormat:
+                                      @"音量上开始 / 音量下结束 · 现在 %lu 步",
+                                      (unsigned long)[self steps].count];
+        } else if (ip.row == 1) {
+            c.textLabel.text = @"＋ 手动加一步";
+            c.detailTextLabel.text = @"比如「上滑一条」「点评论按钮」";
+        } else {
+            c.textLabel.text = @"⚡ 全部加随机";
+            c.textLabel.textColor = ED_YELL;
+            c.detailTextLabel.text = @"位置 ±8pt · 时长 ±20% · 间隔 ±30%";
+        }
+        return c;
+    }
+
+    // 兜底步骤
+    NSDictionary *st = [self steps][ip.row];
+    c.textLabel.text = [NSString stringWithFormat:@"%ld  %@", (long)(ip.row + 1),
+                        [TDScript describeStep:st]];
+    NSDictionary *r = [st[@"rnd"] isKindOfClass:[NSDictionary class]] ? st[@"rnd"] : nil;
+    NSString *rnd = r ? [NSString stringWithFormat:@" · 随机 %.0f%%", [r[@"p"] doubleValue] * 100] : @" · 无随机";
+    c.detailTextLabel.text = [NSString stringWithFormat:@"间隔 %.0fms%@", [st[@"gap"] doubleValue], rnd];
+    c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    c.selectionStyle = UITableViewCellSelectionStyleDefault;
+    return c;
+}
+
+- (void)onChanged:(UISwitch *)sw {
+    [self fs][@"on"] = @(sw.on);
+    [self commit];
+}
+
+- (void)onceChanged:(UISwitch *)sw {
+    [self fs][@"once"] = @(sw.on);
+    [self commit];
+}
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+    if (ip.section == 1) {
+        if (ip.row == 0) [self recordAction];
+        else if (ip.row == 1) [self addStep];
+        else [self randomizeAll];
+        return;
+    }
+    if (ip.section == 2) { [self editStepAtIndex:ip.row]; return; }
+}
+
+- (void)alertTitle:(NSString *)t message:(NSString *)m {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:t message:m
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+/// 录兜底动作：走穿透录制，录完不建新脚本，直接填进这里
+- (void)recordAction {
+    TDRecorder *r = [TDRecorder shared];
+    if (r.recording) { [self alertTitle:@"正在录" message:@"先按音量下结束当前这次录制"]; return; }
+    if ([TDEngine shared].running) [[TDEngine shared] stop];
+
+    __weak typeof(self) ws = self;
+    r.onStepsReady = ^(NSArray<NSDictionary *> *steps) {
+        typeof(self) ss = ws;
+        if (!ss) return;
+        [ss appendRecorded:steps];
+    };
+    if (![r startLive]) {
+        r.onStepsReady = nil;
+        [self alertTitle:@"录制起不来" message:[r status]];
+        return;
+    }
+    [self alertTitle:@"开始录兜底动作"
+             message:@"现在切到抖音，把「找不到图时该做的事」做一遍（比如上滑一条、点一下评论），"
+                      "做完按音量下结束。\n\n录完会自动填进这里，并带上随机偏移。"];
+}
+
+- (void)appendRecorded:(NSArray<NSDictionary *> *)steps {
+    if (steps.count == 0) return;
+    NSMutableArray *arr = [self steps];
+    for (NSDictionary *d in steps) {
+        NSMutableDictionary *m = [d mutableCopy];
+        if (![m[@"rnd"] isKindOfClass:[NSDictionary class]]) m[@"rnd"] = TDDefaultFailsafeRnd();
+        [arr addObject:m];
+    }
+    [self commit];
+    TDLog(@"兜底动作已更新：%lu 步", (unsigned long)arr.count);
+}
+
+- (void)addStep {
+    __weak typeof(self) ws = self;
+    TDPresentKindSheet(self, @"加一步兜底动作", ^(NSInteger k) {
+        typeof(self) ss = ws;
+        if (!ss) return;
+        NSMutableDictionary *d = TDNewStepOfKind(k);
+        d[@"rnd"] = TDDefaultFailsafeRnd();
+        [ss.steps addObject:d];
+        NSInteger idx = (NSInteger)[ss steps].count - 1;
+        TDPresentStepEditor(ss, d, YES, ^{
+            [[TDScriptStore shared] save];
+            [ss.tableView reloadData];
+        }, ^{
+            if (idx < (NSInteger)[ss steps].count) {
+                [[ss steps] removeObjectAtIndex:idx];
+                [[TDScriptStore shared] save];
+                [ss.tableView reloadData];
+            }
+        });
+    });
+}
+
+- (void)randomizeAll {
+    NSMutableArray *arr = [self steps];
+    if (arr.count == 0) { [self alertTitle:@"还没有兜底步骤" message:nil]; return; }
+    for (NSMutableDictionary *d in arr) {
+        if (![d isKindOfClass:[NSMutableDictionary class]]) continue;
+        NSDictionary *old = [d[@"rnd"] isKindOfClass:[NSDictionary class]] ? d[@"rnd"] : nil;
+        NSMutableDictionary *r = old ? [old mutableCopy] : [NSMutableDictionary dictionary];
+        if (!r[@"p"]) r[@"p"] = @1.0;
+        if ([r[@"px"] doubleValue] < 1) r[@"px"] = @8;
+        if (!r[@"ms"]) r[@"ms"] = @0.2;
+        if (!r[@"gap"]) r[@"gap"] = @0.3;
+        d[@"rnd"] = r;
+    }
+    [self commit];
+    [self alertTitle:@"已加随机" message:@"位置 ±8pt、时长 ±20%、间隔 ±30%。想更细可以点进单步改。"];
+}
+
+- (void)editStepAtIndex:(NSInteger)idx {
+    NSMutableArray *arr = [self steps];
+    if (idx < 0 || idx >= (NSInteger)arr.count) return;
+    NSMutableDictionary *d = arr[idx];
+    if (![d isKindOfClass:[NSMutableDictionary class]]) {
+        d = [d mutableCopy];
+        arr[idx] = d;
+    }
+    __weak typeof(self) ws = self;
+    TDPresentStepEditor(self, d, NO, ^{
+        typeof(self) ss = ws;
+        [[TDScriptStore shared] save];
+        [ss.tableView reloadData];
+    }, ^{
+        typeof(self) ss = ws;
+        if (idx < (NSInteger)[ss steps].count) {
+            [[ss steps] removeObjectAtIndex:idx];
+            [[TDScriptStore shared] save];
+            [ss.tableView reloadData];
+        }
+    });
+}
+
+@end
+
+#pragma mark - 评论池
+
+@interface TDPoolVC : UIViewController
+@end
+
+@implementation TDPoolVC {
+    UITextView *_tv;
+    UILabel *_hint;
+    UIButton *_tryBtn;
+    UIButton *_modeBtn;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"评论池";
+    self.view.backgroundColor = ED_BG;
+
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"保存" style:UIBarButtonItemStyleDone
+                                        target:self action:@selector(onSave)];
+    self.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(onClose)];
+
+    _hint = [[UILabel alloc] initWithFrame:CGRectZero];
+    _hint.text = @"一行一条，回放时随机取一条。以 # 开头的行当备注，不参与随机。";
+    _hint.font = [UIFont systemFontOfSize:12];
+    _hint.textColor = ED_DIM;
+    _hint.numberOfLines = 2;
+    [self.view addSubview:_hint];
+
+    _tv = [[UITextView alloc] initWithFrame:CGRectZero];
+    _tv.backgroundColor = ED_CARD;
+    _tv.textColor = ED_TEXT;
+    _tv.font = [UIFont systemFontOfSize:15];
+    _tv.textContainerInset = UIEdgeInsetsMake(10, 8, 10, 8);
+    _tv.layer.cornerRadius = 10;
+    _tv.clipsToBounds = YES;
+    _tv.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
+    _tv.text = [TDCommentPool() componentsJoinedByString:@"\n"];
+    [self.view addSubview:_tv];
+
+    _tryBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_tryBtn setTitle:@"试粘贴一条" forState:UIControlStateNormal];
+    [_tryBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    _tryBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    _tryBtn.backgroundColor = ED_ACCENT;
+    _tryBtn.layer.cornerRadius = 10;
+    [_tryBtn addTarget:self action:@selector(onTry) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_tryBtn];
+
+    _modeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_modeBtn setTitleColor:ED_TEXT forState:UIControlStateNormal];
+    _modeBtn.titleLabel.font = [UIFont systemFontOfSize:12.5];
+    _modeBtn.titleLabel.numberOfLines = 2;
+    _modeBtn.backgroundColor = ED_CARD;
+    _modeBtn.layer.cornerRadius = 10;
+    _modeBtn.layer.borderWidth = 1;
+    _modeBtn.layer.borderColor = ED_LINE.CGColor;
+    [_modeBtn addTarget:self action:@selector(onCycleMode) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_modeBtn];
+    [self refreshModeBtn];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    UIEdgeInsets sa = UIEdgeInsetsZero;
+    if (@available(iOS 11.0, *)) sa = self.view.safeAreaInsets;
+    CGFloat w = self.view.bounds.size.width;
+    CGFloat h = self.view.bounds.size.height;
+    CGFloat top = sa.top + 8;
+    CGFloat bottom = h - sa.bottom;
+
+    _hint.frame = CGRectMake(16, top, w - 32, 34);
+    CGFloat tvTop = CGRectGetMaxY(_hint.frame) + 6;
+    CGFloat barH = 46;
+    _tv.frame = CGRectMake(14, tvTop, w - 28, bottom - barH - 14 - tvTop);
+
+    _tryBtn.frame = CGRectMake(14, bottom - barH - 4, 140, barH);
+    _modeBtn.frame = CGRectMake(162, bottom - barH - 4, w - 176, barH);
+}
+
+- (void)refreshModeBtn {
+    [_modeBtn setTitle:[NSString stringWithFormat:@"发送方式：%@\n（点一下切换）", TDPasteVariantDesc()]
+              forState:UIControlStateNormal];
+}
+
+- (void)onCycleMode {
+    NSInteger v = (TDPasteVariant() + 1) % 3;
+    TDSetPasteVariant(v);
+    [self refreshModeBtn];
+    TDLog(@"粘贴发送方式切到：%@", TDPasteVariantDesc());
+}
+
+- (NSArray<NSString *> *)linesFromTV {
+    NSMutableArray *out = [NSMutableArray array];
+    [_tv.text enumerateLinesUsingBlock:^(NSString *line, BOOL *stop) {
+        NSString *s = [line stringByTrimmingCharactersInSet:
+                       [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (s.length) [out addObject:s];
+    }];
+    return out;
+}
+
+- (void)savePool {
+    TDCommentPoolSet([self linesFromTV]);
+}
+
+- (void)onSave {
+    [self.view endEditing:YES];
+    [self savePool];
+    [self alertTitle:@"已保存" message:[NSString stringWithFormat:@"池里现在 %ld 条可用话术。",
+                                       (long)TDCommentPoolCount()]];
+}
+
+- (void)onClose {
+    [self.view endEditing:YES];
+    [self savePool];
+    [[NSNotificationCenter defaultCenter] postNotificationName:TDDataChangedNotification object:nil];
+    [self.navigationController dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)onTry {
+    [self.view endEditing:YES];
+    [self savePool];
+    NSString *txt = TDCommentPick();
+    if (txt.length == 0) {
+        [self alertTitle:@"池是空的" message:@"先写一条话术再试"];
+        return;
+    }
+    TDPasteText(txt);
+    [self alertTitle:@"已发了一次 Cmd+V"
+             message:[NSString stringWithFormat:@"「%@」\n\n发送方式：%@\n"
+                       "先切到抖音、点开输入框再来试，否则字没地方落。",
+                       txt, TDPasteVariantDesc()]];
+}
+
+- (void)alertTitle:(NSString *)t message:(NSString *)m {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:t message:m
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+@end
+
 #pragma mark - 脚本编辑页
 
 @interface TDScriptEditVC : UITableViewController
@@ -1225,18 +1924,36 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
     }];
 }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 2; }
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    // 循环 / 判断 / 评论池 都是子页面改的，回来要重新读一遍
+    [self.tableView reloadData];
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 3; }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    return s == 0 ? (NSInteger)_script.steps.count : 4;
+    if (s == 0) return (NSInteger)_script.steps.count;
+    if (s == 1) return 3;      // 循环 / 判断 / 评论池
+    return 4;                  // 加事件 / 试运行 / 模板库 / 设为当前
 }
 
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
     if (s == 0) {
-        return [NSString stringWithFormat:@"事件（%lu 个）· 点一行改它",
+        return [NSString stringWithFormat:@"事件（%lu 个）· 点一行改它，左滑可插入/删除",
                 (unsigned long)_script.steps.count];
     }
+    if (s == 1) return @"脚本设置";
     return @"操作";
+}
+
+- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
+    if (s == 1) {
+        return @"判断：识图找不到图时，先跑一段兜底动作再继续。\n"
+                "循环：整条脚本跑几遍、每轮之间歇多久。\n"
+                "评论池：粘贴步骤随机取的话术。";
+    }
+    return nil;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
@@ -1251,7 +1968,9 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
         NSDictionary *st = _script.steps[ip.row];
         c.textLabel.text = [NSString stringWithFormat:@"%ld  %@", (long)(ip.row + 1),
                             [TDScript describeStep:st]];
-        NSString *mode = [st[@"t"] isEqualToString:@"find"] ? @"识图" : @"坐标";
+        NSString *t = st[@"t"];
+        NSString *mode = [t isEqualToString:@"find"] ? @"识图"
+                       : [t isEqualToString:@"paste"] ? @"粘贴" : @"坐标";
         NSDictionary *r = [st[@"rnd"] isKindOfClass:[NSDictionary class]] ? st[@"rnd"] : nil;
         NSString *rnd = r ? [NSString stringWithFormat:@" · 随机 %.0f%%", [r[@"p"] doubleValue] * 100] : @"";
         NSString *skip = st[@"run"] ? [NSString stringWithFormat:@" · 执行 %.0f%%",
@@ -1259,12 +1978,30 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
         c.detailTextLabel.text = [NSString stringWithFormat:@"%@ · 间隔 %.0fms%@%@",
                                   mode, [st[@"gap"] doubleValue], skip, rnd];
         c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    } else if (ip.section == 1) {
+        c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        NSInteger fsn = (NSInteger)[_script failsafeSteps].count;
+        if (ip.row == 0) {
+            c.textLabel.text = @"⟳ 循环整个脚本";
+            c.detailTextLabel.text = [_script loopDesc];
+        } else if (ip.row == 1) {
+            c.textLabel.text = @"⚖ 判断（识图找不到时）";
+            c.detailTextLabel.text = [_script failsafeEnabled]
+                ? [NSString stringWithFormat:@"开 · 兜底 %ld 步 · %@", (long)fsn,
+                   [_script.failsafe[@"once"] boolValue] ? @"只触发一次" : @"每次触发"]
+                : @"关";
+            c.textLabel.textColor = [_script failsafeEnabled] ? ED_YELL : ED_TEXT;
+        } else {
+            c.textLabel.text = @"💬 评论池";
+            c.detailTextLabel.text = [NSString stringWithFormat:@"%ld 条话术",
+                                      (long)TDCommentPoolCount()];
+        }
     } else {
         c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         switch (ip.row) {
             case 0:
-                c.textLabel.text = @"＋ 加一个事件";
-                c.detailTextLabel.text = @"点击 / 长按 / 滑动 / 等待 / 识图";
+                c.textLabel.text = @"＋ 加一个事件（末尾）";
+                c.detailTextLabel.text = @"点击 / 长按 / 滑动 / 等待 / 识图 / 粘贴 · 想插中间就左滑某一行";
                 break;
             case 1:
                 c.textLabel.text = @"▶ 试运行整条脚本";
@@ -1290,6 +2027,23 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
     [tv deselectRowAtIndexPath:ip animated:YES];
     if (ip.section == 0) { [self editStepAtIndex:ip.row]; return; }
 
+    if (ip.section == 1) {
+        if (ip.row == 0) {
+            TDLoopVC *vc = [TDLoopVC new];
+            vc.script = _script;
+            [self.navigationController pushViewController:vc animated:YES];
+        } else if (ip.row == 1) {
+            TDFailsafeVC *vc = [TDFailsafeVC new];
+            vc.script = _script;
+            [self.navigationController pushViewController:vc animated:YES];
+        } else {
+            TDPoolVC *vc = [TDPoolVC new];
+            UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+            [self presentViewController:nav animated:YES completion:nil];
+        }
+        return;
+    }
+
     switch (ip.row) {
         case 0: [self addStep]; break;
         case 1: [self tryRun]; break;
@@ -1305,6 +2059,35 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
             break;
         }
     }
+}
+
+/// 左滑：插入 / 删除。插入是「插到这一行的后面」——
+/// 录完一整条再想补一步时，不用把后面的都重新弄一遍。
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)tv
+    trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)ip {
+    if (ip.section != 0) return nil;
+    __weak typeof(self) ws = self;
+
+    UIContextualAction *ins =
+        [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
+                                                title:@"插入"
+                                              handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
+        typeof(self) ss = ws;
+        if (ss) [ss insertStepAfter:ip.row];
+        done(YES);
+    }];
+    ins.backgroundColor = ED_ACCENT;
+
+    UIContextualAction *del =
+        [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive
+                                                title:@"删除"
+                                              handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
+        typeof(self) ss = ws;
+        if (ss) [ss deleteStepAtIndex:ip.row];
+        done(YES);
+    }];
+
+    return [UISwipeActionsConfiguration configurationWithActions:@[del, ins]];
 }
 
 - (BOOL)tableView:(UITableView *)tv canEditRowAtIndexPath:(NSIndexPath *)ip { return ip.section == 0; }
@@ -1357,90 +2140,63 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
 }
 
 - (void)addStep {
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"加什么事件"
-                                                              message:nil
-                                                       preferredStyle:UIAlertControllerStyleActionSheet];
-    NSArray *titles = @[@"点击（坐标）", @"长按（坐标）", @"滑动", @"等待", @"识图点击"];
-    for (NSInteger i = 0; i < (NSInteger)titles.count; i++) {
-        [a addAction:[UIAlertAction actionWithTitle:titles[i] style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *x) { [self createStepKind:i]; }]];
-    }
-    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    a.popoverPresentationController.sourceView = self.view;
-    a.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2, 200, 1, 1);
-    [self presentViewController:a animated:YES completion:nil];
+    __weak typeof(self) ws = self;
+    TDPresentKindSheet(self, @"加什么事件（加到末尾）", ^(NSInteger k) {
+        typeof(self) ss = ws;
+        if (ss) [ss insertStepAtIndex:(NSInteger)ss.script.steps.count kind:k];
+    });
 }
 
-- (void)createStepKind:(NSInteger)k {
-    CGSize sb = [UIScreen mainScreen].bounds.size;
-    NSMutableDictionary *d = [NSMutableDictionary dictionary];
-    d[@"gap"] = @(300);
-
-    switch (k) {
-        case 0:
-            d[@"t"] = @"tap";
-            d[@"x"] = @((NSInteger)(sb.width / 2));
-            d[@"y"] = @((NSInteger)(sb.height * 0.62));
-            break;
-        case 1:
-            d[@"t"] = @"long";
-            d[@"x"] = @((NSInteger)(sb.width / 2));
-            d[@"y"] = @((NSInteger)(sb.height * 0.62));
-            d[@"ms"] = @(800);
-            break;
-        case 2:
-            d[@"t"] = @"swipe";
-            d[@"x1"] = @((NSInteger)(sb.width / 2));
-            d[@"y1"] = @((NSInteger)(sb.height * 0.72));
-            d[@"x2"] = @((NSInteger)(sb.width / 2));
-            d[@"y2"] = @((NSInteger)(sb.height * 0.28));
-            d[@"ms"] = @(400);
-            break;
-        case 3:
-            d[@"t"] = @"wait";
-            d[@"ms"] = @(1000);
-            break;
-        default:
-            d[@"t"] = @"find";
-            d[@"tpl"] = @"";
-            d[@"th"] = @([TDConfig shared].threshold);
-            d[@"dx"] = @0;
-            d[@"dy"] = @0;
-            d[@"to"] = @(1500);
-            break;
-    }
-
-    [_script.steps addObject:d];
-    NSInteger idx = (NSInteger)_script.steps.count - 1;
+- (void)insertStepAfter:(NSInteger)idx {
+    NSString *title = [NSString stringWithFormat:@"在第 %ld 步后面插入",
+                       (long)(idx + 1)];
     __weak typeof(self) ws = self;
-    TDStepEditVC *vc = [[TDStepEditVC alloc] initWithStep:d isNew:YES onSave:^{
+    TDPresentKindSheet(self, title, ^(NSInteger k) {
+        typeof(self) ss = ws;
+        if (ss) [ss insertStepAtIndex:idx + 1 kind:k];
+    });
+}
+
+/// 在 pos 位置插一步，并立刻打开编辑页。取消编辑就算「没加」——
+/// 不然列表里会留下一个用户根本没确认过的默认步骤。
+- (void)insertStepAtIndex:(NSInteger)pos kind:(NSInteger)k {
+    NSMutableDictionary *d = TDNewStepOfKind(k);
+    if (pos < 0 || pos > (NSInteger)_script.steps.count) pos = (NSInteger)_script.steps.count;
+    [_script.steps insertObject:d atIndex:(NSUInteger)pos];
+    [[TDScriptStore shared] save];
+    [self.tableView reloadData];
+
+    __weak typeof(self) ws = self;
+    TDPresentStepEditor(self, d, YES, ^{
         typeof(self) ss = ws;
         [[TDScriptStore shared] save];
         [ss.tableView reloadData];
-    } onDelete:^{
+    }, ^{
         typeof(self) ss = ws;
-        if (idx < (NSInteger)ss.script.steps.count) {
-            [ss.script.steps removeObjectAtIndex:idx];
-            [[TDScriptStore shared] save];
-            [ss.tableView reloadData];
-        }
-    }];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
-    [self presentViewController:nav animated:YES completion:nil];
+        [ss deleteStepAtIndex:pos];
+    });
+}
+
+- (void)deleteStepAtIndex:(NSInteger)idx {
+    if (idx < 0 || idx >= (NSInteger)_script.steps.count) return;
+    [_script.steps removeObjectAtIndex:idx];
+    [[TDScriptStore shared] save];
+    [self.tableView reloadData];
 }
 
 - (void)tryRun {
     if (_script.steps.count == 0) return;
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"试运行"
-                                                              message:@"3 秒后开始，现在切到抖音。用当前脚本的循环次数。"
+                                                              message:@"3 秒后开始，现在切到抖音。\n按这条脚本自己的循环 / 判断设置跑。"
                                                        preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"开始" style:UIAlertActionStyleDefault
                                        handler:^(UIAlertAction *x) {
-        NSArray *plan = [self->_script engineSteps];
-        NSInteger loops = [TDConfig shared].loopCount;
+        __weak typeof(self) ws = self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            [[TDEngine shared] playSteps:plan loop:loops];
+            typeof(self) ss = ws;
+            if (!ss) return;
+            [[TDEngine shared] playScript:ss.script];
             TDFloatRefresh();
         });
     }]];

@@ -107,8 +107,33 @@ NSInteger TDHIDLastKeyUsage(void);
 void TDKeysInstall(void);
 NSString *TDKeysStatus(void);
 
-#pragma mark - 内置模板
+#pragma mark - 键盘注入（粘贴用）
 
+/// 发一个键盘事件。usage 用 HID keyboard page(0x07) 的 usage：
+/// 0x19='v'，0xE3=左 Command，0xE1=左 Shift。
+/// 走的是和触摸同一个 admin 客户端，所以前台 App 的「硬件键盘」通道能收到。
+void TDsendKey(uint16_t usage, BOOL down);
+/// Cmd+V：按下 Command → 按 v → 松 v → 松 Command。
+/// 作用是把剪贴板内容粘进「当前有键盘焦点的输入框」（抖音评论框）。
+void TDsendCmdV(void);
+/// 键盘事件的「来源」用哪一种：0 不设 / 1 学到的真实触摸 senderID / 2 探测到的 senderID。
+/// 这台机器的 HID 校验很严，哪个认就留哪个（评论池页可以现场切着试）。
+NSInteger TDPasteVariant(void);
+void TDSetPasteVariant(NSInteger v);
+NSString *TDPasteVariantDesc(void);
+
+#pragma mark - 评论池（话术）
+
+/// 评论池存 Documents/comment_pool.txt，一行一条。读出来的都是去空白后的非空行。
+NSArray<NSString *> *TDCommentPool(void);
+void TDCommentPoolSet(NSArray<NSString *> *lines);
+NSInteger TDCommentPoolCount(void);
+/// 随机取一条。会尽量避免和上一条重复（连着发两句一样的话最像机器人）。
+NSString *TDCommentPick(void);
+/// 写剪贴板 → 等系统把剪贴板刷新出去 → 发 Cmd+V。
+void TDPasteText(NSString *text);
+
+#pragma mark - 内置模板
 /// 把 bundle 里的内置识图模板（点赞 / 评论 / 收藏）装到 Documents。
 /// 只在目标文件不存在时拷贝：用户删掉的不会被硬塞回来，但每版都会补新内置项。
 void TDInstallBuiltinTemplates(void);
@@ -165,16 +190,34 @@ void TDSetScaleHint(NSString * _Nullable tplName, double scale);
 ///   ms = 时长抖动比例（±ms×100%）
 ///   gap = 间隔抖动比例
 /// 步骤本身还可以带 "run"：执行概率 0~1（小于 1 时这一步有机会整步跳过、不点）
+///
+/// v1.14 新增：
+///   {"t":"paste","text":"","gap":300}   粘贴步骤。text 留空 = 从「评论池」里随机取一条，
+///                                       走「写剪贴板 + Cmd+V」，所以前面的步骤要先点开输入框。
+///
+/// 脚本级还有两块配置（都可选，缺省等于关）：
+///   loop     {"on":1,"count":5,"gap":800}   整套脚本循环几次（count=0 无限），每轮之间歇多久
+///   failsafe {"on":1,"tpl":"","once":1,     判断：识图找不到时做什么
+///             "steps":[ …同普通步骤… ]}      tpl 空 = 任意识图失败都算；steps 可带随机参数
 @interface TDScript : NSObject
 @property (nonatomic, copy) NSString *name;
 @property (nonatomic) NSTimeInterval createdAt;
 @property (nonatomic, strong) NSMutableArray<NSDictionary *> *steps;
+/// 识图找不到时的兜底动作
+@property (nonatomic, strong) NSMutableDictionary *failsafe;
+/// 整个脚本的循环设置
+@property (nonatomic, strong) NSMutableDictionary *loop;
 
 - (instancetype)initWithName:(NSString *)name;
 - (NSString *)summary;                        // "12 步 · 0:35"
 - (NSTimeInterval)duration;                   // 估算总时长（秒）
 - (NSArray<NSDictionary *> *)engineSteps;     // 把 gap 展开成 wait
 + (NSString *)describeStep:(NSDictionary *)st;
+
+- (BOOL)failsafeEnabled;
+- (NSArray<NSDictionary *> *)failsafeSteps;
+/// "不循环" / "循环 5 次" / "无限循环"
+- (NSString *)loopDesc;
 @end
 
 @interface TDScriptStore : NSObject
@@ -208,6 +251,9 @@ UIViewController *TDCreateScriptEditVC(TDScript *script);
 - (BOOL)startLive;
 /// 结束录制，存成新脚本（唯一正常的收尾方式）
 - (void)finishAndSave;
+/// 录完不存成新脚本，直接把步骤交给这个回调 —— 「判断里录一段兜底动作」用它。
+/// 只生效一次，回调完自动清空，之后的录制还是照常存成新脚本。
+@property (nonatomic, copy, nullable) void (^onStepsReady)(NSArray<NSDictionary *> *steps);
 /// 结束并丢弃
 - (void)cancel;
 /// 取走步骤并结束（内部用）
@@ -226,6 +272,9 @@ UIViewController *TDCreateScriptEditVC(TDScript *script);
 @property (nonatomic, copy, nullable) void (^onFinish)(void);
 
 - (void)playSteps:(NSArray<NSDictionary *> *)steps loop:(NSInteger)loops;
+/// 跑一条完整脚本：循环次数/每轮间隔/识图失败兜底 都按脚本自己的配置来。
+/// 悬浮球 ▶、App 里 ▶、编辑页「试运行」全部走这一条。
+- (void)playScript:(TDScript *)script;
 - (void)stop;
 - (void)logMsg:(NSString *)fmt, ...;
 @end
@@ -355,6 +404,9 @@ void TDtraceLogClear(void);
 
 void TDLog(NSString *fmt, ...);
 void TDSetLogHandler(void (^ _Nullable h)(NSString *));
+/// 额外挂一路日志消费者（主界面日志框、悬浮窗日志面板各占一路）。
+/// 和 TDSetLogHandler 是并存的：谁先挂都行，互不覆盖。
+void TDAddLogTap(void (^ _Nullable h)(NSString *));
 
 #pragma mark - 数据变更通知（录制完/脚本改了，UI 和悬浮球都跟着刷）
 

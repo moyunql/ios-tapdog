@@ -792,6 +792,17 @@ static void TDDropTrailingSelfTaps(NSMutableArray<NSDictionary *> *steps) {
     [self teardown];
     _liveSteps = nil;
 
+    // 「判断编辑」里录兜底动作走这条：录完直接交给回调，
+    // 不新建脚本 —— 否则每录一次兜底就多出一条垃圾脚本。
+    void (^ready)(NSArray<NSDictionary *> *) = self.onStepsReady;
+    if (ready) {
+        self.onStepsReady = nil;
+        TDLog(@"录制完成：%lu 步 → 已填进判断的兜底动作", (unsigned long)steps.count);
+        ready([steps copy]);
+        [[NSNotificationCenter defaultCenter] postNotificationName:TDDataChangedNotification object:nil];
+        return;
+    }
+
     TDScript *s = [[TDScriptStore shared] createScript];
     if (steps.count) s.steps = steps;
     [[TDScriptStore shared] save];

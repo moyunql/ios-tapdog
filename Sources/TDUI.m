@@ -1652,7 +1652,8 @@ static NSString *TDCalibModeName(NSInteger m) {
     } else {
         TDScript *s = [[TDScriptStore shared] selectedScript];
         if (!s) return;
-        [[TDEngine shared] playSteps:[s engineSteps] loop:[TDConfig shared].loopCount];
+        // 循环次数 / 每轮间隔 / 识图失败兜底 都按脚本自己的配置来
+        [[TDEngine shared] playScript:s];
     }
     [self refreshButtons];
     TDFloatRefresh();
@@ -1737,8 +1738,8 @@ static NSString *TDCalibModeName(NSInteger m) {
                                       (long)TDInjectCount()];
         } else {
             TDConfig *cfg = [TDConfig shared];
-            c.textLabel.text = @"循环次数 / 点击偏移";
-            c.detailTextLabel.text = [NSString stringWithFormat:@"%@ · 偏移 ±%.0fpt",
+            c.textLabel.text = @"全局默认 / 点击偏移";
+            c.detailTextLabel.text = [NSString stringWithFormat:@"%@ · 偏移 ±%.0fpt（脚本里设了循环就以脚本为准）",
                                       cfg.loopCount == 0 ? @"无限循环" : [NSString stringWithFormat:@"循环 %ld 次", (long)cfg.loopCount],
                                       cfg.jitterPx];
         }

@@ -1052,6 +1052,69 @@ void TDswipe(CGPoint from, CGPoint to, NSTimeInterval sec) {
 
 
 // ---------------------------------------------------------------------------
+// 键盘事件（粘贴评论用）
+//
+// 抖音的评论框是别的进程，改不到它的 UITextView；但「硬件键盘」这条通道是系统级的：
+// 只要前台 App 的输入框有焦点，一条 Cmd+V 就会被 UIKit 翻成 paste:，把剪贴板贴进去。
+// 所以我们只做两件事：写剪贴板 + 发 Cmd+V，剩下的交给系统。
+//
+// 构造用 IOHIDEventCreateKeyboardEvent(page=0x07, usage)，修饰键单独发一条
+// （0xE3 = 左 Command），就像真键盘一样成对按下/抬起 —— 只发 v 是打不出粘贴的。
+// ---------------------------------------------------------------------------
+
+static NSString * const kPasteVariantKey = @"tdPasteVariant";
+
+NSInteger TDPasteVariant(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if ([d objectForKey:kPasteVariantKey] == nil) return 0;
+    return [d integerForKey:kPasteVariantKey];
+}
+
+void TDSetPasteVariant(NSInteger v) {
+    [[NSUserDefaults standardUserDefaults] setInteger:v forKey:kPasteVariantKey];
+}
+
+NSString *TDPasteVariantDesc(void) {
+    switch (TDPasteVariant()) {
+        case 1:  return @"真实触摸来源";
+        case 2:  return @"探测来源";
+        default: return @"不设来源";
+    }
+}
+
+void TDsendKey(uint16_t usage, BOOL down) {
+    IOHIDEventSystemClientRef c = TDClientForDispatch();
+    if (!c) return;
+    uint64_t ts = mach_absolute_time();
+    IOHIDEventRef e = IOHIDEventCreateKeyboardEvent(kCFAllocatorDefault, ts,
+                                                    0x07, usage, down ? true : false, 0);
+    if (!e) return;
+
+    // 来源：先不设（真键盘事件本来就不属于触摸屏那个 sender），
+    // 认不了就在评论池页切成 1/2 再试 —— 这台机器上哪条通只有试了才知道。
+    NSInteger v = TDPasteVariant();
+    uint64_t sid = 0;
+    if (v == 1)      sid = TDHIDSampleSenderID();
+    else if (v == 2) sid = TDProbedSenderID();
+    if (sid) IOHIDEventSetSenderID(e, sid);
+    if (TDInjectBuiltInOn()) IOHIDEventSetIntegerValue(e, kIOHIDEventFieldIsBuiltIn, 1);
+
+    IOHIDEventSystemClientDispatchEvent(c, e);
+    CFRelease(e);
+}
+
+void TDsendCmdV(void) {
+    TDsendKey(0xE3, YES);     // 左 Command 按下
+    usleep(12000);
+    TDsendKey(0x19, YES);     // v 按下
+    usleep(25000);
+    TDsendKey(0x19, NO);      // v 抬起
+    usleep(10000);
+    TDsendKey(0xE3, NO);      // Command 抬起
+}
+
+
+// ---------------------------------------------------------------------------
 // 注入方案表
 //
 // 上一版 16 组之所以全灭，是因为那张表里 senderID 只有两个选项：

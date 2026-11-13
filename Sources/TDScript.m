@@ -18,8 +18,28 @@ static NSString *TDScriptsPath(void) {
         _name = [name copy] ?: @"脚本";
         _createdAt = [[NSDate date] timeIntervalSince1970];
         _steps = [NSMutableArray array];
+        // 判断默认关：老脚本打开就是原来的行为，不会莫名多出一段兜底动作
+        _failsafe = [@{@"on": @NO, @"tpl": @"", @"once": @YES,
+                       @"steps": [NSMutableArray array]} mutableCopy];
+        // 循环默认关：一条脚本默认跑一遍
+        _loop = [@{@"on": @NO, @"count": @1, @"gap": @800} mutableCopy];
     }
     return self;
+}
+
+- (BOOL)failsafeEnabled {
+    return [_failsafe[@"on"] boolValue];
+}
+
+- (NSArray<NSDictionary *> *)failsafeSteps {
+    id a = _failsafe[@"steps"];
+    return [a isKindOfClass:[NSArray class]] ? a : @[];
+}
+
+- (NSString *)loopDesc {
+    if (![_loop[@"on"] boolValue]) return @"不循环";
+    NSInteger n = [_loop[@"count"] integerValue];
+    return n <= 0 ? @"无限循环" : [NSString stringWithFormat:@"循环 %ld 次", (long)n];
 }
 
 - (NSTimeInterval)duration {
@@ -40,7 +60,7 @@ static NSString *TDScriptsPath(void) {
 }
 
 - (NSString *)summary {
-    NSInteger tap = 0, swp = 0, lng = 0, img = 0;
+    NSInteger tap = 0, swp = 0, lng = 0, img = 0, pst = 0;
     for (NSDictionary *s in _steps) {
         NSString *t = s[@"t"];
         if ([t isEqualToString:@"tap"]) tap++;
@@ -48,9 +68,16 @@ static NSString *TDScriptsPath(void) {
         else if ([t isEqualToString:@"long"]) lng++;
         else if ([t isEqualToString:@"gesture"]) swp++;
         else if ([t isEqualToString:@"find"]) img++;
+        else if ([t isEqualToString:@"paste"]) pst++;
     }
     NSInteger secs = (NSInteger)llround([self duration]);
-    NSString *mix = img > 0 ? [NSString stringWithFormat:@" · 识图%ld", (long)img] : @"";
+    NSMutableString *mix = [NSMutableString string];
+    if (img > 0) [mix appendFormat:@" · 识图%ld", (long)img];
+    if (pst > 0) [mix appendFormat:@" · 粘贴%ld", (long)pst];
+    if ([_loop[@"on"] boolValue]) {
+        [mix appendFormat:@" · %@", [self loopDesc]];
+    }
+    if ([self failsafeEnabled]) [mix appendString:@" · 有判断"];
     return [NSString stringWithFormat:@"%lu 步 · 点%ld 滑%ld 长%ld%@ · %ld:%02ld",
             (unsigned long)_steps.count, (long)tap, (long)swp, (long)lng, mix,
             (long)(secs / 60), (long)(secs % 60)];
@@ -86,6 +113,12 @@ static NSString *TDScriptsPath(void) {
                 [st[@"ms"] doubleValue]];
     }
     if ([t isEqualToString:@"wait"])  return [NSString stringWithFormat:@"等待 %.0fms", [st[@"ms"] doubleValue]];
+    if ([t isEqualToString:@"paste"]) {
+        NSString *s = [st[@"text"] isKindOfClass:[NSString class]] ? st[@"text"] : @"";
+        if (s.length == 0) return @"粘贴 · 评论池随机一条";
+        if (s.length > 10) s = [[s substringToIndex:10] stringByAppendingString:@"…"];
+        return [NSString stringWithFormat:@"粘贴「%@」", s];
+    }
     if ([t isEqualToString:@"find"]) {
         NSString *name = st[@"tpl"];
         if (![name isKindOfClass:[NSString class]] || name.length == 0) name = @"(未选模板)";
@@ -137,9 +170,35 @@ static NSString *TDScriptsPath(void) {
             s.createdAt = [raw[@"created"] doubleValue];
             id steps = raw[@"steps"];
             if ([steps isKindOfClass:[NSArray class]]) {
+                [s.steps removeAllObjects];
                 for (id st in steps) {
                     if ([st isKindOfClass:[NSDictionary class]]) [s.steps addObject:[st mutableCopy]];
                 }
+            }
+            // 循环 / 判断：JSON 读回来是只读容器，这里统一转成可改的，
+            // 并且把「兜底动作」里的每一步也换成可变字典（编辑页会原地改它们）。
+            NSDictionary *lp = raw[@"loop"];
+            if ([lp isKindOfClass:[NSDictionary class]]) {
+                NSMutableDictionary *m = [s.loop mutableCopy];
+                for (id k in lp) m[k] = lp[k];
+                s.loop = m;
+            }
+            NSDictionary *fs = raw[@"failsafe"];
+            if ([fs isKindOfClass:[NSDictionary class]]) {
+                NSMutableDictionary *m = [NSMutableDictionary dictionary];
+                for (id k in fs) {
+                    if ([k isEqualToString:@"steps"]) continue;
+                    m[k] = fs[k];
+                }
+                NSMutableArray *fsteps = [NSMutableArray array];
+                id raw2 = fs[@"steps"];
+                if ([raw2 isKindOfClass:[NSArray class]]) {
+                    for (id st in raw2) {
+                        if ([st isKindOfClass:[NSDictionary class]]) [fsteps addObject:[st mutableCopy]];
+                    }
+                }
+                m[@"steps"] = fsteps;
+                s.failsafe = m;
             }
             [_scripts addObject:s];
         }
@@ -153,7 +212,9 @@ static NSString *TDScriptsPath(void) {
     for (TDScript *s in _scripts) {
         [arr addObject:@{@"name": s.name,
                          @"created": @(s.createdAt),
-                         @"steps": s.steps ?: @[]}];
+                         @"steps": s.steps ?: @[],
+                         @"loop": s.loop ?: @{},
+                         @"failsafe": s.failsafe ?: @{}}];
     }
     NSDictionary *j = @{@"selected": @(_selected), @"scripts": arr};
     NSData *d = [NSJSONSerialization dataWithJSONObject:j options:0 error:NULL];
