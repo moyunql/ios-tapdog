@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 巨魔：标记为平台应用，TrollStore 安装后按系统级 App 运行 -->
+	<key>platform-application</key>
+	<true/>
+	<key>com.apple.private.security.no-sandbox</key>
+	<true/>
+	<key>com.apple.private.security.storage.AppDataContainers</key>
+	<true/>
+	<key>get-task-allow</key>
+	<true/>
+	<key>proc_info-allow</key>
+	<true/>
+
+	<!-- 全局触摸注入：没有这三个就别想点别的 App -->
+	<key>com.apple.private.hid.client.event-dispatch</key>
+	<true/>
+	<key>com.apple.private.hid.client.event-filter</key>
+	<true/>
+	<key>com.apple.private.hid.client.event-monitor</key>
+	<true/>
+	<key>com.apple.private.hid.client.service-protected</key>
+	<true/>
+	<key>com.apple.private.hid.manager.client</key>
+	<true/>
+
+	<!-- 截屏：取主显示器 framebuffer / IOSurface -->
+	<key>com.apple.QuartzCore.displayable-context</key>
+	<true/>
+	<key>com.apple.QuartzCore.global-capture</key>
+	<true/>
+	<key>com.apple.QuartzCore.secure-capture</key>
+	<true/>
+	<key>com.apple.QuartzCore.secure-mode</key>
+	<true/>
+	<key>com.apple.security.iokit-user-client-class</key>
+	<array>
+		<string>IOSurfaceRootUserClient</string>
+		<string>IOSurfaceAcceleratorClient</string>
+		<string>IOMobileFramebufferUserClient</string>
+	</array>
+
+	<!-- 悬浮球盖在抖音上面 -->
+	<key>com.apple.springboard.accessibility-window-hosting</key>
+	<true/>
+	<key>com.apple.springboard.appbackgroundstyle</key>
+	<true/>
+	<key>com.apple.springboard.opensensitiveurl</key>
+	<true/>
+	<key>com.apple.backboard.client</key>
+	<true/>
+	<key>com.apple.backboard.accessibility</key>
+	<true/>
+	<key>com.apple.private.windowserver.user-interface-allowed</key>
+	<true/>
+	<key>com.apple.private.allow-explicit-graphics-priority</key>
+	<true/>
+
+	<!-- 后台常驻 -->
+	<key>com.apple.private.background-task.allowed</key>
+	<true/>
+	<key>com.apple.private.kernel.jetsam</key>
+	<true/>
+	<key>com.apple.private.memorystatus</key>
+	<true/>
+	<key>com.apple.private.persona-mgmt</key>
+	<true/>
+</dict>
+</plist>
