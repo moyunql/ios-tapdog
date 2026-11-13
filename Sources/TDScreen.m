@@ -1,23 +1,52 @@
 #import "TD.h"
-#import <IOSurface/IOSurface.h>
 #import <dlfcn.h>
 
 // ---------------------------------------------------------------------------
-// 截屏：从主显示器的 IOMobileFramebuffer 取默认 layer 的 IOSurface，
-// 直接读像素。比 CARenderServer 路径更稳，且拿到的是真实全屏内容。
+// 截屏：从主显示器的 IOMobileFramebuffer 取默认 layer 的 IOSurface，直接读像素。
+//
+// 注意：IOSurface 与 IOMobileFramebuffer 在 iOS SDK 里都没有公开头文件，
+// 且 IOSurface.framework 在真机上位于 /System/Library/PrivateFrameworks，
+// 直接 -framework IOSurface 链接会让 App 启动时 dyld 找不到库。
+// 所以这里全部走 dlopen/dlsym，运行时解析符号。
 // 需要 platform-application + iokit-user-client-class(IOMobileFramebufferUserClient)
 // ---------------------------------------------------------------------------
 
-typedef struct __IOMobileFramebuffer *IOMobileFramebufferRef;
-typedef int32_t (*FnGetMainDisplay)(IOMobileFramebufferRef *fb);
-typedef int32_t (*FnGetLayerSurface)(IOMobileFramebufferRef fb, int layer, IOSurfaceRef *surf);
+typedef struct __IOSurface *IOSurfaceRef;
 
-static FnGetMainDisplay gGetMainDisplay = NULL;
+static const uint32_t kTDIOFBLockReadOnly = 0x00000001;   // kIOSurfaceLockReadOnly
+
+typedef int32_t  (*FnGetMainDisplay)(void **fb);
+typedef int32_t  (*FnGetLayerSurface)(void *fb, int layer, IOSurfaceRef *surf);
+typedef int32_t  (*FnSurfLock)(IOSurfaceRef s, uint32_t opts, uint32_t *seed);
+typedef int32_t  (*FnSurfUnlock)(IOSurfaceRef s, uint32_t opts, uint32_t *seed);
+typedef size_t   (*FnSurfSize)(IOSurfaceRef s);
+typedef size_t   (*FnSurfWidth)(IOSurfaceRef s);
+typedef size_t   (*FnSurfHeight)(IOSurfaceRef s);
+typedef void    *(*FnSurfBase)(IOSurfaceRef s);
+typedef uint32_t (*FnSurfFormat)(IOSurfaceRef s);
+
+static FnGetMainDisplay  gGetMainDisplay = NULL;
 static FnGetLayerSurface gGetLayerSurface = NULL;
+static FnSurfLock        gSurfLock = NULL;
+static FnSurfUnlock      gSurfUnlock = NULL;
+static FnSurfWidth       gSurfGetWidth = NULL;
+static FnSurfHeight      gSurfGetHeight = NULL;
+static FnSurfSize        gSurfGetBytesPerRow = NULL;
+static FnSurfBase        gSurfGetBase = NULL;
+static FnSurfFormat      gSurfGetFormat = NULL;
+
 static BOOL gTriedLoad = NO;
 static NSString *gCapStatus = @"未初始化";
-
 static CGSize gLastPixelSize = CGSizeZero;
+
+/// 先查全局符号表（IOMobileFramebuffer 已把 IOSurface 带进进程时可直接命中），
+/// 再依次尝试两个已知路径。
+static void *TDHIDSym(void *handle, const char *name) {
+    void *p = dlsym(RTLD_DEFAULT, name);
+    if (p) return p;
+    if (handle) return dlsym(handle, name);
+    return NULL;
+}
 
 static void TDLoadFramebuffer(void) {
     if (gTriedLoad) return;
@@ -29,10 +58,25 @@ static void TDLoadFramebuffer(void) {
         gCapStatus = @"IOMobileFramebuffer 打不开";
         return;
     }
-    gGetMainDisplay = (FnGetMainDisplay)dlsym(h, "IOMobileFramebufferGetMainDisplay");
-    gGetLayerSurface = (FnGetLayerSurface)dlsym(h, "IOMobileFramebufferGetLayerDefaultSurface");
+    void *hs = dlopen("/System/Library/PrivateFrameworks/IOSurface.framework/IOSurface", RTLD_NOW);
+    if (!hs) hs = dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface", RTLD_NOW);
+
+    gGetMainDisplay  = (FnGetMainDisplay)TDHIDSym(h, "IOMobileFramebufferGetMainDisplay");
+    gGetLayerSurface = (FnGetLayerSurface)TDHIDSym(h, "IOMobileFramebufferGetLayerDefaultSurface");
+    gSurfLock        = (FnSurfLock)TDHIDSym(hs, "IOSurfaceLock");
+    gSurfUnlock      = (FnSurfUnlock)TDHIDSym(hs, "IOSurfaceUnlock");
+    gSurfGetWidth    = (FnSurfWidth)TDHIDSym(hs, "IOSurfaceGetWidth");
+    gSurfGetHeight   = (FnSurfHeight)TDHIDSym(hs, "IOSurfaceGetHeight");
+    gSurfGetBytesPerRow = (FnSurfSize)TDHIDSym(hs, "IOSurfaceGetBytesPerRow");
+    gSurfGetBase     = (FnSurfBase)TDHIDSym(hs, "IOSurfaceGetBaseAddress");
+    gSurfGetFormat   = (FnSurfFormat)TDHIDSym(hs, "IOSurfaceGetPixelFormat");
+
     if (!gGetMainDisplay || !gGetLayerSurface) {
         gCapStatus = @"符号缺失(GetMainDisplay/GetLayerDefaultSurface)";
+        return;
+    }
+    if (!gSurfLock || !gSurfGetWidth || !gSurfGetHeight || !gSurfGetBase) {
+        gCapStatus = @"IOSurface 符号缺失";
         return;
     }
     gCapStatus = @"符号就绪";
@@ -42,7 +86,7 @@ static IOSurfaceRef TDGrabSurface(void) {
     TDLoadFramebuffer();
     if (!gGetMainDisplay || !gGetLayerSurface) return NULL;
 
-    IOMobileFramebufferRef fb = NULL;
+    void *fb = NULL;
     if (gGetMainDisplay(&fb) != 0 || fb == NULL) {
         gCapStatus = @"GetMainDisplay 失败";
         return NULL;
@@ -57,8 +101,7 @@ static IOSurfaceRef TDGrabSurface(void) {
 }
 
 BOOL TDcaptureReady(void) {
-    IOSurfaceRef s = TDGrabSurface();
-    return s != NULL;
+    return TDGrabSurface() != NULL;
 }
 
 NSString *TDcaptureStatus(void) { return gCapStatus; }
@@ -67,15 +110,15 @@ UIImage *TDscreenshot(void) {
     IOSurfaceRef surf = TDGrabSurface();
     if (surf == NULL) return nil;
 
-    IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
+    gSurfLock(surf, kTDIOFBLockReadOnly, NULL);
 
-    size_t w = IOSurfaceGetWidth(surf);
-    size_t h = IOSurfaceGetHeight(surf);
-    size_t bpr = IOSurfaceGetBytesPerRow(surf);
-    void *base = IOSurfaceGetBaseAddress(surf);
-    uint32_t fmt = IOSurfaceGetPixelFormat(surf);
+    size_t w = gSurfGetWidth(surf);
+    size_t h = gSurfGetHeight(surf);
+    size_t bpr = gSurfGetBytesPerRow ? gSurfGetBytesPerRow(surf) : w * 4;
+    void *base = gSurfGetBase(surf);
+    uint32_t fmt = gSurfGetFormat ? gSurfGetFormat(surf) : 0;
     if (w == 0 || h == 0 || base == NULL) {
-        IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+        gSurfUnlock(surf, kTDIOFBLockReadOnly, NULL);
         return nil;
     }
 
@@ -84,7 +127,7 @@ UIImage *TDscreenshot(void) {
     if (fmt == 0x52474241 /* 'RGBA' */) {
         info = (uint32_t)kCGImageAlphaNoneSkipLast | (uint32_t)kCGBitmapByteOrder32Big;
     } else {
-        // 'BGRA' 及未知格式统一按 BGRA 处理
+        // 'BGRA'（0x42475241）及未知格式统一按 BGRA 处理
         info = (uint32_t)kCGImageAlphaNoneSkipFirst | (uint32_t)kCGBitmapByteOrder32Little;
     }
 
@@ -92,7 +135,7 @@ UIImage *TDscreenshot(void) {
     CGImageRef cg = ctx ? CGBitmapContextCreateImage(ctx) : NULL;
     if (ctx) CGContextRelease(ctx);
     CGColorSpaceRelease(cs);
-    IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+    gSurfUnlock(surf, kTDIOFBLockReadOnly, NULL);
 
     if (!cg) return nil;
     gLastPixelSize = CGSizeMake((CGFloat)w, (CGFloat)h);
