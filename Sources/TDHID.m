@@ -5,6 +5,7 @@
 #import <dlfcn.h>
 #include <mach/mach_time.h>
 #include <unistd.h>
+#include <errno.h>
 
 // ---------------------------------------------------------------------------
 // 全局触摸注入
@@ -980,6 +981,73 @@ static NSString *TDEntitlementSummary(void) {
     return s;
 }
 
+/// 内核眼里的签名状态。
+///
+/// 为什么必须看这个：SecTask 里能读到 hid-event-dispatch 权限，只说明
+/// **签名文件里写着**这条权限；内核放不放行还要看 code signing flags。
+/// TrollStore + ldid 的假签名如果只写了 entitlements 却没把 binary 标成
+/// 平台二进制（CS_PLATFORM_BINARY），私有接口会「静默失败」——
+/// 不报错、不崩溃、事件就是凭空消失，正好是我们现在的症状。
+/// 这一段在越狱机上另说，巨魔装出来的 App 应该看到 platform ✓。
+extern int csops(pid_t pid, unsigned int ops, void *addr, size_t size);
+
+#define TD_CS_OPS_STATUS       0
+#define TD_CS_GET_TASK_ALLOW   0x00000004
+#define TD_CS_HARD             0x00000100
+#define TD_CS_RESTRICT         0x00000800
+#define TD_CS_PLATFORM_BINARY  0x04000000
+
+static NSString *TDCodeSignReport(void) {
+    uint32_t flags = 0;
+    int r = csops(getpid(), TD_CS_OPS_STATUS, &flags, sizeof(flags));
+    if (r != 0) {
+        return [NSString stringWithFormat:@"签名 ?（csops 失败 errno=%d） euid:%d",
+                errno, (int)geteuid()];
+    }
+    BOOL platform = (flags & TD_CS_PLATFORM_BINARY) != 0;
+    BOOL taskAllow = (flags & TD_CS_GET_TASK_ALLOW) != 0;
+    return [NSString stringWithFormat:@"签名 platform:%@ task:%@ euid:%d cs:0x%08x%@",
+            platform ? @"✓" : @"✗",
+            taskAllow ? @"✓" : @"✗",
+            (int)geteuid(), flags,
+            platform ? @"" : @"  ← 内核没当平台二进制"];
+}
+
+/// 从学到的那次**真实**物理触摸里，把坐标原样读出来。
+///
+/// 这条比任何注入实验都值钱：它直接告诉我们这台机器的 digitizer 事件里
+/// x/y 到底用什么量纲（点 / 归一化 / 像素）。有了真值就不用再猜，
+/// 也就不用再拿 14 组构造去盲试。
+NSString *TDHIDSampleGeometry(void) {
+    TDSampleLock();
+    IOHIDEventRef down = gSampleDown ? (IOHIDEventRef)CFRetain(gSampleDown) : NULL;
+    TDSampleUnlock();
+    if (!down) return @"真实事件：未学到（先在方块上点一下）";
+
+    IOHIDEventRef f = TDFingerOf(down);
+    IOHIDFloat hx = IOHIDEventGetFloatValue(down, kIOHIDEventFieldDigitizerX);
+    IOHIDFloat hy = IOHIDEventGetFloatValue(down, kIOHIDEventFieldDigitizerY);
+    IOHIDFloat fx = f ? IOHIDEventGetFloatValue(f, kIOHIDEventFieldDigitizerX) : 0;
+    IOHIDFloat fy = f ? IOHIDEventGetFloatValue(f, kIOHIDEventFieldDigitizerY) : 0;
+    long ident = f ? (long)IOHIDEventGetIntegerValue(f, kIOHIDEventFieldDigitizerIdentity) : -1;
+    long disp = (long)IOHIDEventGetIntegerValue(down, kIOHIDEventFieldDigitizerIsDisplayIntegrated);
+    long kids = IOHIDEventGetChildren(down) ? (long)CFArrayGetCount(IOHIDEventGetChildren(down)) : 0;
+    CFRelease(down);
+
+    CGSize scr = TDMainPointSize();
+    CGFloat sc = [UIScreen mainScreen].scale;
+    // 用最大值判量纲：<=1 只能是归一化；<=短边 基本是点；再大就是像素
+    IOHIDFloat m = MAX(fx, fy);
+    const char *space = (m <= 1.001f) ? "归一化"
+                     : (m <= MAX(scr.width, scr.height) + 1) ? "点"
+                     : "像素";
+    return [NSString stringWithFormat:
+            @"真实事件 finger(%.1f,%.1f) 手(%.1f,%.1f)\n"
+            @"  → 量纲 %s · id %ld · 子事件 %ld · disp %ld · 屏 %.0f×%.0f @%.0fx",
+            (double)fx, (double)fy, (double)hx, (double)hy,
+            space, ident, kids, disp, scr.width, scr.height, sc];
+}
+
 NSString *TDHIDDiagReport(void) {
     NSMutableString *s = [NSMutableString string];
     [s appendFormat:@"客户端  admin:%@ 普通:%@\n",
@@ -997,6 +1065,11 @@ NSString *TDHIDDiagReport(void) {
         real ? [NSString stringWithFormat:@"0x%llx", real] : @"无"];
 
     [s appendFormat:@"权限 %@\n", TDEntitlementSummary()];
-    [s appendFormat:@"上次注入回显 %ld 个（0 = 事件没进系统）", (long)gEchoCount];
+    [s appendFormat:@"%@\n", TDCodeSignReport()];
+    [s appendFormat:@"%@\n", TDHIDSampleGeometry()];
+    // 回显只能证明「监听到了物理转换器自己发的事件」，看不到本进程 dispatch 的；
+    // 所以这个数字是 0 时不能反推「事件被拦」，只能反推「没有回环」。
+    [s appendFormat:@"回显 %ld 个（监听侧看不到本进程 dispatch，0 不代表被拦）",
+        (long)gEchoCount];
     return s;
 }

@@ -18,20 +18,76 @@
 
 #pragma mark - 任意触摸捕获层
 
-// 之前只数那个方块：如果注入的事件被系统当成「从 (0,0) 滑过来」，
-// 或者坐标被 clamp 到角落，落点根本不在方块上，就会误判成「完全没反应」。
-// 这一层铺满全屏，自己 App 收到任何一处触摸都计数，用来区分
-// 「事件没来」和「事件来了但落点不对」。
+// 这一层铺满全屏，唯一的职责是**记下落点**。
+//
+// 之前它只数次数，判据是「有没有触摸」，结果是四种完全不同的失败
+// 在我们眼里长得一模一样：事件被内核拒了、被当成滑动、坐标被缩放了、
+// 落到 (0,0)。四种都显示 ✗，于是只能靠猜。
+//
+// 现在把坐标记下来：
+//   没触摸      → 事件根本没进本进程（内核/投递层的问题）
+//   落点=(0,0)  → 父事件坐标没传下去
+//   落点=目标/3 → 量纲错了（点 vs 像素）
+//   落点=右下角 → 被当成归一化后 clamp 到 1.0（v1.2.3 那次「跳到我的」）
+//   落点=目标   → 链路完全通
 @interface TDTouchCatcher : UIView
-@property (nonatomic, copy) void (^onTouch)(void);
+@property (nonatomic, copy) void (^onTouch)(CGPoint p);
 @property (nonatomic) NSInteger hits;
+@property (nonatomic) CGPoint lastPoint;     // 本层坐标，未收到过即为 NAN
+@property (nonatomic) CGPoint lastScreen;    // 窗口坐标（＝屏幕坐标，全屏无偏移）
+@property (nonatomic) CGPoint minPoint;      // 本次采样范围
+@property (nonatomic) CGPoint maxPoint;
 @end
 
 @implementation TDTouchCatcher
-- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.lastPoint = CGPointMake(NAN, NAN);
+        self.minPoint = CGPointMake(NAN, NAN);
+        self.maxPoint = CGPointMake(NAN, NAN);
+        self.backgroundColor = [UIColor clearColor];
+    }
+    return self;
+}
+
+- (void)resetTrail {
+    self.hits = 0;
+    self.lastPoint = CGPointMake(NAN, NAN);
+    self.minPoint = CGPointMake(NAN, NAN);
+    self.maxPoint = CGPointMake(NAN, NAN);
+}
+
+- (void)record:(NSSet<UITouch *> *)touches {
+    UITouch *t = touches.anyObject;
+    if (!t) return;
+    CGPoint p = [t locationInView:self];
     self.hits += 1;
-    if (self.onTouch) self.onTouch();
+    self.lastPoint = p;
+    self.lastScreen = [t locationInView:nil];
+    if (isnan(self.minPoint.x)) {
+        self.minPoint = p;
+        self.maxPoint = p;
+    } else {
+        self.minPoint = CGPointMake(MIN(self.minPoint.x, p.x), MIN(self.minPoint.y, p.y));
+        self.maxPoint = CGPointMake(MAX(self.maxPoint.x, p.x), MAX(self.maxPoint.y, p.y));
+    }
+    if (self.onTouch) self.onTouch(p);
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [self record:touches];
     [super touchesBegan:touches withEvent:event];
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    // move 不算新的一次触摸，但要更新「最后落点」——滑动被 clamp 的情况全靠它暴露
+    UITouch *t = touches.anyObject;
+    if (t) {
+        self.lastPoint = [t locationInView:self];
+        self.lastScreen = [t locationInView:nil];
+    }
+    [super touchesMoved:touches withEvent:event];
 }
 @end
 
@@ -44,27 +100,41 @@
 - (void)hit;
 - (void)fire;
 - (void)updateHits;
+- (void)handleTouchAt:(CGPoint)p;
 - (void)startScan;
 - (void)scanStep;
 - (void)finishScan;
+- (void)startProbe;
+- (void)probeStep;
+- (void)finishProbe;
 @end
 
 @implementation TDSelfTestVC {
     UIView *_target;
     UILabel *_hits;
+    UILabel *_land;
     UILabel *_status;
     UILabel *_tip;
     UILabel *_scanLog;
     UIButton *_scanBtn;
+    UIButton *_probeBtn;
     NSInteger _count;
     TDTouchCatcher *_catcher;
     // 自动扫描：一组一组试注入构造，哪组命中由程序自己判断，不靠人眼看
     NSInteger _scanIdx;
     NSInteger _prevCount;
+    NSInteger _prevHits;
     NSMutableArray<NSNumber *> *_scanHits;
     NSMutableArray<NSNumber *> *_scanEcho;
     NSTimer *_scanTimer;
     NSTimer *_sampleTimer;
+    // 坐标空间探针：同一目标点，三种量纲各打一次，看落点对不对
+    NSInteger _probeIdx;
+    NSTimer *_probeTimer;
+    NSInteger _probeSavedCoord;
+    NSInteger _probeBaseHits;
+    CGPoint _probeAsked;
+    NSMutableArray<NSString *> *_probeLines;
     BOOL _fbWasOn;
     BOOL _reWasOn;
     BOOL _scanRunning;
@@ -79,16 +149,25 @@
     _catcher.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     _catcher.backgroundColor = [UIColor clearColor];
     __weak typeof(self) wsc = self;
-    _catcher.onTouch = ^{ [wsc updateHits]; };
+    _catcher.onTouch = ^(CGPoint p) { [wsc handleTouchAt:p]; };
     [self.view addSubview:_catcher];
 
     _hits = [[UILabel alloc] initWithFrame:CGRectZero];
-    _hits.text = @"被点中 0 次";
+    _hits.text = @"目标 0 次 · 任意触摸 0 次";
     _hits.textColor = TD_TEXT;
     _hits.font = [UIFont monospacedDigitSystemFontOfSize:20 weight:UIFontWeightBold];
     _hits.textAlignment = NSTextAlignmentCenter;
     _hits.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:_hits];
+
+    _land = [[UILabel alloc] initWithFrame:CGRectZero];
+    _land.text = @"落点 –（还没收到任何触摸）";
+    _land.textColor = TD_DIM;
+    _land.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightMedium];
+    _land.textAlignment = NSTextAlignmentCenter;
+    _land.numberOfLines = 2;
+    _land.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:_land];
 
     _status = [[UILabel alloc] initWithFrame:CGRectZero];
     _status.text = @"真实事件：未学到";
@@ -117,9 +196,9 @@
         [tl.centerYAnchor constraintEqualToAnchor:_target.centerYAnchor],
     ]];
 
-    // 点目标本身也能计数（手动点 vs 注入点，对比用）
-    UITapGestureRecognizer *t = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(hit)];
-    [_target addGestureRecognizer:t];
+    // 方块只当靶子，不再自己收触摸：所有触摸统一由铺满全屏的 catcher 记录，
+    // 这样「落在方块内」和「落在方块外」都能拿到精确坐标。
+    _target.userInteractionEnabled = NO;
 
     UIButton *go = [UIButton buttonWithType:UIButtonTypeSystem];
     [go setTitle:@"注入一次点击到目标中心" forState:UIControlStateNormal];
@@ -132,7 +211,7 @@
     [self.view addSubview:go];
 
     _tip = [[UILabel alloc] initWithFrame:CGRectZero];
-    _tip.text = @"先用手指在方块上点一下（学一次真实触摸），再点下面按钮注入。";
+    _tip.text = @"① 手指在方块上点一下（学一次真实触摸）② 点「坐标探针」看落点 ③ 不对再扫 14 组";
     _tip.textColor = TD_DIM;
     _tip.font = [UIFont systemFontOfSize:13];
     _tip.numberOfLines = 0;
@@ -140,16 +219,28 @@
     _tip.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:_tip];
 
-    // 自动扫描：16 组构造依次注入，命中与否由程序判定
+    // 自动扫描：14 组构造依次注入，命中与否由程序判定
     _scanBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_scanBtn setTitle:@"自动扫描 14 种注入构造" forState:UIControlStateNormal];
+    [_scanBtn setTitle:@"扫描 14 组" forState:UIControlStateNormal];
     [_scanBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    _scanBtn.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    _scanBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
     _scanBtn.backgroundColor = [UIColor colorWithRed:0.36 green:0.30 blue:0.62 alpha:1];
     _scanBtn.layer.cornerRadius = 12;
     _scanBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [_scanBtn addTarget:self action:@selector(startScan) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:_scanBtn];
+
+    // 坐标空间探针：只改量纲，别的都不动。
+    // 这是唯一能把「坐标算错」和「事件被拒」分开的实验。
+    _probeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_probeBtn setTitle:@"坐标探针" forState:UIControlStateNormal];
+    [_probeBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    _probeBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    _probeBtn.backgroundColor = [UIColor colorWithRed:0.16 green:0.44 blue:0.46 alpha:1];
+    _probeBtn.layer.cornerRadius = 12;
+    _probeBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [_probeBtn addTarget:self action:@selector(startProbe) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_probeBtn];
 
     _scanLog = [[UILabel alloc] initWithFrame:CGRectZero];
     _scanLog.text = @"";
@@ -162,10 +253,15 @@
 
     [NSLayoutConstraint activateConstraints:@[
         [_hits.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [_hits.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:24],
+        [_hits.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:20],
+
+        [_land.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [_land.topAnchor constraintEqualToAnchor:_hits.bottomAnchor constant:4],
+        [_land.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:14],
+        [_land.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-14],
 
         [_status.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [_status.topAnchor constraintEqualToAnchor:_hits.bottomAnchor constant:8],
+        [_status.topAnchor constraintEqualToAnchor:_land.bottomAnchor constant:6],
         [_status.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:20],
         [_status.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-20],
 
@@ -184,9 +280,14 @@
         [_tip.bottomAnchor constraintEqualToAnchor:go.topAnchor constant:-18],
 
         [_scanBtn.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:24],
-        [_scanBtn.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-24],
         [_scanBtn.topAnchor constraintEqualToAnchor:go.bottomAnchor constant:10],
-        [_scanBtn.heightAnchor constraintEqualToConstant:46],
+        [_scanBtn.heightAnchor constraintEqualToConstant:44],
+
+        [_probeBtn.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-24],
+        [_probeBtn.topAnchor constraintEqualToAnchor:go.bottomAnchor constant:10],
+        [_probeBtn.heightAnchor constraintEqualToConstant:44],
+        [_probeBtn.leadingAnchor constraintEqualToAnchor:_scanBtn.trailingAnchor constant:10],
+        [_probeBtn.widthAnchor constraintEqualToAnchor:_scanBtn.widthAnchor],
 
         [_scanLog.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:20],
         [_scanLog.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-20],
@@ -204,7 +305,8 @@
 }
 
 - (void)refreshSampleStatus {
-    if (!_scanRunning) _scanLog.text = TDHIDDiagReport();
+    // 扫描/探针期间别覆盖日志区
+    if (!_scanRunning && !_probeTimer) _scanLog.text = TDHIDDiagReport();
     if (!TDHIDSampleReady()) {
         _status.textColor = TD_DIM;
         _status.text = @"真实事件：未学到\n请用手指在这个灰色方块上点一下";
@@ -222,7 +324,8 @@
 - (void)startScan {
     if (_scanTimer) return;
     _scanIdx = 0;
-    _prevCount = _count + _catcher.hits;
+    _prevCount = _count;
+    _prevHits = _catcher.hits;
     _scanHits = [NSMutableArray array];
     _scanEcho = [NSMutableArray array];
     _scanLog.text = @"";
@@ -244,15 +347,25 @@
 - (void)scanStep {
     _scanTimer = nil;
 
-    // 先结算上一组：命中看目标计数，回显看 HID 监听有没有收到自己发的事件
+    // 先结算上一组。判据分三层，比原来只看「有没有触摸」精确：
+    //   命中   = 落点进了方块
+    //   到窗口 = 本进程收到了触摸，但不在方块里（跟着落点就能看出偏到哪了）
+    //   没到   = 本进程一个触摸都没收到（事件没进来，或者进了别的进程）
     if (_scanIdx > 0) {
         NSInteger echo = TDHIDMonitorEchoCount();
-        BOOL ok = ((_count + _catcher.hits) - _prevCount) > 0;
+        BOOL ok = (_count - _prevCount) > 0;
+        BOOL arrived = (_catcher.hits - _prevHits) > 0;
         [_scanHits addObject:@(ok)];
         [_scanEcho addObject:@(echo)];
-        NSString *mark = ok ? @"✓命中"
-                            : (echo > 0 ? [NSString stringWithFormat:@"~回显%ld", (long)echo]
-                                        : @"✗");
+        NSString *mark;
+        if (ok) {
+            mark = @"✓命中";
+        } else if (arrived) {
+            CGPoint g = _catcher.lastPoint;
+            mark = [NSString stringWithFormat:@"~到窗口 (%.0f,%.0f)", g.x, g.y];
+        } else {
+            mark = echo > 0 ? [NSString stringWithFormat:@"~回显%ld", (long)echo] : @"✗没到";
+        }
         NSString *line = [NSString stringWithFormat:@"%2ld %@  %@",
                           (long)_scanIdx, TDInjectPlanDesc(_scanIdx - 1), mark];
         _scanLog.text = _scanLog.text.length ? [_scanLog.text stringByAppendingFormat:@"\n%@", line] : line;
@@ -266,7 +379,8 @@
     TDReleaseStuckTouch();
 
     CGPoint c = [_target.superview convertPoint:_target.center toView:nil];
-    _prevCount = _count + _catcher.hits;
+    _prevCount = _count;
+    _prevHits = _catcher.hits;
     _tip.textColor = TD_DIM;
     _tip.text = [NSString stringWithFormat:@"第 %ld/%ld 组：%@",
                  (long)(_scanIdx + 1), (long)TDInjectPlanCount(),
@@ -312,7 +426,7 @@
                      (long)echoGroups, (long)echoSum];
     } else {
         _tip.textColor = TD_RED;
-        _tip.text = @"14 组全无命中：事件没进系统，或落点不在本 App（对照 v1.2.3 那组看）";
+        _tip.text = @"14 组全无命中：往下看每组后面是「~到窗口」还是「✗没到」";
     }
     // 把这一轮的诊断信息也留在下面，方便截图
     _scanRunning = NO;
@@ -322,18 +436,155 @@
 - (void)viewWillDisappear:(BOOL)animated {
     [super viewWillDisappear:animated];
     if (_scanTimer) { [_scanTimer invalidate]; _scanTimer = nil; }
+    if (_probeTimer) { [_probeTimer invalidate]; _probeTimer = nil; }
     if (_sampleTimer) { [_sampleTimer invalidate]; _sampleTimer = nil; }
     if (_scanBtn && !_scanBtn.enabled) TDSetInjectFeedbackEnabled(_fbWasOn);
+}
+
+#pragma mark - 坐标空间探针
+
+static NSString *TDCoordModeName(NSInteger m) {
+    switch (m) {
+        case TDCoordModeNormalized: return @"归一化";
+        case TDCoordModePixel:      return @"像素  ";
+        default:                    return @"点    ";
+    }
+}
+
+// 同一目标点，只改量纲，连打三次。
+// 判读方法（落点栏会直接写出来）：
+//   某一档 Δ≈0        → 量纲就是它，之前打不中纯粹是坐标算错
+//   三档全「无触摸」   → 量纲不是问题，事件根本没进来（转去看签名的 platform 标志）
+//   三档都落在同一个错位置 → 坐标没被采纳，系统用的还是父事件/上次的坐标
+- (void)startProbe {
+    if (_probeTimer || _scanTimer) return;
+    _probeIdx = 0;
+    _probeLines = [NSMutableArray array];
+    _probeSavedCoord = TDCoordModeCurrent();
+    _fbWasOn = TDInjectFeedbackEnabled();
+    TDSetInjectFeedbackEnabled(NO);
+    _reWasOn = TDUseRealEvents();
+    TDSetUseRealEvents(NO);
+
+    NSInteger plan = TDBestInjectPlan();
+    if (plan < 0) plan = 0;
+    TDApplyInjectPlan(plan);
+
+    _scanLog.text = [NSString stringWithFormat:@"坐标探针 · 构造 #%ld %@\n目标点用「屏幕点」写，三档只换算量纲\n",
+                     (long)(plan + 1), TDInjectPlanDesc(plan)];
+    _probeBtn.enabled = NO;
+    _scanBtn.enabled = NO;
+    _probeBtn.alpha = 0.5;
+    [_probeBtn setTitle:@"探针中…" forState:UIControlStateNormal];
+    [self probeStep];
+}
+
+- (void)probeStep {
+    _probeTimer = nil;
+
+    if (_probeIdx > 0) {
+        NSInteger mode = _probeIdx - 1;
+        BOOL arrived = (_catcher.hits - _probeBaseHits) > 0;
+        NSString *res;
+        if (!arrived) {
+            res = @"无触摸 ← 事件没进本进程";
+        } else {
+            CGPoint g = _catcher.lastPoint;
+            CGPoint w = _probeAsked;
+            res = [NSString stringWithFormat:@"落点 (%.0f,%.0f) Δ(%+.0f,%+.0f) %@",
+                   g.x, g.y, g.x - w.x, g.y - w.y,
+                   (fabs(g.x - w.x) < 12 && fabs(g.y - w.y) < 12) ? @"✓对" : @"✗偏"];
+        }
+        NSString *line = [NSString stringWithFormat:@"%@ 请求(%.0f,%.0f) → %@",
+                          TDCoordModeName(mode), _probeAsked.x, _probeAsked.y, res];
+        [_probeLines addObject:line];
+        _scanLog.text = [_scanLog.text stringByAppendingFormat:@"%@\n", line];
+    }
+
+    if (_probeIdx >= 3) {
+        [self finishProbe];
+        return;
+    }
+
+    TDReleaseStuckTouch();
+    TDSetCoordMode(_probeIdx);
+    // 目标中心换算成屏幕点，三档都从同一个屏幕点出发
+    CGPoint c = [_target.superview convertPoint:_target.center toView:nil];
+    _probeAsked = c;
+    _probeBaseHits = _catcher.hits;
+    TDtap(c.x, c.y);
+    _probeIdx++;
+
+    __weak typeof(self) ws = self;
+    _probeTimer = [NSTimer scheduledTimerWithTimeInterval:0.9 repeats:NO block:^(NSTimer *t) {
+        [ws probeStep];
+    }];
+}
+
+- (void)finishProbe {
+    if (_probeTimer) { [_probeTimer invalidate]; _probeTimer = nil; }
+    TDSetCoordMode(_probeSavedCoord);
+    TDSetInjectFeedbackEnabled(_fbWasOn);
+    TDSetUseRealEvents(_reWasOn);
+    _probeBtn.enabled = YES;
+    _scanBtn.enabled = YES;
+    _probeBtn.alpha = 1;
+    [_probeBtn setTitle:@"坐标探针" forState:UIControlStateNormal];
+
+    NSInteger good = -1;
+    BOOL anyArrived = NO;
+    for (NSInteger i = 0; i < (NSInteger)_probeLines.count; i++) {
+        if ([_probeLines[i] containsString:@"✓对"] && good < 0) good = i;
+        if (![_probeLines[i] containsString:@"无触摸"]) anyArrived = YES;
+    }
+    if (good >= 0) {
+        _tip.textColor = TD_GREEN;
+        _tip.text = [NSString stringWithFormat:@"量纲 = %@（已恢复原设置，去注入页改成它）",
+                     TDCoordModeName(good)];
+    } else if (anyArrived) {
+        _tip.textColor = TD_RED;
+        _tip.text = @"事件能进窗口但三档落点都不对 → 坐标没被采纳，不是量纲问题";
+    } else {
+        _tip.textColor = TD_RED;
+        _tip.text = @"三档都没触摸：跟坐标无关，事件根本没进来（看下面签名的 platform）";
+    }
+    _scanLog.text = [_scanLog.text stringByAppendingFormat:@"────\n%@", TDHIDDiagReport()];
 }
 
 - (void)updateHits {
     _hits.text = [NSString stringWithFormat:@"目标 %ld 次 · 任意触摸 %ld 次",
                   (long)_count, (long)_catcher.hits];
+
+    if (isnan(_catcher.lastPoint.x)) {
+        _land.textColor = TD_DIM;
+        _land.text = @"落点 –（还没收到任何触摸）";
+        return;
+    }
+    CGPoint got = _catcher.lastPoint;
+    CGPoint want = _target.center;
+    CGFloat dx = got.x - want.x, dy = got.y - want.y;
+    BOOL inside = CGRectContainsPoint(_target.frame, got);
+    _land.textColor = inside ? TD_GREEN : TD_RED;
+    NSString *head = [NSString stringWithFormat:
+                      @"落点 (%.0f,%.0f)  目标 (%.0f,%.0f)  Δ(%+.0f,%+.0f)",
+                      got.x, got.y, want.x, want.y, dx, dy];
+    NSString *tail = [NSString stringWithFormat:
+                      @"共 %ld 次 · x %.0f~%.0f  y %.0f~%.0f",
+                      (long)_catcher.hits,
+                      _catcher.minPoint.x, _catcher.maxPoint.x,
+                      _catcher.minPoint.y, _catcher.maxPoint.y];
+    _land.text = [NSString stringWithFormat:@"%@\n%@", head, tail];
+}
+
+- (void)handleTouchAt:(CGPoint)p {
+    if (CGRectContainsPoint(_target.frame, p)) {
+        _count++;
+        [self hit];
+    }
+    [self updateHits];
 }
 
 - (void)hit {
-    _count++;
-    [self updateHits];
     [self refreshSampleStatus];
     [UIView animateWithDuration:0.18 animations:^{
         self->_target.backgroundColor = TD_GREEN;

@@ -41,6 +41,12 @@ void TDSetUseRealEvents(BOOL on);
 /// 一次性报告：客户端能否建立、HID 服务数、探到的 senderID、
 /// 物理触摸监听状态、回显计数、关键权限是否真的在位。
 NSString *TDHIDDiagReport(void);
+/// 内核眼里的签名状态（platform 标志 / euid / csflags）。
+/// entitlements 里有权限 ≠ 内核会放行，这一项是把两者分开看的唯一手段。
+NSString *TDCodeSignReport(void);
+/// 学到的那次真实触摸的坐标量纲（点 / 归一化 / 像素）+ identity + displayIntegrated。
+/// 用真值替代猜测：不知道量纲就改注入，等于闭着眼睛调参。
+NSString *TDHIDSampleGeometry(void);
 /// 强制重新探测 senderID（清缓存）
 uint64_t TDProbeSenderIDForce(void);
 uint64_t TDProbedSenderIDCached(void);
