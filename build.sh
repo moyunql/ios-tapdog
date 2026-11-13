@@ -44,11 +44,22 @@ if [ -z "$LDID" ]; then
   brew install ldid
   LDID="$(command -v ldid)"
 fi
-"$LDID" -S entitlements.plist "$APP/TapDog"
-"$LDID" -S entitlements.plist "$APP" 2>/dev/null || true
+
+# ldid 自带的手写 XML 解析器不认 <!-- 注释 -->，会 assert 退出。
+# 签名前生成一份去掉注释的副本。
+python3 - <<'PY'
+import re, pathlib
+src = pathlib.Path("entitlements.plist").read_text(encoding="utf-8")
+plain = re.sub(r"<!--.*?-->", "", src, flags=re.S)
+pathlib.Path("build/ent.plist").write_text(plain, encoding="utf-8")
+print("entitlements 去注释完成，%d -> %d 字节" % (len(src), len(plain)))
+PY
+
+"$LDID" -S build/ent.plist "$APP/TapDog"
+echo "签名完成"
 
 echo "== 校验签名里的权限 =="
-"$LDID" -e "$APP/TapDog" | grep -E "hid.client.event-dispatch|platform-application|window-hosting" || true
+"$LDID" -e "$APP/TapDog" | grep -E "hid.client.event-dispatch|platform-application|accessibility-window-hosting" || true
 
 echo "== 打包 ipa =="
 ( cd build && zip -qry TapDog.ipa Payload )
