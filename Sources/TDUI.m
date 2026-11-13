@@ -163,7 +163,8 @@
     _values = [@[ TDhidStatus(),
                   TDcaptureStatus(),
                   TDHUDStatus(),
-                  [[TDRecorder shared] status],
+                  [NSString stringWithFormat:@"%@ · 事件 %ld",
+                   [[TDRecorder shared] status], (long)[TDRecorder shared].rawEventCount],
                   [NSString stringWithFormat:@"%@ · %@", [TDKeepAlive status],
                    [TDEngine shared].jetsamStatus ?: @"jetsam 未设置"],
                   TDSandboxStatus(),
@@ -226,6 +227,7 @@
     UILabel *_countdown;
     NSInteger _countLeft;
     NSTimer *_countTimer;
+    NSTimer *_liveTimer;
     BOOL _pendingRecord;
 }
 
@@ -421,6 +423,7 @@
 }
 
 - (void)onStop {
+    [self stopLiveCounter];
     [[TDEngine shared] stop];
     if ([TDRecorder shared].recording) [self finishRecording];
     [self refreshButtons];
@@ -459,7 +462,8 @@
             TDLog(@"录制启动失败：%@", [[TDRecorder shared] status]);
             return;
         }
-        TDLog(@"录制中…在抖音里点几下，回 App 或点球停止");
+        TDLog(@"录制中…在抖音里点几下，回 App 或点悬浮条停止");
+        [self startLiveCounter];
     } else {
         TDScript *s = [[TDScriptStore shared] selectedScript];
         if (!s) return;
@@ -469,14 +473,50 @@
     TDFloatRefresh();
 }
 
+/// 录制时实时显示「系统投递了多少个事件 / 采到了多少」——用来判断监听到底通没通
+- (void)startLiveCounter {
+    [self stopLiveCounter];
+    __weak typeof(self) ws = self;
+    _liveTimer = [NSTimer scheduledTimerWithTimeInterval:0.4 repeats:YES block:^(NSTimer *tm) {
+        typeof(self) ss = ws;
+        if (!ss) { [tm invalidate]; return; }
+        TDRecorder *r = [TDRecorder shared];
+        if (!r.recording) { [ss stopLiveCounter]; return; }
+        NSInteger raw = r.rawEventCount;
+        NSInteger got = r.eventCount;
+        if (raw == 0) {
+            ss->_log.text = @"录制中 · 还没收到触摸：切到抖音点几下，再回来看";
+        } else {
+            ss->_log.text = [NSString stringWithFormat:@"录制中 · 系统事件 %ld · 采样 %ld",
+                             (long)raw, (long)got];
+        }
+    }];
+}
+
+- (void)stopLiveCounter {
+    if (_liveTimer) { [_liveTimer invalidate]; _liveTimer = nil; }
+}
+
 - (void)finishRecording {
+    [self stopLiveCounter];
     TDRecorder *r = [TDRecorder shared];
     if (!r.recording) return;
+    NSInteger raw = r.rawEventCount;
     NSMutableArray *events = [r stop];
     TDScript *s = [[TDScriptStore shared] createScript];
     if (events.count) s.steps = events;
     [[TDScriptStore shared] save];
-    TDLog(@"录制结束：%@（%lu 步）", s.name, (unsigned long)s.steps.count);
+    TDLog(@"录制结束：%@（%lu 步，系统事件 %ld）", s.name, (unsigned long)s.steps.count, (long)raw);
+    if (events.count == 0) {
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:(raw == 0 ? @"一个触摸都没收到" : @"收到了，但没识别成点击")
+                             message:(raw == 0
+                                      ? @"系统没把触摸事件投给 TapDog。可能是录制期间 App 被挂起了，或者监听客户端没连上。先把诊断页第 4 行的内容发我。"
+                                      : @"事件收到了，但都被过滤掉了。把诊断页第 4 行发我，我调整过滤规则。")
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+    }
     [_tv reloadData];
     [self refreshButtons];
     TDFloatRefresh();

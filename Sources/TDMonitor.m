@@ -11,23 +11,21 @@
 // ===========================================================================
 // 录制：系统级触摸监听（display integrated digitizer）
 //
-// 上一版「点录制就闪退」的两个原因，这次全部改掉：
-//
-//  1) 用 Monitor(2) 类型的 client 去注册 RegisterEventFilterCallback。
-//     这个 filter 接口只对 Filter(3) 类型成立，Apple 内部会断言失败直接
-//     SIGABRT。iOS 13 起 Monitor 类型必须用 RegisterEventCallback（回调返回
-//     void，不是 IOHIDEventRef）。现在优先用 EventCallback，没有才退回 filter。
-//
-//  2) 回调跑在 HID 的事件线程上，里面发 ObjC 消息、读 UIScreen、还往
-//     NSMutableArray 里 addObject，主线程同时在 reloadData —— 后台线程碰
-//     UIKit + 并发改容器，必崩。
-//     现在回调里只做「纯 C 提取 + 加锁写定长数组」：不发 ObjC 消息、不碰
-//     UIKit、不分配内存。解析和 UI 刷新全留到主线程 stop 时做。
+// 历史坑位，逐条记着：
+//  1) RegisterEventCallback 的回调是 4 个参数：
+//     void (*)(void *target, void *refcon, IOHIDEventQueueRef queue, IOHIDEventRef event)
+//     少写一个参数 = 把 queue 当 event 读 = 一点录制就 EXC_BAD_ACCESS。
+//  2) 回调跑在 HID 的事件线程，里面绝不能发 ObjC 消息 / 读 UIScreen / 改容器。
+//     这里只做纯 C 提取 + 加锁写定长数组，解析留给主线程。
+//  3) 不要用 kIOHIDEventFieldDigitizerIsDisplayIntegrated 做硬过滤。
+//     这个字段在 hand 父事件上有、在 finger 子事件上经常读不到 0；
+//     一旦按它过滤，就变成「一个都收不到」——之前「录不到点击」就是这个。
+//     现在不过滤，只记录，谁上报就用谁。
 //
 // 权限：com.apple.private.hid.client.event-monitor / event-filter
 // ===========================================================================
 
-#define TD_SAMPLE_MAX 4096
+#define TD_SAMPLE_MAX 6144
 
 typedef struct {
     uint64_t t;        // mach_absolute_time
@@ -40,13 +38,15 @@ static volatile int gSampleCount = 0;
 static volatile int gArmed = 0;
 static os_unfair_lock gSampleLock = OS_UNFAIR_LOCK_INIT;
 
+// 诊断计数（回调里自增，主线程只读）
+static volatile int32_t gRawEvents = 0;      // 收到的 digitizer 事件数
+static volatile int32_t gPushedEvents = 0;   // 真正存下来的样本数
+
 typedef IOHIDEventSystemClientRef (*TDCreateWithTypeFn)(CFAllocatorRef, uint32_t, CFDictionaryRef);
 
-// !! 注意：RegisterEventCallback 的回调是 4 个参数 !!
-// typedef void(*)(void *target, void *refcon, IOHIDEventQueueRef queue, IOHIDEventRef event)
-// 少写一个参数的话，系统会把 queue 当成 event 递进来，一取字段就 EXC_BAD_ACCESS。
+// !! 4 个参数，第 3 个是 IOHIDEventQueueRef !!
 typedef void (*TDEventCallback)(void *target, void *refcon, void *queue, IOHIDEventRef event);
-// Filter 版（老接口）是 3 个参数，且必须把 event 原样返回
+// 老 filter 接口是 3 个参数，且必须把 event 原样返回
 typedef IOHIDEventRef (*TDFilterCallback)(void *target, void *refcon, IOHIDEventRef event);
 
 typedef void (*TDRegisterEventFn)(IOHIDEventSystemClientRef, TDEventCallback, void *, void *);
@@ -54,6 +54,7 @@ typedef void (*TDRegisterFilterFn)(IOHIDEventSystemClientRef, TDFilterCallback, 
 typedef void (*TDScheduleFn)(IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef);
 
 static IOHIDEventSystemClientRef gClient = NULL;
+static IOHIDEventSystemClientRef gFilterClient = NULL;   // 备用通道
 static NSString *gStatus = @"未启动";
 static NSString *gApi = nil;
 
@@ -68,6 +69,9 @@ static double TDmsBetween(uint64_t a, uint64_t b) {
 // HID 线程：只允许纯 C 操作
 // ---------------------------------------------------------------------------
 
+static int  gFingerDown = 0;      // 回调线程私有的按下状态
+static double gLastPushedX = -1e9, gLastPushedY = -1e9;
+
 static void TDPushSample(double x, double y, int touching) {
     os_unfair_lock_lock(&gSampleLock);
     if (gSampleCount < TD_SAMPLE_MAX) {
@@ -77,6 +81,7 @@ static void TDPushSample(double x, double y, int touching) {
         s->y = y;
         s->touching = (uint8_t)(touching ? 1 : 0);
         gSampleCount = gSampleCount + 1;
+        __sync_fetch_and_add(&gPushedEvents, 1);
     }
     os_unfair_lock_unlock(&gSampleLock);
 }
@@ -85,37 +90,45 @@ static void TDHandleRawEvent(IOHIDEventRef event) {
     if (!gArmed || !event) return;
     if (IOHIDEventGetType(event) != kIOHIDEventTypeDigitizer) return;
 
+    __sync_fetch_and_add(&gRawEvents, 1);
+
     CFArrayRef kids = IOHIDEventGetChildren(event);
     CFIndex n = 0;
     if (kids && CFGetTypeID(kids) == CFArrayGetTypeID()) n = CFArrayGetCount(kids);
 
-    int integrated = 0;
-    int touching = 0;
-    double x = 0, y = 0;
-
     if (n > 0) {
-        // 只取第一根手指；多指手势录不了，忽略其余
+        // 只取第一根手指；多指手势不支持
         CFTypeRef c0 = CFArrayGetValueAtIndex(kids, 0);
-        if (c0 && CFGetTypeID(c0) == IOHIDEventGetTypeID()) {
-            IOHIDEventRef f = (IOHIDEventRef)c0;
-            integrated = (int)IOHIDEventGetIntegerValue(f, kIOHIDEventFieldDigitizerIsDisplayIntegrated);
-            touching = (int)IOHIDEventGetIntegerValue(f, kIOHIDEventFieldDigitizerTouch);
-            if (touching) {
-                x = IOHIDEventGetFloatValue(f, kIOHIDEventFieldDigitizerX);
-                y = IOHIDEventGetFloatValue(f, kIOHIDEventFieldDigitizerY);
-            }
-        } else {
-            integrated = 1;
-            touching = 1;
+        if (!c0 || CFGetTypeID(c0) != IOHIDEventGetTypeID()) return;
+
+        IOHIDEventRef f = (IOHIDEventRef)c0;
+        int touching = (int)IOHIDEventGetIntegerValue(f, kIOHIDEventFieldDigitizerTouch);
+        if (!touching) {
+            // 子事件明确说没接触，但 collection 里还有它 —— 当作抬起处理
+            if (!gFingerDown) return;
+            gFingerDown = 0;
+            TDPushSample(0, 0, 0);
+            gLastPushedX = -1e9;
+            return;
         }
-    } else {
-        // collection 里一根手指都没有 = 抬手
-        integrated = (int)IOHIDEventGetIntegerValue(event, kIOHIDEventFieldDigitizerIsDisplayIntegrated);
-        touching = 0;
+
+        double x = IOHIDEventGetFloatValue(f, kIOHIDEventFieldDigitizerX);
+        double y = IOHIDEventGetFloatValue(f, kIOHIDEventFieldDigitizerY);
+
+        gFingerDown = 1;
+        // 原地抖动不用每帧都存，省缓冲
+        if (fabs(x - gLastPushedX) < 5.0 && fabs(y - gLastPushedY) < 5.0) return;
+        gLastPushedX = x;
+        gLastPushedY = y;
+        TDPushSample(x, y, 1);
+        return;
     }
 
-    if (!integrated) return;   // 不是屏幕上的触摸（外接设备等）
-    TDPushSample(x, y, touching);
+    // collection 里一根手指都没有 = 抬手（只在按下过之后记一次）
+    if (!gFingerDown) return;
+    gFingerDown = 0;
+    gLastPushedX = -1e9;
+    TDPushSample(0, 0, 0);
 }
 
 // 返回 void 的那个（Monitor 类型专用，4 参数）
@@ -147,64 +160,119 @@ static IOHIDEventRef TDFilterCB(void *target, void *refcon, IOHIDEventRef event)
 }
 
 - (NSInteger)eventCount { return (NSInteger)gSampleCount; }
+- (NSInteger)rawEventCount { return (NSInteger)gRawEvents; }
 - (NSString *)status { return gStatus; }
+
+- (BOOL)openMonitor {
+    if (gClient) return YES;
+
+    TDCreateWithTypeFn create = (TDCreateWithTypeFn)dlsym(RTLD_DEFAULT,
+                                                           "IOHIDEventSystemClientCreateWithType");
+    if (create) {
+        CFMutableDictionaryRef props = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
+                                                                &kCFTypeDictionaryKeyCallBacks,
+                                                                &kCFTypeDictionaryValueCallBacks);
+        // 2 = kIOHIDEventSystemClientTypeMonitor
+        gClient = create(kCFAllocatorDefault, 2, props);
+        if (props) CFRelease(props);
+    }
+    if (!gClient) gClient = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+    if (!gClient) {
+        gStatus = @"失败：监听客户端建不起来（HID 权限）";
+        return NO;
+    }
+
+    // iOS 13+：Monitor 类型配 RegisterEventCallback
+    TDRegisterEventFn regEv = (TDRegisterEventFn)dlsym(RTLD_DEFAULT,
+                                                       "IOHIDEventSystemClientRegisterEventCallback");
+    if (regEv) {
+        regEv(gClient, TDEventCB, NULL, NULL);
+        gApi = @"event-callback";
+    } else {
+        TDRegisterFilterFn regF = (TDRegisterFilterFn)dlsym(RTLD_DEFAULT,
+                                                            "IOHIDEventSystemClientRegisterEventFilterCallback");
+        if (regF) { regF(gClient, TDFilterCB, NULL, NULL); gApi = @"filter"; }
+    }
+    if (!gApi) {
+        gStatus = @"失败：系统没有触摸回调接口";
+        return NO;
+    }
+
+    TDScheduleFn sched = (TDScheduleFn)dlsym(RTLD_DEFAULT,
+                                             "IOHIDEventSystemClientScheduleWithRunLoop");
+    if (!sched) {
+        gStatus = @"失败：监听器挂不上 runloop";
+        return NO;
+    }
+    sched(gClient, CFRunLoopGetMain(), kCFRunLoopCommonModes);
+
+    gStatus = [NSString stringWithFormat:@"已连接（%@）", gApi];
+    TDLog(@"触摸监听已建立：%@", gStatus);
+    return YES;
+}
+
+/// 备用通道：Filter 类型（3）+ RegisterEventFilterCallback。
+/// 只在主通道 2.5 秒内一个事件都没收到时才启用，避免两条通道重复入样。
+- (BOOL)openFilterChannel {
+    if (gFilterClient) return YES;
+
+    TDCreateWithTypeFn create = (TDCreateWithTypeFn)dlsym(RTLD_DEFAULT,
+                                                           "IOHIDEventSystemClientCreateWithType");
+    TDRegisterFilterFn regF = (TDRegisterFilterFn)dlsym(RTLD_DEFAULT,
+                                                        "IOHIDEventSystemClientRegisterEventFilterCallback");
+    TDScheduleFn sched = (TDScheduleFn)dlsym(RTLD_DEFAULT,
+                                             "IOHIDEventSystemClientScheduleWithRunLoop");
+    if (!create || !regF || !sched) {
+        gStatus = @"主通道无事件，且备用通道接口缺失";
+        return NO;
+    }
+    // 3 = kIOHIDEventSystemClientTypeFilter
+    gFilterClient = create(kCFAllocatorDefault, 3, NULL);
+    if (!gFilterClient) {
+        gStatus = @"主通道无事件，备用通道也建不起来";
+        TDLog(@"备用监听通道创建失败");
+        return NO;
+    }
+    regF(gFilterClient, TDFilterCB, NULL, NULL);
+    sched(gFilterClient, CFRunLoopGetMain(), kCFRunLoopCommonModes);
+    gStatus = @"已连接（filter 备用通道）";
+    TDLog(@"主通道无事件，已启用 filter 备用通道");
+    return YES;
+}
+
+- (void)armFallbackTimer {
+    __weak typeof(self) ws = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        typeof(self) ss = ws;
+        if (!ss || !ss.recording) return;
+        if (gRawEvents > 0) return;         // 主通道有事件，不用管
+        [ss openFilterChannel];
+    });
+}
 
 - (BOOL)start {
     @try {
         if (self.recording) return YES;
         if ([TDEngine shared].running) [[TDEngine shared] stop];
 
-        if (!gClient) {
-            TDCreateWithTypeFn create = (TDCreateWithTypeFn)dlsym(RTLD_DEFAULT,
-                                                                   "IOHIDEventSystemClientCreateWithType");
-            if (create) {
-                CFMutableDictionaryRef props = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
-                                                                        &kCFTypeDictionaryKeyCallBacks,
-                                                                        &kCFTypeDictionaryValueCallBacks);
-                // 2 = kIOHIDEventSystemClientTypeMonitor
-                gClient = create(kCFAllocatorDefault, 2, props);
-                if (props) CFRelease(props);
-            }
-            if (!gClient) gClient = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
-            if (!gClient) {
-                gStatus = @"失败：监听客户端建不起来（HID 权限）";
-                return NO;
-            }
+        if (![self openMonitor]) return NO;
 
-            // iOS 13+：Monitor 类型配 RegisterEventCallback
-            TDRegisterEventFn regEv = (TDRegisterEventFn)dlsym(RTLD_DEFAULT,
-                                                               "IOHIDEventSystemClientRegisterEventCallback");
-            if (regEv) {
-                regEv(gClient, TDEventCB, NULL, NULL);
-                gApi = @"event-callback";
-            } else {
-                TDRegisterFilterFn regF = (TDRegisterFilterFn)dlsym(RTLD_DEFAULT,
-                                                                    "IOHIDEventSystemClientRegisterEventFilterCallback");
-                if (regF) { regF(gClient, TDFilterCB, NULL, NULL); gApi = @"filter"; }
-            }
-            if (!gApi) {
-                CFRelease(gClient);
-                gClient = NULL;
-                gStatus = @"失败：系统没有触摸回调接口";
-                return NO;
-            }
-
-            TDScheduleFn sched = (TDScheduleFn)dlsym(RTLD_DEFAULT,
-                                                     "IOHIDEventSystemClientScheduleWithRunLoop");
-            if (!sched) {
-                gStatus = @"失败：监听器挂不上 runloop";
-                return NO;
-            }
-            sched(gClient, CFRunLoopGetMain(), kCFRunLoopCommonModes);
-            gStatus = [NSString stringWithFormat:@"已连接（%@）", gApi];
-        }
+        // 切到抖音后要保持进程活着，否则一个事件都收不到
+        [TDKeepAlive ensure];
 
         os_unfair_lock_lock(&gSampleLock);
         gSampleCount = 0;
         os_unfair_lock_unlock(&gSampleLock);
+        gRawEvents = 0;
+        gPushedEvents = 0;
+        gFingerDown = 0;
+        gLastPushedX = -1e9;
+        gLastPushedY = -1e9;
 
         self.recording = YES;
         gArmed = 1;
+        [self armFallbackTimer];
         if (self.onChange) self.onChange();
         return YES;
     } @catch (NSException *e) {
@@ -220,6 +288,15 @@ static IOHIDEventRef TDFilterCB(void *target, void *refcon, IOHIDEventRef event)
     gArmed = 0;
     self.recording = NO;
 
+    // 备用通道用一次就拆掉，避免下次录制两条通道重复入样
+    if (gFilterClient) {
+        typedef void (*TDCancelFn)(IOHIDEventSystemClientRef);
+        TDCancelFn cancel = (TDCancelFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientCancel");
+        if (cancel) cancel(gFilterClient);
+        CFRelease(gFilterClient);
+        gFilterClient = NULL;
+    }
+
     static TDSample buf[TD_SAMPLE_MAX];
     int n = 0;
     os_unfair_lock_lock(&gSampleLock);
@@ -228,6 +305,8 @@ static IOHIDEventRef TDFilterCB(void *target, void *refcon, IOHIDEventRef event)
     if (n > 0) memcpy(buf, gSamples, sizeof(TDSample) * (size_t)n);
     gSampleCount = 0;
     os_unfair_lock_unlock(&gSampleLock);
+
+    TDLog(@"录制停止：系统事件 %d · 采样 %d", (int)gRawEvents, n);
 
     NSMutableArray *steps = [self parseSamples:buf count:n];
     if (self.onChange) self.onChange();
@@ -257,10 +336,9 @@ static IOHIDEventRef TDFilterCB(void *target, void *refcon, IOHIDEventRef event)
         ratio = TDscreenScaleRatio();
         if (ratio < 1.2 || ratio > 4.0) ratio = [UIScreen mainScreen].nativeScale;
         if (ratio < 1.2 || ratio > 4.0) ratio = 1.0;
-        TDLog(@"录制坐标按像素处理：原始最大 (%.0f, %.0f) 屏宽 %.0f 换算比 %.3f",
-              maxX, maxY, sb.width, ratio);
+        TDLog(@"坐标按像素换算：最大 (%.0f, %.0f) / 屏宽 %.0f = %.3f", maxX, maxY, sb.width, ratio);
     } else {
-        TDLog(@"录制坐标最大 (%.0f, %.0f)，按点处理", maxX, maxY);
+        TDLog(@"坐标按点处理：最大 (%.0f, %.0f)", maxX, maxY);
     }
 
     BOOL down = NO, moved = NO;
@@ -288,7 +366,7 @@ static IOHIDEventRef TDFilterCB(void *target, void *refcon, IOHIDEventRef event)
             down = NO;
             double durMs = TDmsBetween(s[i].t, downT);
 
-            // 从屏幕最底部起手往上拖 = 上滑回桌面，别录进去
+            // 从屏幕最底部起手往上拖 = 上滑回桌面，别录
             if (sy > sb.height - 44 && moved && ly < sy - 60) {
                 lastEnd = s[i].t;
                 continue;
@@ -297,9 +375,8 @@ static IOHIDEventRef TDFilterCB(void *target, void *refcon, IOHIDEventRef event)
             NSMutableDictionary *d = [NSMutableDictionary dictionary];
             d[@"gap"] = @((NSInteger)MAX(0.0, TDmsBetween(downT, lastEnd)));
 
-            double cx = sx, cy = sy;
-            cx = MAX(0, MIN(sb.width  - 1, cx));
-            cy = MAX(0, MIN(sb.height - 1, cy));
+            double cx = MAX(0, MIN(sb.width  - 1, sx));
+            double cy = MAX(0, MIN(sb.height - 1, sy));
 
             if (!moved && durMs < 450) {
                 d[@"t"] = @"tap";

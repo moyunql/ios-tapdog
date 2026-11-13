@@ -70,7 +70,8 @@ TDMatch * _Nullable TDfindImage(UIImage *tpl, double threshold, double minScale,
 @interface TDRecorder : NSObject
 + (instancetype)shared;
 @property (nonatomic, readonly) BOOL recording;
-@property (nonatomic, readonly) NSInteger eventCount;
+@property (nonatomic, readonly) NSInteger eventCount;      // 已采到的样本数
+@property (nonatomic, readonly) NSInteger rawEventCount;   // 系统投递过来的事件数（诊断用）
 @property (nonatomic, copy, nullable) void (^onChange)(void);
 
 /// 返回 NO 表示系统不给监听（权限/接口不可用），此时只能用手动取点
@@ -127,6 +128,8 @@ NSString *TDBypassJetsam(void);
 
 @interface TDKeepAlive : NSObject
 + (void)start;
+/// 重新激活一次音频会话（被别的 App 抢走后，后台就保不住了）
++ (void)ensure;
 + (NSString *)status;
 @end
 

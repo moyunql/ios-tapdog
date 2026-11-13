@@ -26,6 +26,17 @@ static NSString *gAudioStatus = @"未启动";
 }
 
 + (void)start { [[self shared] begin]; }
+
++ (void)ensure {
+    TDKeepAlive *k = [self shared];
+    if (!k->_player) { [k begin]; return; }
+    NSError *err = nil;
+    [[AVAudioSession sharedInstance] setActive:YES error:&err];
+    if (!k->_player.playing) [k->_player play];
+    gAudioStatus = k->_player.playing ? @"静音播放中（后台不会被挂起）"
+                                      : @"播放被中断（切到抖音可能被挂起）";
+}
+
 + (NSString *)status { return gAudioStatus; }
 
 - (void)begin {
