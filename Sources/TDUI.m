@@ -491,7 +491,7 @@
 }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    return s == 0 ? [TDScriptStore shared].scripts.count : 1;
+    return s == 0 ? [TDScriptStore shared].scripts.count : 2;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
@@ -510,9 +510,17 @@
             ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
         c.tintColor = TD_GREEN;
     } else {
-        c.textLabel.text = @"＋ 新建脚本";
-        c.detailTextLabel.text = @"从空白开始，用录制往里加步骤";
-        c.accessoryType = UITableViewCellAccessoryNone;
+        if (ip.row == 0) {
+            c.textLabel.text = @"＋ 新建脚本";
+            c.detailTextLabel.text = @"从空白开始，用录制往里加步骤";
+        } else {
+            TDConfig *cfg = [TDConfig shared];
+            c.textLabel.text = @"循环次数 / 点击偏移";
+            c.detailTextLabel.text = [NSString stringWithFormat:@"%@ · 偏移 ±%.0fpt",
+                                      cfg.loopCount == 0 ? @"无限循环" : [NSString stringWithFormat:@"循环 %ld 次", (long)cfg.loopCount],
+                                      cfg.jitterPx];
+        }
+        c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     }
     return c;
 }
@@ -525,11 +533,39 @@
         [tv reloadData];
         [self refreshButtons];
         TDFloatRefresh();
-    } else {
+    } else if (ip.row == 0) {
         [[TDScriptStore shared] createScript];
         [tv reloadData];
         [self refreshButtons];
+    } else {
+        [self editSettings];
     }
+}
+
+- (void)editSettings {
+    TDConfig *cfg = [TDConfig shared];
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"循环 / 偏移"
+                                                              message:@"循环 0 = 无限；偏移是每次点击的随机抖动半径（防检测）"
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *t) {
+        t.placeholder = @"循环次数(0=无限)";
+        t.text = [NSString stringWithFormat:@"%ld", (long)cfg.loopCount];
+        t.keyboardType = UIKeyboardTypeNumberPad;
+    }];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *t) {
+        t.placeholder = @"偏移(点)";
+        t.text = [NSString stringWithFormat:@"%.0f", cfg.jitterPx];
+        t.keyboardType = UIKeyboardTypeDecimalPad;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+        cfg.loopCount = [a.textFields[0].text integerValue];
+        cfg.jitterPx = [a.textFields[1].text doubleValue];
+        [cfg save];
+        [self->_tv reloadData];
+        [self refreshButtons];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 - (BOOL)tableView:(UITableView *)tv canEditRowAtIndexPath:(NSIndexPath *)ip { return ip.section == 0; }
