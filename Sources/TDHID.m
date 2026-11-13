@@ -40,6 +40,79 @@ static const uint64_t kTDDefaultSenderID = 0x8000000817319372ULL;
 static NSString * const kInjVariantKey = @"tdInjVariant";
 static NSString * const kInjBuiltInKey = @"tdInjBuiltIn";
 static NSString * const kInjBKSKey     = @"tdInjBKS";
+static NSString * const kCoordModeKey  = @"tdCoordMode";
+
+#pragma mark - 坐标空间
+
+// 事件里的 x/y 该填什么单位，各系统版本不一样。填错的表现非常典型：
+// 系统把 207 当成 207.0(归一化) 直接 clamp 到 1.0 —— 于是无论点哪，
+// 落点都在屏幕右下角。抖音右下角正好是 tab bar 最右的「我」。
+static CGSize TDMainPointSize(void) {
+    static CGSize s;
+    static BOOL got = NO;
+    if (!got) {
+        s = [UIScreen mainScreen].bounds.size;
+        if (s.width < 1 || s.height < 1) s = CGSizeMake(414, 736);
+        got = YES;
+    }
+    return s;
+}
+
+NSInteger TDCoordModeCurrent(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if ([d objectForKey:kCoordModeKey] == nil) return TDCoordModePoint;
+    return [d integerForKey:kCoordModeKey];
+}
+
+void TDSetCoordMode(NSInteger m) {
+    [[NSUserDefaults standardUserDefaults] setInteger:m forKey:kCoordModeKey];
+}
+
+NSString *TDCoordModeDesc(void) {
+    CGSize s = TDMainPointSize();
+    switch (TDCoordModeCurrent()) {
+        case TDCoordModeNormalized:
+            return [NSString stringWithFormat:@"归一化 0~1（屏 %.0f×%.0f）", s.width, s.height];
+        case TDCoordModePixel:
+            return [NSString stringWithFormat:@"物理像素 ×%.0f（%.0f×%.0f）",
+                    [UIScreen mainScreen].scale,
+                    s.width * [UIScreen mainScreen].scale,
+                    s.height * [UIScreen mainScreen].scale];
+        default:
+            return [NSString stringWithFormat:@"屏幕点 %.0f×%.0f", s.width, s.height];
+    }
+}
+
+CGPoint TDCoordToEventSpace(CGPoint p) {
+    CGSize s = TDMainPointSize();
+    switch (TDCoordModeCurrent()) {
+        case TDCoordModeNormalized:
+            return CGPointMake(s.width > 0 ? p.x / s.width : 0,
+                               s.height > 0 ? p.y / s.height : 0);
+        case TDCoordModePixel: {
+            CGFloat sc = [UIScreen mainScreen].scale;
+            if (sc < 1) sc = 1;
+            return CGPointMake(p.x * sc, p.y * sc);
+        }
+        default:
+            return p;
+    }
+}
+
+CGPoint TDScreenPointFromEventSpace(CGPoint e) {
+    CGSize s = TDMainPointSize();
+    switch (TDCoordModeCurrent()) {
+        case TDCoordModeNormalized:
+            return CGPointMake(e.x * s.width, e.y * s.height);
+        case TDCoordModePixel: {
+            CGFloat sc = [UIScreen mainScreen].scale;
+            if (sc < 1) sc = 1;
+            return CGPointMake(e.x / sc, e.y / sc);
+        }
+        default:
+            return e;
+    }
+}
 
 static uint64_t gProbedSender = 0;
 static BOOL gProbedTried = NO;
@@ -202,17 +275,24 @@ NSString *TDhidStatus(void) {
 //   - 父事件的 eventMask 给 kIOHIDDigitizerEventTouch，不能是 0
 //   - 补 TiltX / TiltY / Altitude 三个字段，否则 BackBoard 认为这不是屏幕触摸
 //   - finger 的 Major/MinorRadius 给 0.04（真实手指量级），给 0 会被当噪声丢掉
-static IOHIDEventRef TDCreateHand(uint32_t mask, uint64_t ts) {
+static IOHIDEventRef TDCreateHand(uint32_t mask, uint64_t ts, CGPoint e) {
     IOHIDEventRef hand = IOHIDEventCreateDigitizerEvent(kCFAllocatorDefault,
                                                        ts,
                                                        kIOHIDDigitizerTransducerTypeHand,
                                                        0, 0,
                                                        kIOHIDDigitizerEventTouch,
                                                        0,
-                                                       0.0, 0.0, 0.0, 0.0, 0.0,
-                                                       0, true, 0);
+                                                       (IOHIDFloat)e.x, (IOHIDFloat)e.y,
+                                                       0.0, 0.0, 0.0,
+                                                       mask & kIOHIDDigitizerEventTouch ? 1 : 0,
+                                                       true, 0);
     if (!hand) return NULL;
     IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
+    IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerType,
+                              kIOHIDDigitizerTransducerTypeHand);
+    // 父事件的坐标也补上：有些系统版本只读父事件的位置
+    IOHIDEventSetFloatValue(hand, kIOHIDEventFieldDigitizerX, (IOHIDFloat)e.x);
+    IOHIDEventSetFloatValue(hand, kIOHIDEventFieldDigitizerY, (IOHIDFloat)e.y);
     IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerTiltX,
                               kIOHIDDigitizerTransducerTypeHand);
     IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerTiltY, 1);
@@ -230,8 +310,11 @@ static void TDEmit(uint32_t mask, BOOL touch, CGFloat x, CGFloat y) {
     if (isDown) __sync_fetch_and_add(&gInjectCount, 1);
     if (gFeedback) gFeedback(x, y, isDown);
 
+    // 屏幕点 → 事件坐标空间（点 / 归一化 / 像素）
+    CGPoint e = TDCoordToEventSpace(CGPointMake(x, y));
+
     uint64_t ts = mach_absolute_time();
-    IOHIDEventRef hand = TDCreateHand(mask, ts);
+    IOHIDEventRef hand = TDCreateHand(mask, ts, e);
     if (!hand) return;
 
     int isTouch = touch ? 1 : 0;
@@ -240,15 +323,19 @@ static void TDEmit(uint32_t mask, BOOL touch, CGFloat x, CGFloat y) {
                                                                1,      // index
                                                                3,      // identity
                                                                mask,
-                                                               (IOHIDFloat)x,
-                                                               (IOHIDFloat)y,
+                                                               (IOHIDFloat)e.x,
+                                                               (IOHIDFloat)e.y,
                                                                0.0f, 0.0f, 0.0f,
                                                                isTouch,   // range
                                                                isTouch,   // touch
                                                                0);
     if (finger) {
         IOHIDEventSetIntegerValue(finger, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
+        IOHIDEventSetIntegerValue(finger, kIOHIDEventFieldDigitizerType,
+                                  kIOHIDDigitizerTransducerTypeFinger);
         IOHIDEventSetIntegerValue(finger, kIOHIDEventFieldDigitizerTouch, isTouch);
+        IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerX, (IOHIDFloat)e.x);
+        IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerY, (IOHIDFloat)e.y);
         IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerMajorRadius, 0.04f);
         IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerMinorRadius, 0.04f);
         IOHIDEventAppendEvent(hand, finger);

@@ -1,5 +1,7 @@
 #import "TD.h"
 #import <QuartzCore/QuartzCore.h>
+#import <math.h>
+#import <stdarg.h>
 
 // ---------------------------------------------------------------------------
 // 主界面（按键精灵式：录制 / 播放 / 停止 + 脚本列表 + 诊断）
@@ -127,6 +129,227 @@
 @interface TDInjectVC : UITableViewController
 @end
 
+#pragma mark - 坐标标定
+//
+// 「点中间却跳到我的」＝注入生效了，但坐标被系统按另一种空间解释了。
+// 这里把三种可能的空间各注一次，用自己的窗口当靶子接住，直接读出落点。
+
+@interface TDCalibVC : UIViewController
+@end
+
+static const NSInteger kCalibModes[] = { TDCoordModePoint, TDCoordModeNormalized, TDCoordModePixel };
+static NSString *TDCalibModeName(NSInteger m) {
+    return m == TDCoordModeNormalized ? @"归一化" : (m == TDCoordModePixel ? @"像素" : @"点坐标");
+}
+
+@interface TDCalibVC ()
+- (void)start;
+- (void)say:(NSString *)fmt, ...;
+- (void)runFrom:(NSInteger)modeIdx got:(NSInteger)gotIdx notes:(NSMutableArray<NSString *> *)notes;
+- (void)probeAt:(CGPoint)p done:(void (^)(BOOL, CGPoint))done;
+- (void)finishWith:(NSMutableArray<NSString *> *)notes;
+@end
+
+@implementation TDCalibVC {
+    UILabel   *_log;
+    UIButton  *_go;
+    UIView    *_catcher;
+    BOOL       _running;
+    BOOL       _floatWasVisible;
+
+    NSInteger  _token;
+    BOOL       _probeGot;
+    CGPoint    _probePt;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"坐标标定";
+    self.view.backgroundColor = TD_BG;
+
+    _log = [[UILabel alloc] initWithFrame:CGRectZero];
+    _log.textColor = TD_TEXT;
+    _log.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+    _log.numberOfLines = 0;
+    _log.text = @"点「开始标定」：会依次用三种坐标空间各点两次，\n"
+                 "看哪一组落点跟期望一致。\n\n"
+                 "标定期间悬浮球会暂时藏起来（它盖在上面会挡靶子）。";
+    _log.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:_log];
+
+    _go = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_go setTitle:@"开始标定" forState:UIControlStateNormal];
+    [_go setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    _go.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+    _go.backgroundColor = TD_ACCENT;
+    _go.layer.cornerRadius = 12;
+    _go.translatesAutoresizingMaskIntoConstraints = NO;
+    [_go addTarget:self action:@selector(start) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_go];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [_log.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:16],
+        [_log.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:18],
+        [_log.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-18],
+
+        [_go.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:24],
+        [_go.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-24],
+        [_go.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-24],
+        [_go.heightAnchor constraintEqualToConstant:52],
+    ]];
+}
+
+- (void)say:(NSString *)fmt, ... {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    _log.text = s;
+}
+
+// 靶子：铺满全屏接住注入进来的触摸
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    UITouch *t = touches.anyObject;
+    if (!t) return;
+    CGPoint p = [t locationInView:self.view];
+    _probeGot = YES;
+    _probePt = p;
+
+    UIView *dot = [[UIView alloc] initWithFrame:CGRectMake(p.x - 6, p.y - 6, 12, 12)];
+    dot.backgroundColor = TD_GREEN;
+    dot.layer.cornerRadius = 6;
+    dot.userInteractionEnabled = NO;
+    [self.view addSubview:dot];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [dot removeFromSuperview]; });
+}
+
+- (void)start {
+    if (_running) return;
+    _running = YES;
+    _go.enabled = NO;
+
+    // 悬浮球是全屏托管窗口，会挡在靶子上面，先藏起来
+    _floatWasVisible = TDFloatVisible();
+    if (_floatWasVisible) TDFloatSetVisible(NO);
+
+    // 透明接球层，盖住按钮和文字，保证触摸都落到 self.view
+    _catcher = [[UIView alloc] initWithFrame:self.view.bounds];
+    _catcher.backgroundColor = [UIColor colorWithWhite:0 alpha:0.001];
+    _catcher.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.view addSubview:_catcher];
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self runFrom:0 got:0 notes:[NSMutableArray array]];
+    });
+}
+
+// 每个模式两个采样点：中心（判断整体）+ 左上（判断有没有缩放）
+- (void)runFrom:(NSInteger)modeIdx got:(NSInteger)gotIdx notes:(NSMutableArray<NSString *> *)notes {
+    if (modeIdx >= 3) { [self finishWith:notes]; return; }
+
+    NSInteger mode = kCalibModes[modeIdx];
+    TDSetCoordMode(mode);
+
+    CGSize s = [UIScreen mainScreen].bounds.size;
+    CGPoint pts[2] = { CGPointMake(s.width * 0.5, s.height * 0.5),
+                       CGPointMake(s.width * 0.25, s.height * 0.3) };
+
+    __weak typeof(self) ws = self;
+    [self probeAt:pts[gotIdx] done:^(BOOL ok, CGPoint at) {
+        TDCalibVC *ss = ws;
+        if (!ss) return;
+
+        if (ok) {
+            CGFloat d = hypot(at.x - pts[gotIdx].x, at.y - pts[gotIdx].y);
+            [notes addObject:[NSString stringWithFormat:@"%@ (%.0f,%.0f) → (%.0f,%.0f) 偏差%.0f %@",
+                              TDCalibModeName(mode),
+                              pts[gotIdx].x, pts[gotIdx].y, at.x, at.y, d, d < 15 ? @"✓" : @"✗"]];
+        } else {
+            [notes addObject:[NSString stringWithFormat:@"%@ (%.0f,%.0f) → 没接到",
+                              TDCalibModeName(mode),
+                              pts[gotIdx].x, pts[gotIdx].y]];
+        }
+        [ss say:@"%@", [notes componentsJoinedByString:@"\n"]];
+
+        NSInteger nextMode = (gotIdx == 0) ? modeIdx : modeIdx + 1;
+        NSInteger nextGot  = (gotIdx == 0) ? 1 : 0;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [ss runFrom:nextMode got:nextGot notes:notes];
+        });
+    }];
+}
+
+- (void)probeAt:(CGPoint)p done:(void (^)(BOOL, CGPoint))done {
+    _token++;
+    NSInteger tk = _token;
+    _probeGot = NO;
+    _probePt = CGPointMake(-1, -1);
+
+    // TDtap 里有 usleep，挪到后台队列，别卡主线程
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        TDtap(p.x, p.y);
+    });
+
+    __weak typeof(self) ws = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        TDCalibVC *ss = ws;
+        if (!ss || tk != ss->_token) return;
+        done(ss->_probeGot, ss->_probePt);
+    });
+}
+
+- (void)finishWith:(NSMutableArray<NSString *> *)notes {
+    if (notes.count < 6) {                 // 中途被打断，别越界
+        _running = NO;
+        _go.enabled = YES;
+        [_catcher removeFromSuperview];
+        _catcher = nil;
+        if (_floatWasVisible) TDFloatSetVisible(YES);
+        [self say:@"标定被打断了，重新点一次「开始标定」。"];
+        return;
+    }
+
+    // 统计哪种模式两个点都命中
+    NSInteger best = -1;
+    for (NSInteger i = 0; i < 3; i++) {
+        NSString *a = notes[i * 2];
+        NSString *b = notes[i * 2 + 1];
+        if ([a hasSuffix:@"✓"] && [b hasSuffix:@"✓"]) { best = kCalibModes[i]; break; }
+    }
+
+    NSMutableString *out = [notes componentsJoinedByString:@"\n"].mutableCopy;
+    if (best >= 0) {
+        TDSetCoordMode(best);
+        [out appendFormat:@"\n\n→ 采用「%@」：两次都落在期望位置。", TDCalibModeName(best)];
+    } else {
+        // 找到「接到了但偏了」的模式，把偏移量算出来
+        NSInteger anyGot = -1;
+        for (NSInteger i = 0; i < 3; i++) {
+            if (![notes[i * 2] hasSuffix:@"没接到"]) { anyGot = kCalibModes[i]; break; }
+        }
+        if (anyGot >= 0) {
+            [out appendFormat:@"\n\n→ 只有「%@」能落到自己 App 上，但位置偏了。"
+                                "把这三行发我，我按偏移量修。", TDCalibModeName(anyGot)];
+        } else {
+            [out appendString:@"\n\n→ 三种都没接到：注入到本 App 的路径没通。"
+                           "先在抖音里实测一次，把落点位置告诉我。"];
+        }
+    }
+
+    [self say:@"%@", out];
+    _running = NO;
+    _go.enabled = YES;
+    [_catcher removeFromSuperview];
+    _catcher = nil;
+    if (_floatWasVisible) TDFloatSetVisible(YES);
+}
+
+@end
+
 #pragma mark - 诊断页
 
 @interface TDDiagVC : UIViewController <UITableViewDataSource>
@@ -146,7 +369,7 @@
     _titles = @[@"触摸注入", @"截屏", @"悬浮球托管", @"录制（全屏取点）",
                 @"后台保活", @"沙盒 / 权限", @"点击偏移 / 循环",
                 @"注入自检（点得动吗）", @"崩溃日志", @"点击反馈（200ms 红圈）",
-                @"注入调试（点不动就试这个）"];
+                @"注入调试（点不动就试这个）", @"坐标标定（点偏了用这个）"];
 
     _tv = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
     _tv.dataSource = self;
@@ -202,6 +425,9 @@
     } else if (ip.row == 10) {
         c.detailTextLabel.text = TDInjectVariantDesc();
         c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    } else if (ip.row == 11) {
+        c.detailTextLabel.text = [NSString stringWithFormat:@"当前：%@", TDCoordModeDesc()];
+        c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     }
     return c;
 }
@@ -215,6 +441,8 @@
         [tv reloadData];
     } else if (ip.row == 10) {
         [self.navigationController pushViewController:[TDInjectVC new] animated:YES];
+    } else if (ip.row == 11) {
+        [self.navigationController pushViewController:[TDCalibVC new] animated:YES];
     } else if (ip.row == 8) {
         NSString *log = TDcrashLogText();
         UIAlertController *a = [UIAlertController alertControllerWithTitle:@"崩溃日志"
@@ -251,12 +479,13 @@
     TDProbedSenderID();          // 先把真实 ID 探出来，界面上直接显示结果
 }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 3; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 4; }
 
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
     return @[@"① 事件里的 senderID 怎么给",
              @"② 再补哪些字段",
-             @"③ 试一次"][s];
+             @"③ 坐标用哪个空间",
+             @"④ 试一次"][s];
 }
 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
@@ -270,12 +499,20 @@
         return @"BackBoard digitizer info 是 iOS 13 之后的关键一步，"
                @"但参数不对会直接闪退。每次启动 App 都会自动关掉它。";
     }
+    if (s == 2) {
+        return @"屏幕坐标填进去，系统按哪种空间解释，各版本不一样。"
+               @"填错时坐标会被 clamp 到边界：点中间落到右下角 = 抖音的「我」。"
+               @"拿不准就点诊断页的「坐标标定」自动扫一遍。";
+    }
     return @"点一下 → 5 秒后往屏幕正中注入一次。这时按 Home 切到抖音等着："
             "红圈冒出来而且视频暂停/继续，就说明这个组合对了。";
 }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    return s == 0 ? 3 : (s == 1 ? 2 : 1);
+    if (s == 0) return 3;
+    if (s == 1) return 2;
+    if (s == 2) return 3;
+    return 1;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
@@ -309,8 +546,19 @@
             c.detailTextLabel.text = @"告诉 BackBoard 这事件属于哪块屏（⚠️ 可能闪退）";
             if (TDInjectBKSDigitizerInfoOn()) c.accessoryType = UITableViewCellAccessoryCheckmark;
         }
+    } else if (ip.section == 2) {
+        NSArray<NSString *> *names = @[@"屏幕点（414×736，常规）",
+                                       @"归一化 0~1",
+                                       @"物理像素（×3）"];
+        NSArray<NSString *> *subs = @[@"UIScreen.bounds 的坐标，多数注入实现用这个",
+                                      @"x÷宽、y÷高，超范围会被截断到 1.0",
+                                      @"点坐标乘屏幕 scale，Retina 屏上偶见"];
+        c.textLabel.text = names[ip.row];
+        c.detailTextLabel.text = subs[ip.row];
+        if (TDCoordModeCurrent() == (TDCoordMode)ip.row) {
+            c.accessoryType = UITableViewCellAccessoryCheckmark;
+        }
     } else {
-        if (_trialLeft > 0) {
             c.textLabel.text = [NSString stringWithFormat:@"%ld 秒后注入… 现在切抖音", (long)_trialLeft];
             c.textLabel.textColor = [UIColor colorWithRed:1.0 green:0.62 blue:0.15 alpha:1.0];
             c.detailTextLabel.text = @"按 Home 切过去等着";
@@ -357,6 +605,15 @@
         [self presentViewController:a animated:YES completion:nil];
         return;
     }
+    if (ip.section == 2) {
+        TDSetCoordMode(ip.row);
+        [tv reloadData];
+        return;
+    }
+    if (ip.section == 3) {
+        [self startTrial];
+        return;
+    }
     [self startTrial];
 }
 
@@ -388,8 +645,8 @@
 }
 
 - (void)refreshTrialSection {
-    if (self.tableView.numberOfSections < 3) return;
-    [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:2]
+    if (self.tableView.numberOfSections < 4) return;
+    [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:3]
                   withRowAnimation:UITableViewRowAnimationNone];
 }
 

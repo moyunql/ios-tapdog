@@ -148,6 +148,21 @@ typedef NS_ENUM(NSInteger, TDInjectVariant) {
     TDInjectVariantAutoSender = 2,   // 读本机 HID 服务的真实 senderID
 };
 
+/// 注入坐标用哪个坐标系。事件到底被系统当成哪一种，各机型/系统版本不一样，
+/// 表现就是「点中间却落到右下角」这类复位式错位。
+typedef NS_ENUM(NSInteger, TDCoordMode) {
+    TDCoordModePoint      = 0,   // 414×736 点（UIScreen.bounds，默认）
+    TDCoordModeNormalized = 1,   // 归一化 0.0~1.0
+    TDCoordModePixel      = 2,   // 物理像素 1242×2208（点 × scale）
+};
+
+void TDSetCoordMode(NSInteger m);
+NSInteger TDCoordModeCurrent(void);
+NSString *TDCoordModeDesc(void);
+/// 按当前模式把屏幕点坐标转成「要写进事件的坐标」，标定页用它做反推
+CGPoint TDCoordToEventSpace(CGPoint p);
+CGPoint TDScreenPointFromEventSpace(CGPoint e);
+
 void TDSetInjectVariant(NSInteger v);
 NSInteger TDInjectVariantCurrent(void);
 void TDSetInjectBuiltIn(BOOL on);
