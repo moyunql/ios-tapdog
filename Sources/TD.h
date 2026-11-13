@@ -94,6 +94,19 @@ BOOL TDInjectSampleSenderOn(void);
 void TDSetBestInjectPlan(NSInteger i);
 NSInteger TDBestInjectPlan(void);
 
+#pragma mark - 硬件按键（音量键）
+
+/// 物理按键回调。usage: 0xE9 = 音量上，0xEA = 音量下。
+/// 走的是 HID 监听（和触摸同一条），所以 App 在后台也收得到。
+void TDSetHIDKeyHandler(void (^ _Nullable h)(NSInteger usage));
+/// 收到过多少次按键事件（诊断用：一直是 0 说明这条路没通，得靠音量 KVO 兜底）
+NSInteger TDHIDKeyEventCount(void);
+NSInteger TDHIDLastKeyUsage(void);
+
+/// 接管音量键：上 = 开始录制，下 = 停止并保存；同时把音量钉在接管时的值。
+void TDKeysInstall(void);
+NSString *TDKeysStatus(void);
+
 #pragma mark - 截屏
 
 BOOL TDcaptureReady(void);
@@ -116,12 +129,23 @@ TDMatch * _Nullable TDfindImage(UIImage *tpl, double threshold, double minScale,
 
 #pragma mark - 脚本
 
-/// 一条脚本 = 一串步骤
+/// 一条脚本 = 一串步骤，可以是「坐标步骤 + 识图步骤」混在一起的混合模式
 /// 步骤格式（均带 gap：与上一步之间的间隔毫秒）：
 ///   {"t":"tap","x":207,"y":660,"gap":0}
 ///   {"t":"long","x":207,"y":660,"ms":800,"gap":0}
 ///   {"t":"swipe","x1":207,"y1":600,"x2":207,"y2":200,"ms":400,"gap":0}
 ///   {"t":"wait","ms":500,"gap":0}
+///   {"t":"find","tpl":"tpl_1699.png","th":0.85,"dx":0,"dy":0,
+///    "to":1500,"ms":0,"gap":0}        // 识图点击；ms>0 则按长按执行，to=超时毫秒
+/// 每个步骤都可以带随机化参数：
+///   {"rnd":{"p":1.0,"px":8,"pr":[0.3,1.0],"rd":[0.2,1.2],"ms":0.25,"gap":0.4}}
+///   p  = 随机率 0~1（这一步有多大比例启用随机）
+///   px = 位置随机半径（点，0 表示不随机）
+///   pr = 压力范围（不开就不写这个键）
+///   rd = 触摸半径范围（同上）
+///   ms = 时长抖动比例（±ms×100%）
+///   gap = 间隔抖动比例
+/// 步骤本身还可以带 "run"：执行概率 0~1（小于 1 时这一步有机会整步跳过、不点）
 @interface TDScript : NSObject
 @property (nonatomic, copy) NSString *name;
 @property (nonatomic) NSTimeInterval createdAt;
@@ -144,6 +168,11 @@ TDMatch * _Nullable TDfindImage(UIImage *tpl, double threshold, double minScale,
 - (void)save;
 - (void)load;
 @end
+
+/// 脚本编辑页（混合模式）：一条脚本的全部步骤列成表，
+/// 每行可改坐标、可切成识图、可单独设随机率与随机度。
+/// 返回的是导航控制器，直接 present 即可。
+UIViewController *TDCreateScriptEditVC(TDScript *script);
 
 #pragma mark - 录制（全屏取点层，不依赖私有 HID 监听）
 
@@ -324,6 +353,9 @@ void TDFloatResetPosition(void);
 
 /// 托管窗口本体（录制取点层要挂到它的 rootViewController 上）
 UIWindow * _Nullable TDFloatWindow(void);
+/// 悬浮条在屏幕上的可点区域。录制时用它把「按停止那一下」过滤掉，
+/// 否则停止录制这个触摸本身会被录成脚本的最后一步。
+CGRect TDFloatTouchRect(void);
 /// 把托管窗口铺满全屏 / 缩回悬浮条（取点录制用）
 void TDFloatSetFullScreen(BOOL on);
 BOOL TDFloatIsFullScreen(void);

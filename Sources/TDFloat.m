@@ -2,7 +2,10 @@
 #import <QuartzCore/QuartzCore.h>
 
 // ---------------------------------------------------------------------------
-// 悬浮条（三个按钮：▶ 开始执行 / ■ 停止执行 / ◎ 注入自检）
+// 悬浮条（两个按钮：▶ 开始执行 / ■ 停止执行）
+//
+// ◎ 那个注入自检球已经去掉：录制改用音量键（上录下停），按键验证有注入自检页，
+// 它在屏幕上只剩「被误点」这一个作用，留着反而碍事。
 //
 // ★ 托管窗口必须贴合按钮本身，绝不能铺满全屏：
 //   跨进程托管窗口的触摸命中在窗口服务器侧完成，我们进程里 hitTest 返回
@@ -13,8 +16,6 @@
 // 交互：
 //   点 ▶  = 开始执行选中脚本（录制中则结束录制并保存）
 //   点 ■  = 停止执行 / 停止录制并保存
-//   点 ◎  = 3 秒后往屏幕中间注入一次点击（验证能不能点到别的 App）
-//   长按 ◎ = 3 秒后从下方往上方滑一次（不录制也能验证滑动）
 //   长按 ▶ = 穿透录制：蒙版不拦触摸，边刷抖音边录（推荐）
 //   长按 ■ = 取点录制：全屏取样，抖音会被挡住，纯标点用
 //   拖动  = 挪位置（位置记在 NSUserDefaults；取点模式下自动禁用，否则会把取点层拖走）
@@ -24,7 +25,7 @@ NSString * const TDDataChangedNotification = @"TDDataChangedNotification";
 
 static const CGFloat kTDBallSize = 54.0;
 static const CGFloat kTDBallGap  = 5.0;
-static const CGFloat kTDOverlayW = 187.0;   // 7 + 54 + 5 + 54 + 5 + 54 + 8
+static const CGFloat kTDOverlayW = 128.0;   // 7 + 54 + 5 + 54 + 8
 static const CGFloat kTDOverlayH = 70.0;    // 8 + 54 + 8
 
 static NSString * const kTDBallPosX = @"tdBallCenterX";
@@ -37,8 +38,6 @@ static UIView *gStartView = nil;
 static UILabel *gStartLabel = nil;
 static UIView *gStopView = nil;
 static UILabel *gStopLabel = nil;
-static UIView *gTestView = nil;
-static UILabel *gTestLabel = nil;
 
 #pragma mark - 位置
 
@@ -94,11 +93,6 @@ void TDFloatRefresh(void) {
         gStopView.backgroundColor = [UIColor colorWithRed:0.90 green:0.22 blue:0.22 alpha:0.95];
         gStopLabel.text = @"■";
         gStopView.alpha = 0.45;
-    }
-    if (gTestView) {
-        gTestView.backgroundColor = [UIColor colorWithRed:0.42 green:0.36 blue:0.86 alpha:0.95];
-        gTestLabel.text = @"◎";
-        gTestView.alpha = (r.recording || e.running) ? 0.45 : 1;
     }
 }
 
@@ -171,33 +165,6 @@ static void TDFloatStartLiveRecord(void) {
     TDFloatRefresh();
 }
 
-/// 注入自检：3 秒后往屏幕中间点一下。
-/// 在抖音里按它 —— 视频暂停/继续，说明注入真的到得了别的 App。
-static void TDFloatDoTestTap(void) {
-    CGSize sb = [UIScreen mainScreen].bounds.size;
-    CGPoint c = CGPointMake(sb.width / 2.0, sb.height * 0.45);
-    TDLog(@"3 秒后往屏幕中间 (%.0f, %.0f) 注入一次点击…", c.x, c.y);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        TDtap(c.x, c.y);
-        TDLog(@"已注入点击 (%.0f, %.0f) · %@", c.x, c.y, TDhidStatus());
-    });
-}
-
-/// ◎ 长按 = 3 秒后从屏幕下方往上方滑一次。
-/// 有它就不用先录一段才能测滑动：在抖音里长按，看它会不会翻到下一条。
-static void TDFloatDoTestSwipe(void) {
-    CGSize sb = [UIScreen mainScreen].bounds.size;
-    CGPoint a = CGPointMake(sb.width * 0.5, sb.height * 0.72);
-    CGPoint b = CGPointMake(sb.width * 0.5, sb.height * 0.28);
-    TDLog(@"3 秒后从 (%.0f, %.0f) 上滑到 (%.0f, %.0f)…", a.x, a.y, b.x, b.y);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        TDswipe(a, b, 0.30);
-        TDLog(@"已注入上滑 (%.0f,%.0f)→(%.0f,%.0f) · %@", a.x, a.y, b.x, b.y, TDhidStatus());
-    });
-}
-
 #pragma mark - 球体视图
 
 @interface TDBallVC : UIViewController <UIGestureRecognizerDelegate>
@@ -258,32 +225,6 @@ static void TDFloatDoTestSwipe(void) {
     gStopView.tag = 2;
     gStopLabel.text = @"■";
 
-    gTestView = [self makeBallAtX:7 + (kTDBallSize + kTDBallGap) * 2];
-    gTestLabel = (UILabel *)gTestView.subviews.firstObject;
-    gTestView.tag = 3;
-    gTestLabel.text = @"◎";
-
-    // ◎ 点 = 试点击；◎ 长按 = 试滑动。
-    // 滑动没法在自家界面里验证（要滑的是抖音的列表），所以给它一个
-    // 不用录制、直接打一次的入口，出问题能立刻分清是「滑动构造不对」还是「录制不对」。
-    //
-    // 注意：makeBallAtX 给每个球都挂了「长按=录制」的手势，
-    // 这里必须先把 ◎ 上那个摘掉，否则长按 ◎ 会同时开录制又打滑动。
-    for (UIGestureRecognizer *gr in [gTestView.gestureRecognizers copy]) {
-        if ([gr isKindOfClass:[UILongPressGestureRecognizer class]]) {
-            [gTestView removeGestureRecognizer:gr];
-        }
-    }
-    UILongPressGestureRecognizer *tlp =
-        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(onTestLong:)];
-    tlp.minimumPressDuration = 0.7;
-    [gTestView addGestureRecognizer:tlp];
-    for (UIGestureRecognizer *gr in gTestView.gestureRecognizers) {
-        if ([gr isKindOfClass:[UITapGestureRecognizer class]]) {
-            [gr requireGestureRecognizerToFail:tlp];
-        }
-    }
-
     // 拖动挪位置。这一条只在「悬浮条」形态下成立：
     // 取点模式窗口是铺满全屏的，pan 会认全屏任意一处滑动，把整个窗口
     // 连同取点层一起拖走（用户看到的「滑动时悬浮窗跟着滑」就是这个）。
@@ -300,7 +241,6 @@ static void TDFloatDoTestSwipe(void) {
     UIView *v = g.view;
     if (v.tag == 1) TDFloatDoStart();
     else if (v.tag == 2) TDFloatDoStop();
-    else if (v.tag == 3) TDFloatDoTestTap();
 }
 
 - (void)onLong:(UILongPressGestureRecognizer *)g {
@@ -314,10 +254,6 @@ static void TDFloatDoTestSwipe(void) {
     NSInteger tag = g.view.tag;
     if (tag == 1)      TDFloatStartLiveRecord();
     else if (tag == 2) TDFloatToggleRecord();
-}
-
-- (void)onTestLong:(UILongPressGestureRecognizer *)g {
-    if (g.state == UIGestureRecognizerStateBegan) TDFloatDoTestSwipe();
 }
 
 /// 屏幕坐标（用 windowScene 坐标系，窗口移动时不会被抵消）
@@ -546,6 +482,15 @@ void TDFloatSetVisible(BOOL on) {
 }
 
 BOOL TDFloatVisible(void) { return gBallWindow && !gBallWindow.hidden; }
+
+/// 悬浮条在屏幕上占的那块地方（屏幕坐标）。
+/// 录制时要拿它过滤触摸：用户按 ■ 停止那一下落在这块里，
+/// 不过滤就会被录成脚本最后一步 —— 这就是「点停止也录进去了」。
+CGRect TDFloatTouchRect(void) {
+    if (!gBallWindow || gBallWindow.hidden) return CGRectNull;
+    if (gFullScreen) return CGRectNull;     // 全屏是取点层本身，不能过滤
+    return CGRectInset(gBallWindow.frame, -4, -4);
+}
 
 void TDFloatResetPosition(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];

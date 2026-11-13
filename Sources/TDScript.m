@@ -30,6 +30,8 @@ static NSString *TDScriptsPath(void) {
         if ([t isEqualToString:@"wait"] || [t isEqualToString:@"long"] ||
             [t isEqualToString:@"swipe"] || [t isEqualToString:@"gesture"]) {
             total += [s[@"ms"] doubleValue] / 1000.0;
+        } else if ([t isEqualToString:@"find"]) {
+            total += 0.45 + [s[@"to"] doubleValue] / 1000.0 * 0.5;
         } else {
             total += 0.08;
         }
@@ -38,17 +40,19 @@ static NSString *TDScriptsPath(void) {
 }
 
 - (NSString *)summary {
-    NSInteger tap = 0, swp = 0, lng = 0;
+    NSInteger tap = 0, swp = 0, lng = 0, img = 0;
     for (NSDictionary *s in _steps) {
         NSString *t = s[@"t"];
         if ([t isEqualToString:@"tap"]) tap++;
         else if ([t isEqualToString:@"swipe"]) swp++;
         else if ([t isEqualToString:@"long"]) lng++;
         else if ([t isEqualToString:@"gesture"]) swp++;
+        else if ([t isEqualToString:@"find"]) img++;
     }
     NSInteger secs = (NSInteger)llround([self duration]);
-    return [NSString stringWithFormat:@"%lu 步 · 点%ld 滑%ld 长%ld · %ld:%02ld",
-            (unsigned long)_steps.count, (long)tap, (long)swp, (long)lng,
+    NSString *mix = img > 0 ? [NSString stringWithFormat:@" · 识图%ld", (long)img] : @"";
+    return [NSString stringWithFormat:@"%lu 步 · 点%ld 滑%ld 长%ld%@ · %ld:%02ld",
+            (unsigned long)_steps.count, (long)tap, (long)swp, (long)lng, mix,
             (long)(secs / 60), (long)(secs % 60)];
 }
 
@@ -82,7 +86,16 @@ static NSString *TDScriptsPath(void) {
                 [st[@"ms"] doubleValue]];
     }
     if ([t isEqualToString:@"wait"])  return [NSString stringWithFormat:@"等待 %.0fms", [st[@"ms"] doubleValue]];
-    if ([t isEqualToString:@"find"])  return [NSString stringWithFormat:@"识图 %@ ≥%.2f", st[@"tpl"], [st[@"th"] doubleValue]];
+    if ([t isEqualToString:@"find"]) {
+        NSString *name = st[@"tpl"];
+        if (![name isKindOfClass:[NSString class]] || name.length == 0) name = @"(未选模板)";
+        if ([name hasPrefix:@"tpl_"]) name = [name substringToIndex:MIN((NSUInteger)13, name.length)];
+        BOOL lng = [st[@"ms"] doubleValue] > 0;
+        return [NSString stringWithFormat:@"识图%@ %@ ≥%.2f · 偏(%+.0f,%+.0f)",
+                lng ? @"长按" : @"点击", name,
+                st[@"th"] ? [st[@"th"] doubleValue] : 0.85,
+                [st[@"dx"] doubleValue], [st[@"dy"] doubleValue]];
+    }
     return t ?: @"?";
 }
 

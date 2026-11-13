@@ -28,6 +28,7 @@ libs=(
   -framework CoreGraphics
   -framework QuartzCore
   -framework AVFoundation
+  -framework MediaPlayer
   -framework CoreFoundation
   -Wl,-undefined,dynamic_lookup
   -Wl,-headerpad_max_install_names

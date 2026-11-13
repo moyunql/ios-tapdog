@@ -101,6 +101,11 @@ extern UIViewController *TDCreateMainVC(void);
     [TDEngine shared].jetsamStatus = TDBypassJetsam();
     TDFloatInstall();
 
+    // 音量键接管：上 = 开始录制，下 = 停止并保存。
+    // 这里会顺手把 HID 监听从常驻打开 —— 按键事件和触摸走的是同一个客户端，
+    // 监听不跑就收不到按键，只能退回音量 KVO 兜底。
+    TDKeysInstall();
+
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(didEnterBackground)
                                                  name:UIApplicationDidEnterBackgroundNotification

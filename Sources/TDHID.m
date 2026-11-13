@@ -677,6 +677,18 @@ static volatile int32_t gMonTotal = 0;
 static volatile int32_t gEchoCount = 0;
 static volatile int gEchoActive = 0;
 
+// 物理按键（音量键）这条路和触摸共用同一个监听客户端。
+// 有它就不用去 KVO 音量、也不用真的让音量变化 —— App 在后台照样收得到。
+static void (^gKeyHandler)(NSInteger usage) = NULL;
+static volatile int32_t gKeyCount = 0;
+static volatile int32_t gKeyLastUsage = 0;
+
+void TDSetHIDKeyHandler(void (^h)(NSInteger usage)) {
+    gKeyHandler = [h copy];
+}
+NSInteger TDHIDKeyEventCount(void) { return (NSInteger)gKeyCount; }
+NSInteger TDHIDLastKeyUsage(void) { return (NSInteger)gKeyLastUsage; }
+
 void TDHIDEchoReset(void) { gEchoCount = 0; gEchoActive = 1; }
 void TDHIDEchoStop(void) { gEchoActive = 0; }
 NSInteger TDHIDMonitorEchoCount(void) { return (NSInteger)gEchoCount; }
@@ -754,6 +766,21 @@ double TDHIDTraceSeconds(uint64_t t) {
 /// 纯 C：不碰 ObjC、不动 UIKit
 static void TDSampleHandler(void *target, void *refcon, IOHIDEventQueueRef q, IOHIDEventRef e) {
     if (!e) return;
+
+    // 物理按键：音量上 0xE9 / 音量下 0xEA（HID consumer page）。
+    // mask 非 0 表示按下；松手那一帧不再触发，免得一次按键算两回。
+    if (IOHIDEventGetType(e) == kIOHIDEventTypeButton) {
+        uint32_t num  = (uint32_t)IOHIDEventGetIntegerValue(e, kIOHIDEventFieldButtonNumber);
+        uint32_t mask = (uint32_t)IOHIDEventGetIntegerValue(e, kIOHIDEventFieldButtonMask);
+        gKeyLastUsage = (int32_t)num;
+        if (mask != 0) {
+            __sync_fetch_and_add(&gKeyCount, 1);
+            void (^h)(NSInteger) = gKeyHandler;
+            if (h) h((NSInteger)num);
+        }
+        return;
+    }
+
     if (IOHIDEventGetType(e) != kIOHIDEventTypeDigitizer) return;
     __sync_fetch_and_add(&gMonTotal, 1);
     if (gEchoActive) __sync_fetch_and_add(&gEchoCount, 1);
@@ -1252,6 +1279,8 @@ NSString *TDHIDDiagReport(void) {
     [s appendFormat:@"权限 %@\n", TDEntitlementSummary()];
     [s appendFormat:@"%@\n", TDCodeSignReport()];
     [s appendFormat:@"%@\n", TDHIDSampleGeometry()];
+    // 音量键这条路：一直为 0 说明 button 事件不进这个客户端，只能靠音量 KVO 兜底
+    [s appendFormat:@"%@\n", TDKeysStatus()];
     // 回显只能证明「监听到了物理转换器自己发的事件」，看不到本进程 dispatch 的；
     // 所以这个数字是 0 时不能反推「事件被拦」，只能反推「没有回环」。
     [s appendFormat:@"回显 %ld 个（监听侧看不到本进程 dispatch，0 不代表被拦）",

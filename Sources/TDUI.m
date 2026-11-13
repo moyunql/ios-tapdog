@@ -1647,7 +1647,7 @@ static NSString *TDCalibModeName(NSInteger m) {
             TDLog(@"穿透录制启动失败：%@", [r status]);
             return;
         }
-        TDLog(@"录制中：直接在抖音里点/滑，蒙版只画轨迹不挡触摸；回来点停止保存");
+        TDLog(@"录制中：抖音里直接点/滑；按音量下键结束保存（音量上键也能开始录）");
         [self startLiveCounter];
     } else {
         TDScript *s = [[TDScriptStore shared] selectedScript];
@@ -1667,7 +1667,7 @@ static NSString *TDCalibModeName(NSInteger m) {
         if (!ss) { [tm invalidate]; return; }
         TDRecorder *r = [TDRecorder shared];
         if (!r.recording) { [ss stopLiveCounter]; return; }
-        ss->_log.text = [NSString stringWithFormat:@"录制中 · 已记录 %ld 步（回 App 点「停止录制」保存）",
+        ss->_log.text = [NSString stringWithFormat:@"录制中 · 已记录 %ld 步（按音量下键结束保存）",
                          (long)r.eventCount];
     }];
 }
@@ -1703,7 +1703,7 @@ static NSString *TDCalibModeName(NSInteger m) {
 }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    return s == 0 ? [TDScriptStore shared].scripts.count : 3;
+    return s == 0 ? [TDScriptStore shared].scripts.count : 4;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
@@ -1726,6 +1726,12 @@ static NSString *TDCalibModeName(NSInteger m) {
             c.textLabel.text = @"＋ 新建脚本";
             c.detailTextLabel.text = @"从空白开始，用录制往里加步骤";
         } else if (ip.row == 1) {
+            TDScript *sel = [[TDScriptStore shared] selectedScript];
+            c.textLabel.text = @"✎ 编辑当前脚本";
+            c.detailTextLabel.text = sel
+                ? [NSString stringWithFormat:@"%@ · 每步可改坐标/识图/随机", [sel summary]]
+                : @"还没有脚本";
+        } else if (ip.row == 2) {
             c.textLabel.text = @"注入自检";
             c.detailTextLabel.text = [NSString stringWithFormat:@"点得动吗 · 已注入 %ld 次",
                                       (long)TDInjectCount()];
@@ -1749,11 +1755,22 @@ static NSString *TDCalibModeName(NSInteger m) {
         [tv reloadData];
         [self refreshButtons];
         TDFloatRefresh();
+        // 点脚本 = 进编辑页。以前点了只能选中，改一步得重新录一遍。
+        TDScript *sc = [TDScriptStore shared].scripts[ip.row];
+        [self.navigationController presentViewController:TDCreateScriptEditVC(sc)
+                                                animated:YES completion:nil];
     } else if (ip.row == 0) {
-        [[TDScriptStore shared] createScript];
+        TDScript *sc = [[TDScriptStore shared] createScript];
         [tv reloadData];
         [self refreshButtons];
+        [self.navigationController presentViewController:TDCreateScriptEditVC(sc)
+                                                animated:YES completion:nil];
     } else if (ip.row == 1) {
+        TDScript *sc = [[TDScriptStore shared] selectedScript];
+        if (!sc) return;
+        [self.navigationController presentViewController:TDCreateScriptEditVC(sc)
+                                                animated:YES completion:nil];
+    } else if (ip.row == 2) {
         [self.navigationController pushViewController:[TDSelfTestVC new] animated:YES];
     } else {
         [self editSettings];

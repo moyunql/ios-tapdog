@@ -424,6 +424,7 @@ static NSString *gStatus = @"就绪（全屏取点）";
     NSInteger _liveSpace;                   // -1 未知 / 0 归一化 / 1 点 / 2 像素
     NSTimer *_liveTimer;
     NSMutableArray<NSDictionary *> *_liveSteps;
+    BOOL _liveIgnore;                       // 这一笔落在我们自己身上（悬浮条/本 App），不录
 }
 @property (nonatomic, readwrite) BOOL recording;
 - (void)liveTick;
@@ -555,6 +556,16 @@ static NSString *gStatus = @"就绪（全屏取点）";
     CGFloat sc = [UIScreen mainScreen].scale;
     if (scr.width < 1 || sc < 1) sc = 1;
 
+    // 人在自己 App 里的时候，屏幕上所有触摸都是我们的按钮 —— 一律不录。
+    // 切到抖音后 App 变 inactive，录制照常。
+    if ([UIApplication sharedApplication].applicationState == UIApplicationStateActive) {
+        _liveCursor = total;
+        _liveTrack = nil;
+        _liveIgnore = NO;
+        return;
+    }
+    CGRect selfRect = TDFloatTouchRect();
+
     for (NSInteger i = _liveCursor; i < total; i++) {
         CGFloat rx = 0, ry = 0;
         double ts = 0;
@@ -576,15 +587,28 @@ static NSString *gStatus = @"就绪（全屏取点）";
 
         double sec = TDHIDTraceSeconds((uint64_t)ts);
 
+        CGPoint pt = CGPointMake(x, y);
+
         if (down) {
+            if (_liveIgnore) continue;
             if (!_liveTrack) {
+                // 落在悬浮条上的按下（用户按 ■ 停止那一下）不算一步
+                if (!CGRectIsNull(selfRect) && CGRectContainsPoint(selfRect, pt)) {
+                    _liveIgnore = YES;
+                    continue;
+                }
                 _liveTrack = [NSMutableArray array];
                 _liveStartTs = sec;
             }
-            [_liveTrack addObject:[NSValue valueWithCGPoint:CGPointMake(x, y)]];
-            TDMaskSetLive(CGPointMake(x, y), YES);
+            [_liveTrack addObject:[NSValue valueWithCGPoint:pt]];
+            TDMaskSetLive(pt, YES);
         } else {
-            [self liveFinishTrackAt:CGPointMake(x, y) time:sec];
+            if (_liveIgnore) {
+                _liveIgnore = NO;
+                _liveTrack = nil;
+                continue;
+            }
+            [self liveFinishTrackAt:pt time:sec];
         }
     }
     _liveCursor = total;
@@ -706,6 +730,7 @@ static NSString *gStatus = @"就绪（全屏取点）";
         TDMaskHide();
         _live = NO;
         _liveTrack = nil;
+        _liveIgnore = NO;
     }
 
     self.recording = NO;
@@ -726,6 +751,32 @@ static NSString *gStatus = @"就绪（全屏取点）";
     [[NSNotificationCenter defaultCenter] postNotificationName:TDDataChangedNotification object:nil];
 }
 
+/// 末尾若干步如果正好落在悬浮条上，说明是「按停止」那一下，
+/// 逐帧过滤偶尔会漏（按下和抬起之间窗口移动/重建），这里再兜一次。
+static void TDDropTrailingSelfTaps(NSMutableArray<NSDictionary *> *steps) {
+    CGRect r = TDFloatTouchRect();
+    if (CGRectIsNull(r)) return;
+    NSInteger guard = 0;
+    while (steps.count > 0 && guard++ < 4) {
+        NSDictionary *d = steps.lastObject;
+        NSString *t = d[@"t"];
+        CGPoint p = CGPointZero;
+        if ([t isEqualToString:@"tap"] || [t isEqualToString:@"long"]) {
+            p = CGPointMake([d[@"x"] doubleValue], [d[@"y"] doubleValue]);
+        } else if ([t isEqualToString:@"swipe"]) {
+            p = CGPointMake([d[@"x1"] doubleValue], [d[@"y1"] doubleValue]);
+        } else if ([t isEqualToString:@"gesture"]) {
+            NSArray *pts = d[@"pts"];
+            NSArray *last = pts.lastObject;
+            if (last.count >= 2) p = CGPointMake([last[0] doubleValue], [last[1] doubleValue]);
+        } else {
+            break;
+        }
+        if (!CGRectContainsPoint(r, p)) break;
+        [steps removeLastObject];
+    }
+}
+
 - (void)finishAndSave {
     if (!self.recording) return;
 
@@ -737,6 +788,7 @@ static NSString *gStatus = @"就绪（全屏取点）";
     } else {
         steps = [gPicker.steps mutableCopy] ?: [NSMutableArray array];
     }
+    TDDropTrailingSelfTaps(steps);
     [self teardown];
     _liveSteps = nil;
 
