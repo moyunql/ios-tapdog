@@ -14,6 +14,12 @@ void TDswipe(CGPoint from, CGPoint to, NSTimeInterval sec);
 /// 多点轨迹手势，points 为 NSValue(CGPoint)，sec 为总时长
 void TDgesture(NSArray<NSValue *> *points, NSTimeInterval sec);
 
+/// 把「按下去但没抬起来」的手指收回来。
+/// up 事件一旦被系统丢掉，屏幕上会留一个幽灵按压点，之后连人工点按都点不动，
+/// 只有杀掉 App 才好 —— 这个函数就是用来现场救的。
+void TDReleaseStuckTouch(void);
+BOOL TDHasStuckTouch(void);
+
 #pragma mark - 截屏
 
 BOOL TDcaptureReady(void);

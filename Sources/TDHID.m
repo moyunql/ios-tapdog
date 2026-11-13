@@ -289,20 +289,26 @@ void TDSetInjectHandLegacy(BOOL on) {
     [[NSUserDefaults standardUserDefaults] setBool:on forKey:kHandLegacyKey];
 }
 
-static IOHIDEventRef TDCreateHand(uint32_t mask, uint64_t ts, CGPoint e, BOOL touch) {
+static IOHIDEventRef TDCreateHand(uint32_t mask, uint64_t ts, CGPoint e, BOOL touch,
+                                  uint32_t identity) {
     BOOL legacy = TDInjectHandLegacy();
+    // 注意 range / touch 这两个参数在这里**必须恒为 1/true**。
+    // hand 是「这只手」，tap 期间手一直在屏幕上；只有 finger 子事件才在 up 时离开。
+    // 之前跟着 touch 一起变 0，结果是 up 事件不被系统接受 —— 手指永远释放不掉，
+    // 屏幕上留一个幽灵按压点，之后连真人手点都点不动（整机卡住）。
     IOHIDEventRef hand = IOHIDEventCreateDigitizerEvent(kCFAllocatorDefault,
                                                        ts,
                                                        kIOHIDDigitizerTransducerTypeHand,
-                                                       0, 0,
+                                                       0, identity,
                                                        legacy ? kIOHIDDigitizerEventTouch : mask,
                                                        0,
                                                        legacy ? 0.0 : (IOHIDFloat)e.x,
                                                        legacy ? 0.0 : (IOHIDFloat)e.y,
                                                        0.0, 0.0, 0.0,
-                                                       touch ? 1 : 0,     // range
-                                                       touch,             // touch
+                                                       1,                 // range：手始终在感应范围内
+                                                       true,              // touch：手始终在屏幕上
                                                        0);
+    (void)touch;
     if (!hand) return NULL;
     IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
     IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerTiltX,
@@ -311,6 +317,10 @@ static IOHIDEventRef TDCreateHand(uint32_t mask, uint64_t ts, CGPoint e, BOOL to
     IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerAltitude, 1);
     return hand;
 }
+
+// 当前还按在屏幕上的那根手指。up 一旦丢了，靠它把手指收回来。
+static volatile uint32_t gActiveIdentity = 0;
+static CGFloat gActiveX = 0, gActiveY = 0;
 
 // 每次手势用一个新的 identity。
 // 固定 identity 时，只要有一次 up 没被系统收下，后面所有 down 都会被当成
@@ -329,11 +339,20 @@ static void TDEmit(uint32_t mask, BOOL touch, CGFloat x, CGFloat y, uint32_t ide
     BOOL isDown = (mask & kIOHIDDigitizerEventTouch) && touch;
     if (isDown) __sync_fetch_and_add(&gInjectCount, 1);
 
+    // 记下「当前按着的那根手指」，up 丢了随时能收回来
+    if (isDown) {
+        gActiveIdentity = identity;
+        gActiveX = x;
+        gActiveY = y;
+    } else if (!touch && (mask & kIOHIDDigitizerEventTouch)) {
+        gActiveIdentity = 0;
+    }
+
     // 屏幕点 → 事件坐标空间（点 / 归一化 / 像素）
     CGPoint e = TDCoordToEventSpace(CGPointMake(x, y));
 
     uint64_t ts = mach_absolute_time();
-    IOHIDEventRef hand = TDCreateHand(mask, ts, e, touch);
+    IOHIDEventRef hand = TDCreateHand(mask, ts, e, touch, identity);
     if (!hand) return;
 
     int isTouch = touch ? 1 : 0;
@@ -382,6 +401,20 @@ static void TDShowFeedback(CGFloat x, CGFloat y) {
         fn(x, y, YES);
     });
 }
+
+void TDReleaseStuckTouch(void) {
+    uint32_t ident = gActiveIdentity;
+    if (ident == 0) return;
+    CGFloat x = gActiveX, y = gActiveY;
+    // 同一个 identity 连发几次 up，直到系统认下来
+    for (int i = 0; i < 3; i++) {
+        TDEmit(kMaskUp, NO, x, y, ident);
+        usleep(25000);
+    }
+    gActiveIdentity = 0;
+}
+
+BOOL TDHasStuckTouch(void) { return gActiveIdentity != 0; }
 
 void TDtap(CGFloat x, CGFloat y) {
     uint32_t ident = TDNextIdentity();

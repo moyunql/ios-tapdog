@@ -199,6 +199,19 @@ static NSString *TDCalibModeName(NSInteger m) {
     ]];
 }
 
+// 标定中途返回时把现场还原（不然悬浮球就一直藏着，窗口状态也可能没恢复）
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    if (_running) {
+        _running = NO;
+        _token++;
+        [_catcher removeFromSuperview];
+        _catcher = nil;
+        if (_floatWasVisible) TDFloatSetVisible(YES);
+        TDSetCoordMode(TDCoordModePoint);   // 半截的标定结果不作数
+    }
+}
+
 - (void)say:(NSString *)fmt, ... {
     va_list ap;
     va_start(ap, fmt);
@@ -413,7 +426,14 @@ static NSString *TDCalibModeName(NSInteger m) {
     c.detailTextLabel.text = ip.row < (NSInteger)_values.count ? _values[ip.row] : @"";
     c.accessoryType = UITableViewCellAccessoryNone;
     c.selectionStyle = UITableViewCellSelectionStyleNone;
-    if (ip.row == 7) {
+    if (ip.row == 0) {
+        // 第 1 行兼做「救急」：up 丢了会留一根幽灵手指，整机连人工点按都失灵
+        if (TDHasStuckTouch()) {
+            c.detailTextLabel.text = @"⚠️ 有手指卡在屏幕上 · 点这里释放";
+            c.detailTextLabel.textColor = TD_RED;
+            c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        }
+    } else if (ip.row == 7) {
         c.detailTextLabel.text = [NSString stringWithFormat:@"已注入 %ld 次 · 验证注入和坐标",
                                   (long)TDInjectCount()];
         c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
@@ -436,6 +456,19 @@ static NSString *TDCalibModeName(NSInteger m) {
 
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
+    if (ip.row == 0) {
+        BOOL had = TDHasStuckTouch();
+        TDReleaseStuckTouch();
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:@"释放触摸"
+                             message:(had ? @"已把卡住的那根手指抬起来，现在手点应该恢复正常。"
+                                          : @"当前没有检测到卡住的手指。")
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+        [self refresh];
+        return;
+    }
     if (ip.row == 7) {
         [self.navigationController pushViewController:[TDSelfTestVC new] animated:YES];
     } else if (ip.row == 9) {

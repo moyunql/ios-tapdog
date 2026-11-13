@@ -127,6 +127,18 @@ extern UIViewController *TDCreateMainVC(void);
             [[TDEngine shared] stop];
             TDLog(@"回到 App，已停止回放");
         }
+        // 回放中途被打断时，最后一次 up 可能没发出去 —— 手指会一直「按着」，
+        // 表现为整个屏幕连人手都点不动。回来先把它抬起来。
+        if (TDHasStuckTouch()) {
+            TDReleaseStuckTouch();
+            TDLog(@"回到 App，已释放卡住的触摸");
+        }
+        // 取点/标定中途退出时，托管窗口可能还留在全屏状态，
+        // 那一层盖在 App 上也同样会吞掉所有触摸，缩回去。
+        if (TDFloatIsFullScreen()) {
+            TDFloatSetFullScreen(NO);
+            TDLog(@"回到 App，托管窗口已从全屏缩回");
+        }
         TDFloatRefresh();
     });
 }
