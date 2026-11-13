@@ -1,0 +1,23 @@
+name: probe
+on: workflow_dispatch
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "ubuntu ok"
+
+  mac_old:
+    runs-on: macos-13
+    steps:
+      - run: sw_vers; xcodebuild -version
+
+  mac_latest:
+    runs-on: macos-latest
+    steps:
+      - run: sw_vers; xcodebuild -version
+
+  mac_15:
+    runs-on: macos-15
+    steps:
+      - run: sw_vers; xcodebuild -version
