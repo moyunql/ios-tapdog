@@ -1,5 +1,6 @@
 #import "TD.h"
 #import <QuartzCore/QuartzCore.h>
+#import <PhotosUI/PhotosUI.h>
 #import <math.h>
 
 // ---------------------------------------------------------------------------
@@ -51,6 +52,63 @@ static NSArray<NSString *> *TDTemplateList(void) {
     return out;
 }
 
+/// 重画成 .up 方向、scale=1、像素尺寸 = 原图像素尺寸。
+///
+/// 相册里的图几乎都带 orientation（相机拍的是 .right，截图倒可能是别的），
+/// 而 CGImageCreateWithImageInRect 是按「未旋转」的像素裁的：
+/// 不先摊平，框出来会是横的或者错位。所以进来的图一律先过这一道。
+static UIImage *TDImageUpright(UIImage *img) {
+    CGImageRef cg = img.CGImage;
+    if (!cg) return nil;
+    size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
+    if (w < 1 || h < 1) return nil;
+    if (img.imageOrientation == UIImageOrientationUp && fabs(img.scale - 1.0) < 0.001) return img;
+
+    UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat defaultFormat];
+    f.scale = 1.0;
+    f.opaque = YES;
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(w, h) format:f];
+    return [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [img drawInRect:CGRectMake(0, 0, w, h)];
+    }];
+}
+
+/// 相册图 → 屏幕像素尺度。mode: 0 本来就一致 / 1 已缩放 / 2 宽高比不像同一块屏
+///
+/// 模板匹配是单尺度的：模板里的像素必须和屏幕上那块的实际像素一样大，
+/// 差 10% 就几乎不可能过阈值。相册里现成的图多是被转发压过的（比如 828×1472），
+/// 所以先量一下屏幕真实像素尺寸，宽高比一致就等比缩回去。
+/// 注意不能用 414×736×3 = 1242×2208：Plus 机型是 3x 渲染后再降采样到 1080×1920，
+/// 直接乘 scale 会差 13%，必须用截屏实测。
+static UIImage *TDImageToScreenScale(UIImage *img, NSInteger *mode) {
+    if (mode) *mode = 0;
+    UIImage *up = TDImageUpright(img);
+    if (!up) return nil;
+    CGSize src = up.size;
+
+    UIImage *probe = TDscreenshot();
+    CGSize dst = probe ? probe.size : CGSizeZero;
+    if (dst.width < 1 || src.width < 1) return up;
+
+    CGFloat arSrc = src.width / MAX(1.0, src.height);
+    CGFloat arDst = dst.width / MAX(1.0, dst.height);
+    if (fabs(arSrc - arDst) > 0.02) {
+        if (mode) *mode = 2;
+        return up;
+    }
+    if (fabs(src.width - dst.width) < 1.5 && fabs(src.height - dst.height) < 1.5) return up;
+
+    UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat defaultFormat];
+    f.scale = 1.0;
+    f.opaque = YES;
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:dst format:f];
+    UIImage *out = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [up drawInRect:CGRectMake(0, 0, dst.width, dst.height)];
+    }];
+    if (out && mode) *mode = 1;
+    return out;
+}
+
 /// tpl_1699880000.png → 尾 6 位，够区分又不占地方
 static NSString *TDTplDisplay(NSString *file) {
     if (file.length < 4) return file ?: @"";
@@ -60,10 +118,84 @@ static NSString *TDTplDisplay(NSString *file) {
     return s;
 }
 
+// 相册选图。
+//
+// 用 PHPicker（iOS 14+）：它在独立进程里挑图，**不需要相册权限**，
+// 也就不会在 TrollStore 签名的包上卡在权限弹窗。老系统退回 UIImagePickerController，
+// 那条路要 NSPhotoLibraryUsageDescription（Info.plist 里已经有了）。
+// 选择期间必须有人强持有 self，否则 block 回调时对象已经没了。
+static NSMutableArray *gPhotoPicks = nil;
+
+@interface TDPhotoPick : NSObject <PHPickerViewControllerDelegate,
+                                  UIImagePickerControllerDelegate,
+                                  UINavigationControllerDelegate>
+@property (nonatomic, weak) UIViewController *host;
+@property (nonatomic, copy) void (^onImage)(UIImage *img);
+- (void)presentFrom:(UIViewController *)host;
+@end
+
+@implementation TDPhotoPick
+
+- (void)presentFrom:(UIViewController *)host {
+    self.host = host;
+    if (!gPhotoPicks) gPhotoPicks = [NSMutableArray array];
+    [gPhotoPicks addObject:self];
+
+    if (@available(iOS 14.0, *)) {
+        PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
+        cfg.filter = [PHPickerFilter imagesFilter];
+        cfg.selectionLimit = 1;
+        PHPickerViewController *pk = [[PHPickerViewController alloc] initWithConfiguration:cfg];
+        pk.delegate = self;
+        [host presentViewController:pk animated:YES completion:nil];
+    } else {
+        UIImagePickerController *ip = [[UIImagePickerController alloc] init];
+        ip.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+        ip.delegate = self;
+        [host presentViewController:ip animated:YES completion:nil];
+    }
+}
+
+- (void)finishWith:(UIImage *)img {
+    void (^cb)(UIImage *) = self.onImage;
+    self.onImage = nil;
+    [gPhotoPicks removeObject:self];
+    if (cb) cb(img);
+}
+
+- (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
+    [picker dismissViewControllerAnimated:YES completion:nil];
+    if (results.count == 0) { [self finishWith:nil]; return; }
+
+    NSItemProvider *it = results.firstObject.itemProvider;
+    if (![it canLoadObjectOfClass:[UIImage class]]) { [self finishWith:nil]; return; }
+
+    __weak typeof(self) ws = self;
+    [it loadObjectOfClass:[UIImage class] completionHandler:^(id<NSItemProviderReading> obj, NSError *err) {
+        UIImage *img = [obj isKindOfClass:[UIImage class]] ? (UIImage *)obj : nil;
+        // 回调在后台队列，UI 一律回主线程
+        dispatch_async(dispatch_get_main_queue(), ^{ [ws finishWith:img]; });
+    }];
+}
+
+- (void)imagePickerController:(UIImagePickerController *)picker
+didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
+    UIImage *img = info[UIImagePickerControllerOriginalImage];
+    [picker dismissViewControllerAnimated:YES completion:^{ [self finishWith:img]; }];
+}
+
+- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
+    [picker dismissViewControllerAnimated:YES completion:^{ [self finishWith:nil]; }];
+}
+
+@end
+
 #pragma mark - 截屏拉框
 
 @interface TDCropVC : UIViewController
 @property (nonatomic, strong) UIImage *shot;
+/// 来源说明，比如「来自相册（已缩放到屏幕尺度）」，会显示在顶部和提示里
+@property (nonatomic, copy) NSString *note;
 @property (nonatomic, copy) void (^onDone)(NSString *tplName);
 @end
 
@@ -81,7 +213,7 @@ static NSString *TDTplDisplay(NSString *file) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor blackColor];
-    self.title = @"框选要识别的画面";
+    self.title = _note.length ? @"框选（相册图）" : @"框选要识别的画面";
     self.navigationItem.leftBarButtonItem =
         [[UIBarButtonItem alloc] initWithTitle:@"取消" style:UIBarButtonItemStylePlain
                                         target:self action:@selector(onCancel)];
@@ -111,11 +243,13 @@ static NSString *TDTplDisplay(NSString *file) {
     [self.view addSubview:_sizeLabel];
 
     _tip = [[UILabel alloc] initWithFrame:CGRectZero];
-    _tip.text = @"在画面上按住拖动，框住要认的那个图案（越小越准）";
+    _tip.text = _note.length
+        ? [NSString stringWithFormat:@"%@\n在画面上按住拖动，框住要认的那个图案（越小越准）", _note]
+        : @"在画面上按住拖动，框住要认的那个图案（越小越准）";
     _tip.textColor = ED_DIM;
     _tip.font = [UIFont systemFontOfSize:13];
     _tip.textAlignment = NSTextAlignmentCenter;
-    _tip.numberOfLines = 2;
+    _tip.numberOfLines = 3;
     [self.view addSubview:_tip];
 
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPan:)];
@@ -125,8 +259,8 @@ static NSString *TDTplDisplay(NSString *file) {
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     _iv.frame = self.view.bounds;
-    _tip.frame = CGRectMake(20, self.view.bounds.size.height - 70,
-                            self.view.bounds.size.width - 40, 44);
+    _tip.frame = CGRectMake(20, self.view.bounds.size.height - 92,
+                            self.view.bounds.size.width - 40, 66);
     [self updateImgRect];
 }
 
@@ -239,6 +373,18 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
                         isNew:(BOOL)isNew
                        onSave:(void (^)(void))onSave
                      onDelete:(void (^)(void))onDelete;
+@end
+
+/// 私有方法前向声明：这些在定义之前就被调用（比如按钮 action → pickTemplate），
+/// 不声明只是警告，但警告一多真正的问题就看不见了。
+@interface TDStepEditVC ()
+- (void)pickTemplate;
+- (void)captureTemplate;
+- (void)importFromPhotos;
+- (void)afterPhotoPick:(UIImage *)img;
+- (void)chooseTemplate;
+- (void)runTest;
+- (void)confirmDelete;
 @end
 
 @implementation TDStepEditVC {
@@ -426,7 +572,8 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
     if (s == 2) return @"压力/半径默认关：之前实测这台机器只认「压力 0 / 半径 0.04」，开了可能点不动。";
-    if (s == 1 && _imgMode) return @"模板是截屏里框出来的；直播/视频画面会变，尽量框静态按钮。";
+    if (s == 1 && _imgMode)
+        return @"模板可以截屏框选，也可以从相册传一张截图；画面会变的（直播/视频）尽量框静态按钮。";
     return nil;
 }
 
@@ -493,6 +640,7 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
         c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         c.selectionStyle = UITableViewCellSelectionStyleDefault;
         c.textLabel.text = @"模板";
+        if (_tpl.length == 0) c.detailTextLabel.text = @"未选 · 可截屏或从相册导入";
         if (_tpl.length) {
             UIImage *im = [UIImage imageWithContentsOfFile:TDTplPath(_tpl)];
             c.imageView.image = im;
@@ -601,10 +749,12 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
 
 - (void)pickTemplate {
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"识图模板"
-                                                              message:@"截一屏拉个框，或者用已有模板"
+                                                              message:@"截一屏拉个框、从相册传一张，或者用已有模板"
                                                        preferredStyle:UIAlertControllerStyleActionSheet];
     [a addAction:[UIAlertAction actionWithTitle:@"截取当前屏幕" style:UIAlertActionStyleDefault
                                        handler:^(UIAlertAction *x) { [self captureTemplate]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"从相册选图" style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction *x) { [self importFromPhotos]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"从模板库选" style:UIAlertActionStyleDefault
                                        handler:^(UIAlertAction *x) { [self chooseTemplate]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
@@ -625,6 +775,60 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
     }
     TDCropVC *c = [TDCropVC new];
     c.shot = shot;
+    __weak typeof(self) ws = self;
+    c.onDone = ^(NSString *name) {
+        typeof(self) ss = ws;
+        if (!ss) return;
+        ss->_tpl = [name copy];
+        [ss.tableView reloadData];
+    };
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:c];
+    nav.modalPresentationStyle = UIModalPresentationFullScreen;
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+/// 从相册挑一张，进同一个拉框页。
+/// 为什么还要拉框：整张截图当模板太大，匹配既慢又容易被相似区域骗；
+/// 而且用户往往是「截了图，只关心其中某个按钮」，框一下才准。
+- (void)importFromPhotos {
+    __weak typeof(self) ws = self;
+    TDPhotoPick *pk = [TDPhotoPick new];
+    pk.onImage = ^(UIImage *img) { [ws afterPhotoPick:img]; };
+    [pk presentFrom:self];
+}
+
+- (void)afterPhotoPick:(UIImage *)img {
+    if (!img) {
+        // 用户取消时也会走到这里，静默返回；真读不出来才提示
+        return;
+    }
+    NSInteger mode = 0;
+    UIImage *fixed = TDImageToScreenScale(img, &mode);
+    if (!fixed) {
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"这张图读不出来"
+                                                                  message:@"换一张试试，png / jpg 都行"
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+        return;
+    }
+
+    NSString *note;
+    if (mode == 1) {
+        note = [NSString stringWithFormat:@"来自相册 · 已缩放到屏幕像素 %.0f×%.0f",
+                fixed.size.width, fixed.size.height];
+    } else if (mode == 2) {
+        // 宽高比对不上有两种情况：一是裁好的局部小图（可用），二是别的机型/别的缩放的截图
+        // （尺度不对，多半匹配不上）。不拦，交给下面的「试识别一次」去判。
+        note = @"来自相册 · 宽高比与屏幕不同，模板按本机像素才对，框完先用「试识别一次」验一下";
+    } else {
+        note = [NSString stringWithFormat:@"来自相册 · %.0f×%.0f，与屏幕像素一致",
+                fixed.size.width, fixed.size.height];
+    }
+
+    TDCropVC *c = [TDCropVC new];
+    c.shot = fixed;
+    c.note = note;
     __weak typeof(self) ws = self;
     c.onDone = ^(NSString *name) {
         typeof(self) ss = ws;
@@ -695,14 +899,27 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         UIImage *tpl = [UIImage imageWithContentsOfFile:TDTplPath(name)];
         TDMatch *m = tpl ? TDfindImage(tpl, th, 1.0, 1.0, 1) : nil;
+        BOOL scaled = NO;
+        // 和回放时一样：原尺度不中就再扫一遍尺度 —— 相册图常常和屏幕像素不是 1:1
+        if (tpl && !m) {
+            m = TDfindImage(tpl, th, 0.85, 1.15, 7);
+            scaled = (m != nil);
+        }
         NSString *msg;
         if (!tpl) {
             msg = @"模板文件读不出来";
         } else if (!m) {
-            msg = [NSString stringWithFormat:@"没找到（阈值 %.2f）。\n可以框小一点，或把阈值调低。", th];
+            msg = [NSString stringWithFormat:
+                   @"没找到（阈值 %.2f，连 ±15%% 尺度扫描也没有）。\n"
+                    "模板 %.0f×%.0f px —— 如果比屏幕上那个图案大很多/小很多，"
+                    "说明这张图的尺度和本机不匹配，换一张本机截屏最稳。",
+                   th, tpl.size.width, tpl.size.height];
         } else {
-            msg = [NSString stringWithFormat:@"命中 %.3f\n屏幕位置 (%.0f, %.0f)\n加偏移后：(%.0f, %.0f)",
-                   m.score, m.point.x, m.point.y,
+            msg = [NSString stringWithFormat:@"命中 %.3f%@\n模板 %.0f×%.0f px\n屏幕位置 (%.0f, %.0f)\n加偏移后：(%.0f, %.0f)",
+                   m.score,
+                   scaled ? [NSString stringWithFormat:@"（靠尺度扫描 %.2f×）", m.scale] : @"",
+                   tpl.size.width, tpl.size.height,
+                   m.point.x, m.point.y,
                    m.point.x + dx, m.point.y + dy];
         }
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -794,6 +1011,12 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
 @interface TDTplListVC : UITableViewController
 @end
 
+@interface TDTplListVC ()
+- (void)onImport;
+- (void)afterImport:(UIImage *)img;
+- (void)flashSaved:(NSString *)name;
+@end
+
 @implementation TDTplListVC
 
 - (void)viewDidLoad {
@@ -801,6 +1024,56 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
     self.title = @"识图模板";
     self.tableView.backgroundColor = ED_BG;
     self.tableView.rowHeight = 62;
+    // 模板也可以直接从这里进相册导入，然后框选保存
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd
+                                                      target:self action:@selector(onImport)];
+}
+
+- (void)onImport {
+    __weak typeof(self) ws = self;
+    TDPhotoPick *pk = [TDPhotoPick new];
+    pk.onImage = ^(UIImage *img) { [ws afterImport:img]; };
+    [pk presentFrom:self];
+}
+
+- (void)afterImport:(UIImage *)img {
+    if (!img) return;
+    NSInteger mode = 0;
+    UIImage *fixed = TDImageToScreenScale(img, &mode);
+    if (!fixed) return;
+
+    TDCropVC *c = [TDCropVC new];
+    c.shot = fixed;
+    c.note = mode == 1
+        ? [NSString stringWithFormat:@"来自相册 · 已缩放到屏幕像素 %.0f×%.0f",
+           fixed.size.width, fixed.size.height]
+        : (mode == 2 ? @"来自相册 · 宽高比与屏幕不同，框完先用「试识别一次」验一下"
+                     : [NSString stringWithFormat:@"来自相册 · %.0f×%.0f，与屏幕像素一致",
+                        fixed.size.width, fixed.size.height]);
+
+    __weak typeof(self) ws = self;
+    c.onDone = ^(NSString *name) {
+        typeof(self) ss = ws;
+        if (!ss) return;
+        [ss.tableView reloadData];
+        [ss flashSaved:name];
+    };
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:c];
+    nav.modalPresentationStyle = UIModalPresentationFullScreen;
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+/// 存好了给个回执：模板页没有「选中」这个动作，不给反馈会以为没成功
+- (void)flashSaved:(NSString *)name {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"已存成模板"
+                                                              message:[NSString stringWithFormat:@"%@（%.0f×%.0f）",
+                                                                       TDTplDisplay(name),
+                                                                       [UIImage imageWithContentsOfFile:TDTplPath(name)].size.width,
+                                                                       [UIImage imageWithContentsOfFile:TDTplPath(name)].size.height]
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {

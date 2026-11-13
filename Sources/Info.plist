@@ -15,9 +15,9 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.11.0</string>
+	<string>1.12.0</string>
 	<key>CFBundleVersion</key>
-	<string>39</string>
+	<string>40</string>
 	<key>MinimumOSVersion</key>
 	<string>15.0</string>
 	<key>CFBundleSupportedPlatforms</key>
@@ -36,6 +36,10 @@
 	<array>
 		<string>audio</string>
 	</array>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>从相册挑一张截图，框出要识别的图案存成模板</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>把框好的识图模板存进相册（可选）</string>
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>

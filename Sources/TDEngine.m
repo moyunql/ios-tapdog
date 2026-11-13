@@ -305,10 +305,18 @@ static CGPoint TDJitter(CGPoint p, double r) {
         CFTimeInterval deadline = CACurrentMediaTime() + MAX(0.0, timeoutMs) / 1000.0;
         TDMatch *m = nil;
         NSInteger tries = 0;
+        BOOL scaledHit = NO;
         while (self->_running) {
             tries++;
             m = TDfindImage(tpl, th, 1.0, 1.0, 1);
             if (m) break;
+
+            // 尺度兜底：从相册导进来的模板像素尺度不一定和这块屏一样
+            // （被打包压过、或者干脆是别处裁的图）。原尺度找不到时，
+            // 在 ±15% 内再扫一遍 —— 只在没命中时才付这份开销。
+            m = TDfindImage(tpl, th, 0.85, 1.15, 7);
+            if (m) { scaledHit = YES; break; }
+
             if (timeoutMs <= 0 || CACurrentMediaTime() >= deadline) break;
             usleep(200 * 1000);
         }
@@ -316,6 +324,9 @@ static CGPoint TDJitter(CGPoint p, double r) {
         if (!m) {
             [self logMsg:@"识图没找到 %@（阈值 %.2f，试了 %ld 次）", name, th, (long)tries];
             return;
+        }
+        if (scaledHit) {
+            [self logMsg:@"识图 %@ 是靠尺度扫描命中的（%.2f×），模板像素和屏幕不完全一致", name, m.scale];
         }
 
         CGPoint p = TDJitter(CGPointMake(m.point.x + dx, m.point.y + dy), jitter);
