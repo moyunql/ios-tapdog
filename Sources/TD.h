@@ -36,6 +36,35 @@ void TDHIDReplayTap(CGPoint p);
 BOOL TDUseRealEvents(void);
 void TDSetUseRealEvents(BOOL on);
 
+#pragma mark - 注入链路诊断
+
+/// 一次性报告：客户端能否建立、HID 服务数、探到的 senderID、
+/// 物理触摸监听状态、回显计数、关键权限是否真的在位。
+NSString *TDHIDDiagReport(void);
+/// 强制重新探测 senderID（清缓存）
+uint64_t TDProbeSenderIDForce(void);
+uint64_t TDProbedSenderIDCached(void);
+/// 监听到的 digitizer 事件总数（物理 + 回显）
+NSInteger TDHIDMonitorCount(void);
+/// 本次注入期间回显到的事件数。0 = 事件根本没进 HID 系统。
+NSInteger TDHIDMonitorEchoCount(void);
+void TDHIDEchoReset(void);
+void TDHIDEchoStop(void);
+
+#pragma mark - 注入方案（按可能性排序，含真实 senderID / BKS / 客户端类型）
+
+NSInteger TDInjectPlanCount(void);
+NSString *TDInjectPlanDesc(NSInteger i);
+void TDApplyInjectPlan(NSInteger i);
+/// 走一遍第 i 个方案（会自动选真实副本或合成事件），并开回显计数
+void TDRunInjectPlan(NSInteger i, CGPoint p);
+/// 用监听学到的真实 senderID 当事件来源（不是猜的，是本机数字转换器的真值）
+void TDSetInjectSampleSender(BOOL on);
+BOOL TDInjectSampleSenderOn(void);
+/// 记住扫描胜出的方案号，下次启动沿用（-1/未设置为没扫过）
+void TDSetBestInjectPlan(NSInteger i);
+NSInteger TDBestInjectPlan(void);
+
 #pragma mark - 截屏
 
 BOOL TDcaptureReady(void);
@@ -165,9 +194,10 @@ NSInteger TDInjectCount(void);
 #pragma mark - 注入调试（这台机器到底认哪种事件构造）
 
 typedef NS_ENUM(NSInteger, TDInjectVariant) {
-    TDInjectVariantNoSender   = 0,   // 不设 senderID（最保守）
-    TDInjectVariantHardSender = 1,   // 硬编码 0x8000000817319372
-    TDInjectVariantAutoSender = 2,   // 读本机 HID 服务的真实 senderID
+    TDInjectVariantNoSender     = 0,   // 不设 senderID（最保守）
+    TDInjectVariantHardSender   = 1,   // 硬编码 0x8000000817319372（别的机器的值）
+    TDInjectVariantAutoSender   = 2,   // 读本机 HID 服务的真实 senderID
+    TDInjectVariantSampleSender = 3,   // 用监听学到的、本机物理触摸的真实 senderID
 };
 
 /// 注入坐标用哪个坐标系。事件到底被系统当成哪一种，各机型/系统版本不一样，

@@ -116,46 +116,79 @@ CGPoint TDScreenPointFromEventSpace(CGPoint e) {
 
 static uint64_t gProbedSender = 0;
 static BOOL gProbedTried = NO;
+static NSInteger gServiceCount = 0;
 
 static IOHIDEventSystemClientRef TDhidClient(void);   // 定义在本文件后面
 
 typedef CFArrayRef (*TDCopyServicesFn)(IOHIDEventSystemClientRef);
 typedef CFTypeRef (*TDServiceGetPropFn)(void *service, CFStringRef key);
+typedef uint64_t (*TDServiceRegIDFn)(void *service);
 
-/// 从 IOHIDEventSystemClient 的服务列表里读真实 senderID。
-/// 读不到就返回 0（调用方会退化成「不设 senderID」）。
+static CFArrayRef TDCopyServicesOn(IOHIDEventSystemClientRef c) {
+    if (!c) return NULL;
+    TDCopyServicesFn fn = (TDCopyServicesFn)dlsym(RTLD_DEFAULT,
+                                                 "IOHIDEventSystemClientCopyServices");
+    if (!fn) return NULL;
+    CFArrayRef a = fn(c);
+    if (a && CFGetTypeID(a) != CFArrayGetTypeID()) { CFRelease(a); return NULL; }
+    return a;
+}
+
+void TDProbeSenderIDReset(void) {
+    gProbedSender = 0;
+    gProbedTried = NO;
+}
+
+uint64_t TDProbedSenderIDCached(void) { return gProbedSender; }
+uint64_t TDProbeSenderIDForce(void) {
+    TDProbeSenderIDReset();
+    return TDProbedSenderID();
+}
+
+/// 从 HID 服务列表里读真实 senderID。
+///
+/// 真机实测（iPhone 7 Plus / iOS 15.8.2）：物理触摸的 senderID 是 `0x10000053e`，
+/// 也就是「0x1_00000000 | IORegistryEntryID」。社区流传的
+/// `0x8000000817319372` 是别的机器上的值，写死在这台上必然被系统当成
+/// 「来自不存在设备的事件」丢掉 —— 这正好解释了 16 组全灭。
 uint64_t TDProbedSenderID(void) {
     if (gProbedTried) return gProbedSender;
     gProbedTried = YES;
 
-    IOHIDEventSystemClientRef c = TDhidClient();
-    if (!c) return 0;
-
-    TDCopyServicesFn copyServices =
-        (TDCopyServicesFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientCopyServices");
+    IOHIDEventSystemClientRef clients[2] = { TDhidClient(), NULL };
     TDServiceGetPropFn getProp =
         (TDServiceGetPropFn)dlsym(RTLD_DEFAULT, "IOHIDServiceClientGetProperty");
-    if (!copyServices || !getProp) return 0;
+    TDServiceRegIDFn getRegID =
+        (TDServiceRegIDFn)dlsym(RTLD_DEFAULT, "IOHIDServiceClientGetRegistryID");
 
-    CFArrayRef services = copyServices(c);
-    if (!services) return 0;
-    if (CFGetTypeID(services) != CFArrayGetTypeID()) { CFRelease(services); return 0; }
+    for (int ci = 0; ci < 2 && gProbedSender == 0; ci++) {
+        CFArrayRef services = TDCopyServicesOn(clients[ci]);
+        if (!services) continue;
+        CFIndex n = CFArrayGetCount(services);
+        if (ci == 0) gServiceCount = n;
 
-    CFStringRef keys[] = { CFSTR("SenderID"), CFSTR("HIDSenderID"), CFSTR("senderID") };
-    CFIndex n = CFArrayGetCount(services);
-    for (CFIndex i = 0; i < n && gProbedSender == 0; i++) {
-        void *svc = (void *)CFArrayGetValueAtIndex(services, i);
-        if (!svc) continue;
-        for (int k = 0; k < 3 && gProbedSender == 0; k++) {
-            CFTypeRef v = getProp(svc, keys[k]);
-            if (!v || CFGetTypeID(v) != CFNumberGetTypeID()) continue;
-            long long num = 0;
-            if (CFNumberGetValue((CFNumberRef)v, kCFNumberLongLongType, &num) && num != 0) {
-                gProbedSender = (uint64_t)num;
+        CFStringRef keys[] = { CFSTR("SenderID"), CFSTR("HIDSenderID"), CFSTR("senderID") };
+        for (CFIndex i = 0; i < n && gProbedSender == 0; i++) {
+            void *svc = (void *)CFArrayGetValueAtIndex(services, i);
+            if (!svc) continue;
+            if (getProp) {
+                for (int k = 0; k < 3 && gProbedSender == 0; k++) {
+                    CFTypeRef v = getProp(svc, keys[k]);
+                    if (!v || CFGetTypeID(v) != CFNumberGetTypeID()) continue;
+                    long long num = 0;
+                    if (CFNumberGetValue((CFNumberRef)v, kCFNumberLongLongType, &num) && num != 0) {
+                        gProbedSender = (uint64_t)num;
+                    }
+                }
+            }
+            // 属性读不到就按真机格式拼：0x1_00000000 | IORegistryEntryID
+            if (gProbedSender == 0 && getRegID) {
+                uint64_t rid = getRegID(svc);
+                if (rid) gProbedSender = 0x100000000ULL | (rid & 0xffffffffULL);
             }
         }
+        CFRelease(services);
     }
-    CFRelease(services);
     return gProbedSender;
 }
 
@@ -190,7 +223,9 @@ void TDSetInjectVariant(NSInteger v) {
 }
 NSInteger TDInjectVariantCurrent(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    if ([d objectForKey:kInjVariantKey] == nil) return TDInjectVariantNoSender;   // 默认最保守
+    // 默认用「监听学到的真实 senderID」：这是本机唯一确定合法的来源。
+    // 还没学到时会自动退化成探测值，探测不到就等于不设，不会更糟。
+    if ([d objectForKey:kInjVariantKey] == nil) return TDInjectVariantSampleSender;
     return [d integerForKey:kInjVariantKey];
 }
 
@@ -211,7 +246,28 @@ BOOL TDInjectBKSDigitizerInfoOn(void) {
 /// App 每次启动都回到「安全默认」：BKS 那步有崩溃风险，
 /// 万一是它把 App 弄崩的，重开就自动关掉，不会连环崩。
 void TDInjectResetToSafeDefaults(void) {
-    TDSetInjectBKSDigitizerInfo(NO);
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if (![d boolForKey:@"tdMigrated150"]) {
+        [d setBool:YES forKey:@"tdMigrated150"];
+        if ([d objectForKey:kInjVariantKey] == nil) {
+            [d setInteger:TDInjectVariantSampleSender forKey:kInjVariantKey];
+        }
+    }
+    // 扫到过可用方案就沿用它（含 BKS 开关）；没扫过才回到「无 BKS」的保守状态
+    if ([d objectForKey:@"tdPlanBest"] == nil) {
+        TDSetInjectBKSDigitizerInfo(NO);
+    } else {
+        TDApplyInjectPlan([d integerForKey:@"tdPlanBest"]);
+    }
+}
+
+void TDSetBestInjectPlan(NSInteger i) {
+    [[NSUserDefaults standardUserDefaults] setInteger:i forKey:@"tdPlanBest"];
+}
+NSInteger TDBestInjectPlan(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if ([d objectForKey:@"tdPlanBest"] == nil) return -1;
+    return [d integerForKey:@"tdPlanBest"];
 }
 
 NSString *TDInjectVariantDesc(void) {
@@ -219,6 +275,10 @@ NSString *TDInjectVariantDesc(void) {
     NSString *s;
     if (v == TDInjectVariantHardSender) {
         s = @"硬编码 senderID";
+    } else if (v == TDInjectVariantSampleSender) {
+        uint64_t sid = TDHIDSampleSenderID();
+        s = sid ? [NSString stringWithFormat:@"真实 senderID (0x%llx)", sid]
+                : @"真实 senderID（还没学到，退化为探测值）";
     } else if (v == TDInjectVariantAutoSender) {
         uint64_t sid = TDProbedSenderID();
         s = sid ? [NSString stringWithFormat:@"自动 senderID (%llx)", sid]
@@ -234,11 +294,30 @@ NSString *TDInjectVariantDesc(void) {
 static void TDApplyInjectOptions(IOHIDEventRef hand) {
     uint64_t sid = 0;
     switch (TDInjectVariantCurrent()) {
-        case TDInjectVariantHardSender: sid = kTDDefaultSenderID; break;
-        case TDInjectVariantAutoSender: sid = TDProbedSenderID(); break;
-        default: break;
+        case TDInjectVariantHardSender:
+            sid = kTDDefaultSenderID;
+            break;
+        case TDInjectVariantAutoSender:
+            sid = TDProbedSenderID();
+            break;
+        case TDInjectVariantSampleSender:
+            // 监听里抓到的、本机物理触摸的真实 senderID（真机上形如 0x10000053e）
+            sid = TDHIDSampleSenderID();
+            if (!sid) sid = TDProbedSenderID();
+            break;
+        default:
+            break;
     }
-    if (sid) IOHIDEventSetSenderID(hand, sid);
+    if (sid) {
+        IOHIDEventSetSenderID(hand, sid);
+        // 子事件也带上同一来源：部分系统版本按子事件判定「这次触摸是谁报的」
+        CFArrayRef kids = IOHIDEventGetChildren(hand);
+        if (kids) {
+            for (CFIndex i = 0; i < CFArrayGetCount(kids); i++) {
+                IOHIDEventSetSenderID((IOHIDEventRef)CFArrayGetValueAtIndex(kids, i), sid);
+            }
+        }
+    }
     if (TDInjectBuiltInOn()) IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldIsBuiltIn, 1);
     if (TDInjectBKSDigitizerInfoOn()) TDApplyBKSDigitizerInfo(hand);
 }
@@ -261,6 +340,31 @@ static IOHIDEventSystemClientRef TDhidClient(void) {
 }
 
 BOOL TDhidReady(void) { return TDhidClient() != NULL; }
+
+// 普通（非 admin）客户端。admin 客户端可能只被允许「读事件」，
+// 真正能 dispatch 的也许是普通客户端 —— 这一维也做成可扫的。
+static IOHIDEventSystemClientRef gClientPlain = NULL;
+static IOHIDEventSystemClientRef TDPlainClient(void) {
+    if (!gClientPlain) gClientPlain = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+    return gClientPlain;
+}
+
+// 方案指定的 dispatch 通道（NULL = 默认 admin 客户端）
+static IOHIDEventSystemClientRef gDispatchClient = NULL;
+static IOHIDEventSystemClientRef TDClientForDispatch(void) {
+    if (gDispatchClient) return gDispatchClient;
+    IOHIDEventSystemClientRef c = TDhidClient();
+    return c ? c : TDPlainClient();
+}
+
+void TDSetInjectSampleSender(BOOL on) {
+    if (on) TDSetInjectVariant(TDInjectVariantSampleSender);
+    else if (TDInjectVariantCurrent() == TDInjectVariantSampleSender)
+        TDSetInjectVariant(TDInjectVariantNoSender);
+}
+BOOL TDInjectSampleSenderOn(void) {
+    return TDInjectVariantCurrent() == TDInjectVariantSampleSender;
+}
 
 NSString *TDhidStatus(void) {
     if (!TDhidClient()) {
@@ -369,7 +473,7 @@ static uint32_t TDNextIdentity(void) { return ++gFingerSeq; }
 
 // mask: kIOHIDDigitizerEvent* 位组合；touch: 当前是否接触屏幕
 static void TDEmit(uint32_t mask, BOOL touch, CGFloat x, CGFloat y, uint32_t identity) {
-    IOHIDEventSystemClientRef client = TDhidClient();
+    IOHIDEventSystemClientRef client = TDClientForDispatch();
     if (!client) return;
 
     // 点击反馈挪到手势发完之后（见 TDShowFeedback）：
@@ -500,6 +604,19 @@ static IOHIDEventRef gSampleUp = NULL;
 static uint64_t gSampleSender = 0;
 static volatile int gSampleLock = 0;
 
+// 诊断计数器：监听到的 digitizer 事件总数 + 「注入期间回显到的事件数」。
+// 这两个数字把失败拆成两类，不用再猜：
+//   回显 = 0  → 事件压根没进 HID 系统（dispatch 被拦：权限 / 客户端类型 / senderID 不合法）
+//   回显 > 0  → 事件进了系统，但没路由到前台 App（display / context 信息不对）
+static volatile int32_t gMonTotal = 0;
+static volatile int32_t gEchoCount = 0;
+static volatile int gEchoActive = 0;
+
+void TDHIDEchoReset(void) { gEchoCount = 0; gEchoActive = 1; }
+void TDHIDEchoStop(void) { gEchoActive = 0; }
+NSInteger TDHIDMonitorEchoCount(void) { return (NSInteger)gEchoCount; }
+NSInteger TDHIDMonitorCount(void) { return (NSInteger)gMonTotal; }
+
 static void TDSampleLock(void) { while (__sync_lock_test_and_set(&gSampleLock, 1)) usleep(200); }
 static void TDSampleUnlock(void) { __sync_lock_release(&gSampleLock); }
 
@@ -518,6 +635,8 @@ static IOHIDEventRef TDFingerOf(IOHIDEventRef hand) {
 static void TDSampleHandler(void *target, void *refcon, IOHIDEventQueueRef q, IOHIDEventRef e) {
     if (!e) return;
     if (IOHIDEventGetType(e) != kIOHIDEventTypeDigitizer) return;
+    __sync_fetch_and_add(&gMonTotal, 1);
+    if (gEchoActive) __sync_fetch_and_add(&gEchoCount, 1);
     IOHIDEventRef finger = TDFingerOf(e);
     if (!finger) return;
 
@@ -600,8 +719,9 @@ static void TDReplayOne(IOHIDEventRef tmpl, CGFloat x, CGFloat y, BOOL down) {
     IOHIDEventSetIntegerValue(e, kIOHIDEventFieldDigitizerRange, 1);
 
     if (gSampleSender) IOHIDEventSetSenderID(e, gSampleSender);
+    if (TDInjectBKSDigitizerInfoOn()) TDApplyBKSDigitizerInfo(e);
 
-    IOHIDEventSystemClientRef c = TDhidClient();
+    IOHIDEventSystemClientRef c = TDClientForDispatch();
     if (c) IOHIDEventSystemClientDispatchEvent(c, e);
     CFRelease(e);
 }
@@ -621,6 +741,18 @@ void TDHIDReplayTap(CGPoint p) {
     if (up) CFRelease(up);
 }
 
+// 自己拼出来的事件（hand + finger）。方案扫描和兜底都走这里。
+static void TDSynthTap(CGFloat x, CGFloat y) {
+    uint32_t ident = TDNextIdentity();
+    TDEmit(kMaskDown, YES, x, y, ident);
+    // 一帧静止 move：真实触摸在按住期间 HID 也会持续上报位置，
+    // 完全不给 move 帧时部分版本认不出这是一次 tap。
+    usleep(30000);
+    if (TDInjectStillMoveOn()) TDEmit(kMaskMove, YES, x, y, ident);
+    usleep(50000);
+    TDEmit(kMaskUp, NO, x, y, ident);
+}
+
 void TDtap(CGFloat x, CGFloat y) {
     // 学到过真实触摸时优先走「真实事件副本」这条路：
     // 物理事件的字段（senderID、quality、pressure、display 信息…）全都齐，
@@ -630,14 +762,7 @@ void TDtap(CGFloat x, CGFloat y) {
         TDShowFeedback(x, y);
         return;
     }
-    uint32_t ident = TDNextIdentity();
-    TDEmit(kMaskDown, YES, x, y, ident);
-    // 一帧静止 move：真实触摸在按住期间 HID 也会持续上报位置，
-    // 完全不给 move 帧时部分版本认不出这是一次 tap。
-    usleep(30000);
-    if (TDInjectStillMoveOn()) TDEmit(kMaskMove, YES, x, y, ident);
-    usleep(50000);
-    TDEmit(kMaskUp, NO, x, y, ident);
+    TDSynthTap(x, y);
     TDShowFeedback(x, y);
 }
 
@@ -692,4 +817,154 @@ void TDgesture(NSArray<NSValue *> *points, NSTimeInterval sec) {
 
 void TDswipe(CGPoint from, CGPoint to, NSTimeInterval sec) {
     TDgesture(@[[NSValue valueWithCGPoint:from], [NSValue valueWithCGPoint:to]], sec);
+}
+
+
+// ---------------------------------------------------------------------------
+// 注入方案表
+//
+// 上一版 16 组之所以全灭，是因为那张表里 senderID 只有两个选项：
+// 「不设」和「硬编码 0x8000000817319372」。后者是别的机器的值，
+// 本机真机实测物理触摸的 senderID 是 0x10000053e（= 0x1_00000000 | IORegistryEntryID），
+// 所以那 16 组实际上等于「全部用错来源」，怎么组合都进不去。
+//
+// 这张新表把「从本机学到的真实 senderID」放在第一位，并把
+// BKS digitizer info / 客户端类型 / 真实事件副本 一起编进来。
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    const char *name;
+    NSInteger variant;      // TDInjectVariant
+    BOOL legacy;            // 父坐标回退 (0,0)
+    BOOL parentMaskConst;   // 父事件 mask 写死 Touch
+    BOOL stillMove;         // down/up 之间补一帧静止 move
+    BOOL bks;               // 调 BKSHIDEventSetDigitizerInfo
+    BOOL builtIn;           // 补 IsBuiltIn
+    BOOL real;              // 走「真实事件副本」
+    BOOL plainClient;       // 用普通客户端 dispatch（不是 admin）
+} TDPlan;
+
+static const TDPlan kPlans[] = {
+    {"真实senderID + BKS",              TDInjectVariantSampleSender, NO,  NO,  YES, YES, NO,  NO,  NO },
+    {"真实senderID + BKS + BuiltIn",    TDInjectVariantSampleSender, NO,  NO,  YES, YES, YES, NO,  NO },
+    {"真实senderID（无BKS）",            TDInjectVariantSampleSender, NO,  NO,  YES, NO,  NO,  NO,  NO },
+    {"探测senderID + BKS",              TDInjectVariantAutoSender,   NO,  NO,  YES, YES, NO,  NO,  NO },
+    {"硬编码senderID + BKS",            TDInjectVariantHardSender,   NO,  NO,  YES, YES, NO,  NO,  NO },
+    {"真实senderID + 普通client + BKS",  TDInjectVariantSampleSender, NO,  NO,  YES, YES, NO,  NO,  YES},
+    {"真实senderID + 普通client",        TDInjectVariantSampleSender, NO,  NO,  YES, NO,  NO,  NO,  YES},
+    {"真实副本（保持原字段）",            0,                           NO,  NO,  YES, NO,  NO,  YES, NO },
+    {"真实副本 + BKS",                  0,                           NO,  NO,  YES, YES, NO,  YES, NO },
+    {"真实senderID + BKS + 父0,0",       TDInjectVariantSampleSender, YES, NO,  YES, YES, NO,  NO,  NO },
+    {"真实senderID + BKS + 无move帧",    TDInjectVariantSampleSender, NO,  NO,  NO,  YES, NO,  NO,  NO },
+    {"真实senderID + BKS + 父mask写死",  TDInjectVariantSampleSender, NO,  YES, YES, YES, NO,  NO,  NO },
+};
+
+static NSInteger TDPlanCount(void) {
+    return (NSInteger)(sizeof(kPlans) / sizeof(kPlans[0]));
+}
+NSInteger TDInjectPlanCount(void) { return TDPlanCount(); }
+
+NSString *TDInjectPlanDesc(NSInteger i) {
+    if (i < 0 || i >= TDPlanCount()) return @"";
+    const TDPlan *p = &kPlans[i];
+    if (p->real) {
+        return [NSString stringWithFormat:@"%@%@",
+                [NSString stringWithUTF8String:p->name],
+                TDHIDSampleReady() ? @"" : @"（未学到·会退化为合成）"];
+    }
+    NSMutableString *s = [NSMutableString stringWithUTF8String:p->name];
+    if (!p->stillMove) [s appendString:@" ·无move"];
+    return s;
+}
+
+void TDApplyInjectPlan(NSInteger i) {
+    if (i < 0 || i >= TDPlanCount()) return;
+    const TDPlan *p = &kPlans[i];
+    if (!p->real) TDSetInjectVariant(p->variant);
+    TDSetInjectHandLegacy(p->legacy);
+    TDSetInjectParentMaskConst(p->parentMaskConst);
+    TDSetInjectStillMove(p->stillMove);
+    TDSetInjectBKSDigitizerInfo(p->bks);
+    TDSetInjectBuiltIn(p->builtIn);
+    gDispatchClient = p->plainClient ? TDPlainClient() : NULL;
+}
+
+void TDRunInjectPlan(NSInteger i, CGPoint p) {
+    if (i < 0 || i >= TDPlanCount()) return;
+    const TDPlan *it = &kPlans[i];
+    TDApplyInjectPlan(i);
+    TDHIDEchoReset();              // 开始统计这一轮的回显
+    if (it->real && TDHIDSampleReady()) TDHIDReplayTap(p);
+    else                                TDSynthTap(p.x, p.y);
+}
+
+#pragma mark - 链路诊断报告
+
+/// 运行时读自己的签名权限。ldid 假签名如果没生效，这里会全 ✗ ——
+/// 那种情况下 HID 这条路根本不用再试。
+static int TDHasEntitlement(CFStringRef key) {
+    static void *(*createFromSelf)(CFAllocatorRef) = NULL;
+    static CFTypeRef (*copyEnt)(void *, CFStringRef, CFErrorRef *) = NULL;
+    static void *task = NULL;
+    static BOOL tried = NO;
+    if (!tried) {
+        tried = YES;
+        createFromSelf = dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf");
+        copyEnt = dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
+        if (createFromSelf) task = createFromSelf(kCFAllocatorDefault);
+    }
+    if (!copyEnt || !task) return -1;
+    CFTypeRef v = copyEnt(task, key, NULL);
+    if (!v) return 0;
+    int ok = 0;
+    CFTypeID t = CFGetTypeID(v);
+    if (t == CFBooleanGetTypeID()) {
+        ok = CFBooleanGetValue((CFBooleanRef)v) ? 1 : 0;
+    } else if (t == CFNumberGetTypeID()) {
+        int n = 0;
+        CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &n);
+        ok = n != 0;
+    } else {
+        ok = 1;
+    }
+    CFRelease(v);
+    return ok;
+}
+
+static NSString *TDEntitlementSummary(void) {
+    struct { const char *label; CFStringRef key; } items[] = {
+        {"hiddispatch", CFSTR("com.apple.private.hid.client.event-dispatch")},
+        {"hidmonitor",  CFSTR("com.apple.private.hid.client.event-monitor")},
+        {"backboard",   CFSTR("com.apple.backboard.client")},
+        {"platform",    CFSTR("platform-application")},
+        {"nosandbox",   CFSTR("com.apple.private.security.no-sandbox")},
+    };
+    NSMutableString *s = [NSMutableString string];
+    for (int i = 0; i < 5; i++) {
+        int v = TDHasEntitlement(items[i].key);
+        [s appendFormat:@"%s%@  ", items[i].label,
+            v < 0 ? @"?" : (v ? @"✓" : @"✗")];
+    }
+    return s;
+}
+
+NSString *TDHIDDiagReport(void) {
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"客户端  admin:%@ 普通:%@\n",
+        TDhidClient() ? @"ok" : @"nil", TDPlainClient() ? @"ok" : @"nil"];
+
+    uint64_t probed = TDProbedSenderID();
+    [s appendFormat:@"HID服务 %ld 个 · 探测sender:%@\n", (long)gServiceCount,
+        probed ? [NSString stringWithFormat:@"0x%llx", probed] : @"无"];
+
+    uint64_t real = TDHIDSampleSenderID();
+    [s appendFormat:@"监听 事件%ld · down:%@ up:%@ · sender:%@\n",
+        (long)gMonTotal,
+        gSampleDown ? @"✓" : @"✗",
+        gSampleUp ? @"✓" : @"✗",
+        real ? [NSString stringWithFormat:@"0x%llx", real] : @"无"];
+
+    [s appendFormat:@"权限 %@\n", TDEntitlementSummary()];
+    [s appendFormat:@"上次注入回显 %ld 个（0 = 事件没进系统）", (long)gEchoCount];
+    return s;
 }

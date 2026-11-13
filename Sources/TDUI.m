@@ -41,10 +41,12 @@
     NSInteger _scanIdx;
     NSInteger _prevCount;
     NSMutableArray<NSNumber *> *_scanHits;
+    NSMutableArray<NSNumber *> *_scanEcho;
     NSTimer *_scanTimer;
     NSTimer *_sampleTimer;
     BOOL _fbWasOn;
     BOOL _reWasOn;
+    BOOL _scanRunning;
 }
 
 - (void)viewDidLoad {
@@ -112,7 +114,7 @@
 
     // 自动扫描：16 组构造依次注入，命中与否由程序判定
     _scanBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_scanBtn setTitle:@"自动扫描 16 种注入构造" forState:UIControlStateNormal];
+    [_scanBtn setTitle:@"自动扫描 12 种注入构造" forState:UIControlStateNormal];
     [_scanBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     _scanBtn.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
     _scanBtn.backgroundColor = [UIColor colorWithRed:0.36 green:0.30 blue:0.62 alpha:1];
@@ -174,6 +176,7 @@
 }
 
 - (void)refreshSampleStatus {
+    if (!_scanRunning) _scanLog.text = TDHIDDiagReport();
     if (!TDHIDSampleReady()) {
         _status.textColor = TD_DIM;
         _status.text = @"真实事件：未学到\n请用手指在这个灰色方块上点一下";
@@ -193,14 +196,18 @@
     _scanIdx = 0;
     _prevCount = _count;
     _scanHits = [NSMutableArray array];
+    _scanEcho = [NSMutableArray array];
     _scanLog.text = @"";
+    _scanRunning = YES;
     _scanBtn.enabled = NO;
     _scanBtn.alpha = 0.5;
-    [_scanBtn setTitle:@"扫描中…（约 15 秒）" forState:UIControlStateNormal];
-    // 扫描期间关掉红圈反馈：每 0.85 秒动一次托管窗口，会干扰注入序列
+    [_scanBtn setTitle:@"扫描中…（约 13 秒）" forState:UIControlStateNormal];
+    _tip.textColor = TD_DIM;
+    _tip.text = @"每组注一次：变绿 = 命中，~回显 = 进了系统但没到窗口";
+    // 扫描期间关掉红圈反馈：连续挪托管窗口会干扰注入序列
     _fbWasOn = TDInjectFeedbackEnabled();
     TDSetInjectFeedbackEnabled(NO);
-    // 矩阵扫描必须走合成事件，否则 16 组都会变成同一个真实事件副本
+    // TDRunInjectPlan 自己决定走合成还是真实副本，这里只是别让 TDtap 抢道
     _reWasOn = TDUseRealEvents();
     TDSetUseRealEvents(NO);
     [self scanStep];
@@ -209,32 +216,38 @@
 - (void)scanStep {
     _scanTimer = nil;
 
-    // 先结算上一组的结果
+    // 先结算上一组：命中看目标计数，回显看 HID 监听有没有收到自己发的事件
     if (_scanIdx > 0) {
+        NSInteger echo = TDHIDMonitorEchoCount();
         BOOL ok = (_count - _prevCount) > 0;
         [_scanHits addObject:@(ok)];
+        [_scanEcho addObject:@(echo)];
+        NSString *mark = ok ? @"✓命中"
+                            : (echo > 0 ? [NSString stringWithFormat:@"~回显%ld", (long)echo]
+                                        : @"✗");
         NSString *line = [NSString stringWithFormat:@"%2ld %@  %@",
-                          (long)_scanIdx, TDInjectComboDesc(_scanIdx - 1), ok ? @"✓ 命中" : @"✗"];
+                          (long)_scanIdx, TDInjectPlanDesc(_scanIdx - 1), mark];
         _scanLog.text = _scanLog.text.length ? [_scanLog.text stringByAppendingFormat:@"\n%@", line] : line;
     }
 
-    if (_scanIdx >= TDInjectComboCount()) {
+    if (_scanIdx >= TDInjectPlanCount()) {
         [self finishScan];
         return;
     }
 
-    TDApplyInjectCombo(_scanIdx);
     TDReleaseStuckTouch();
 
     CGPoint c = [_target.superview convertPoint:_target.center toView:nil];
     _prevCount = _count;
+    _tip.textColor = TD_DIM;
     _tip.text = [NSString stringWithFormat:@"第 %ld/%ld 组：%@",
-                 (long)(_scanIdx + 1), (long)TDInjectComboCount(), TDInjectComboDesc(_scanIdx)];
-    TDtap(c.x, c.y);
+                 (long)(_scanIdx + 1), (long)TDInjectPlanCount(),
+                 TDInjectPlanDesc(_scanIdx)];
+    TDRunInjectPlan(_scanIdx, c);
     _scanIdx++;
 
     __weak typeof(self) ws = self;
-    _scanTimer = [NSTimer scheduledTimerWithTimeInterval:0.85 repeats:NO block:^(NSTimer *t) {
+    _scanTimer = [NSTimer scheduledTimerWithTimeInterval:0.95 repeats:NO block:^(NSTimer *t) {
         [ws scanStep];
     }];
 }
@@ -251,15 +264,31 @@
     for (NSInteger i = 0; i < (NSInteger)_scanHits.count; i++) {
         if (_scanHits[i].boolValue) { best = i; break; }
     }
+    NSInteger echoSum = 0;
+    NSInteger echoGroups = 0;
+    for (NSNumber *n in _scanEcho) {
+        echoSum += n.integerValue;
+        if (n.integerValue > 0) echoGroups++;
+    }
+
     if (best >= 0) {
-        TDApplyInjectCombo(best);
+        TDApplyInjectPlan(best);
+        TDSetBestInjectPlan(best);
         _tip.textColor = TD_GREEN;
-        _tip.text = [NSString stringWithFormat:@"第 %ld 组能点动：%@（已自动设为当前构造）",
-                     (long)(best + 1), TDInjectComboDesc(best)];
+        _tip.text = [NSString stringWithFormat:@"第 %ld 组能点动：%@（已设为当前构造）",
+                     (long)(best + 1), TDInjectPlanDesc(best)];
+    } else if (echoGroups > 0) {
+        _tip.textColor = TD_RED;
+        _tip.text = [NSString stringWithFormat:
+                     @"事件进了系统（%ld 组有回显共 %ld 个）但没到窗口 → 投递目标不对，不是权限",
+                     (long)echoGroups, (long)echoSum];
     } else {
         _tip.textColor = TD_RED;
-        _tip.text = @"16 组全部没命中：注入事件到不了本机窗口，问题在事件构造/权限，不在坐标。";
+        _tip.text = @"12 组全无回显 → 事件根本没进 HID 系统（dispatch 被拦：来源/权限）";
     }
+    // 把这一轮的诊断信息也留在下面，方便截图
+    _scanRunning = NO;
+    _scanLog.text = [_scanLog.text stringByAppendingFormat:@"\n────\n%@", TDHIDDiagReport()];
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
