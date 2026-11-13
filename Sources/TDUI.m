@@ -16,6 +16,25 @@
 #define TD_RED     [UIColor colorWithRed:0.902 green:0.263 blue:0.263 alpha:1]
 #define TD_GREEN   [UIColor colorWithRed:0.235 green:0.749 blue:0.478 alpha:1]
 
+#pragma mark - 任意触摸捕获层
+
+// 之前只数那个方块：如果注入的事件被系统当成「从 (0,0) 滑过来」，
+// 或者坐标被 clamp 到角落，落点根本不在方块上，就会误判成「完全没反应」。
+// 这一层铺满全屏，自己 App 收到任何一处触摸都计数，用来区分
+// 「事件没来」和「事件来了但落点不对」。
+@interface TDTouchCatcher : UIView
+@property (nonatomic, copy) void (^onTouch)(void);
+@property (nonatomic) NSInteger hits;
+@end
+
+@implementation TDTouchCatcher
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    self.hits += 1;
+    if (self.onTouch) self.onTouch();
+    [super touchesBegan:touches withEvent:event];
+}
+@end
+
 #pragma mark - 自检页（验证注入是否真的点得动、坐标对不对）
 
 @interface TDSelfTestVC : UIViewController
@@ -24,6 +43,7 @@
 @interface TDSelfTestVC ()
 - (void)hit;
 - (void)fire;
+- (void)updateHits;
 - (void)startScan;
 - (void)scanStep;
 - (void)finishScan;
@@ -37,6 +57,7 @@
     UILabel *_scanLog;
     UIButton *_scanBtn;
     NSInteger _count;
+    TDTouchCatcher *_catcher;
     // 自动扫描：一组一组试注入构造，哪组命中由程序自己判断，不靠人眼看
     NSInteger _scanIdx;
     NSInteger _prevCount;
@@ -53,6 +74,13 @@
     [super viewDidLoad];
     self.title = @"注入自检";
     self.view.backgroundColor = TD_BG;
+
+    _catcher = [[TDTouchCatcher alloc] initWithFrame:self.view.bounds];
+    _catcher.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _catcher.backgroundColor = [UIColor clearColor];
+    __weak typeof(self) wsc = self;
+    _catcher.onTouch = ^{ [wsc updateHits]; };
+    [self.view addSubview:_catcher];
 
     _hits = [[UILabel alloc] initWithFrame:CGRectZero];
     _hits.text = @"被点中 0 次";
@@ -114,7 +142,7 @@
 
     // 自动扫描：16 组构造依次注入，命中与否由程序判定
     _scanBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_scanBtn setTitle:@"自动扫描 12 种注入构造" forState:UIControlStateNormal];
+    [_scanBtn setTitle:@"自动扫描 14 种注入构造" forState:UIControlStateNormal];
     [_scanBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     _scanBtn.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
     _scanBtn.backgroundColor = [UIColor colorWithRed:0.36 green:0.30 blue:0.62 alpha:1];
@@ -194,14 +222,14 @@
 - (void)startScan {
     if (_scanTimer) return;
     _scanIdx = 0;
-    _prevCount = _count;
+    _prevCount = _count + _catcher.hits;
     _scanHits = [NSMutableArray array];
     _scanEcho = [NSMutableArray array];
     _scanLog.text = @"";
     _scanRunning = YES;
     _scanBtn.enabled = NO;
     _scanBtn.alpha = 0.5;
-    [_scanBtn setTitle:@"扫描中…（约 13 秒）" forState:UIControlStateNormal];
+    [_scanBtn setTitle:@"扫描中…（约 15 秒）" forState:UIControlStateNormal];
     _tip.textColor = TD_DIM;
     _tip.text = @"每组注一次：变绿 = 命中，~回显 = 进了系统但没到窗口";
     // 扫描期间关掉红圈反馈：连续挪托管窗口会干扰注入序列
@@ -219,7 +247,7 @@
     // 先结算上一组：命中看目标计数，回显看 HID 监听有没有收到自己发的事件
     if (_scanIdx > 0) {
         NSInteger echo = TDHIDMonitorEchoCount();
-        BOOL ok = (_count - _prevCount) > 0;
+        BOOL ok = ((_count + _catcher.hits) - _prevCount) > 0;
         [_scanHits addObject:@(ok)];
         [_scanEcho addObject:@(echo)];
         NSString *mark = ok ? @"✓命中"
@@ -238,7 +266,7 @@
     TDReleaseStuckTouch();
 
     CGPoint c = [_target.superview convertPoint:_target.center toView:nil];
-    _prevCount = _count;
+    _prevCount = _count + _catcher.hits;
     _tip.textColor = TD_DIM;
     _tip.text = [NSString stringWithFormat:@"第 %ld/%ld 组：%@",
                  (long)(_scanIdx + 1), (long)TDInjectPlanCount(),
@@ -284,7 +312,7 @@
                      (long)echoGroups, (long)echoSum];
     } else {
         _tip.textColor = TD_RED;
-        _tip.text = @"12 组全无回显 → 事件根本没进 HID 系统（dispatch 被拦：来源/权限）";
+        _tip.text = @"14 组全无命中：事件没进系统，或落点不在本 App（对照 v1.2.3 那组看）";
     }
     // 把这一轮的诊断信息也留在下面，方便截图
     _scanRunning = NO;
@@ -298,9 +326,14 @@
     if (_scanBtn && !_scanBtn.enabled) TDSetInjectFeedbackEnabled(_fbWasOn);
 }
 
+- (void)updateHits {
+    _hits.text = [NSString stringWithFormat:@"目标 %ld 次 · 任意触摸 %ld 次",
+                  (long)_count, (long)_catcher.hits];
+}
+
 - (void)hit {
     _count++;
-    _hits.text = [NSString stringWithFormat:@"被点中 %ld 次", (long)_count];
+    [self updateHits];
     [self refreshSampleStatus];
     [UIView animateWithDuration:0.18 animations:^{
         self->_target.backgroundColor = TD_GREEN;

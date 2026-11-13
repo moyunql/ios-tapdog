@@ -393,6 +393,15 @@ void TDSetInjectHandLegacy(BOOL on) {
     [[NSUserDefaults standardUserDefaults] setBool:on forKey:kHandLegacyKey];
 }
 
+// v1.2.3 是唯一一次「事件真的进到抖音」的版本（表现为点中间却跳到「我的」，
+// 也就是一次从 (0,0) 斜滑到目标点的 swipe）。之后几版把它「修对了」，
+// 结果反而一点反应都没有。所以这些构造细节全部做成开关，逐条复刻对比：
+static BOOL gLegacyParent  = NO;    // 父事件坐标回退 (0,0)
+static BOOL gParentRange1  = YES;   // 父事件 range=1（v1.2.3 是 0）
+static BOOL gFixedIdentity = NO;    // identity 恒为 3（v1.2.3 是固定 3）
+static BOOL gSetTypeField = YES;    // 给 hand/finger 补 DigitizerType（v1.2.3 没补）
+static BOOL gExplicitXY   = YES;    // finger 显式 SetFloatValue X/Y（v1.2.3 只靠构造参数）
+
 static NSString * const kParentMaskConstKey = @"tdParentMaskConst";
 static NSString * const kStillMoveKey       = @"tdStillMove";
 
@@ -433,7 +442,7 @@ NSString *TDInjectComboDesc(NSInteger c) {
 
 static IOHIDEventRef TDCreateHand(uint32_t mask, uint64_t ts, CGPoint e, BOOL touch,
                                   uint32_t identity) {
-    BOOL legacy = TDInjectHandLegacy();
+    BOOL legacy = TDInjectHandLegacy() || gLegacyParent;
     uint32_t handMask = (legacy || TDInjectParentMaskConst()) ? kIOHIDDigitizerEventTouch : mask;
     // 注意 range / touch 这两个参数在这里**必须恒为 1/true**。
     // hand 是「这只手」，tap 期间手一直在屏幕上；只有 finger 子事件才在 up 时离开。
@@ -448,12 +457,16 @@ static IOHIDEventRef TDCreateHand(uint32_t mask, uint64_t ts, CGPoint e, BOOL to
                                                        legacy ? 0.0 : (IOHIDFloat)e.x,
                                                        legacy ? 0.0 : (IOHIDFloat)e.y,
                                                        0.0, 0.0, 0.0,
-                                                       1,                 // range：手始终在感应范围内
-                                                       true,              // touch：手始终在屏幕上
+                                                       gParentRange1 ? 1 : 0,   // range
+                                                       true,                    // touch
                                                        0);
     (void)touch;
     if (!hand) return NULL;
     IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
+    if (gSetTypeField) {
+        IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerType,
+                                  kIOHIDDigitizerTransducerTypeHand);
+    }
     IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerTiltX,
                               kIOHIDDigitizerTransducerTypeHand);
     IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerTiltY, 1);
@@ -473,6 +486,7 @@ static uint32_t TDNextIdentity(void) { return ++gFingerSeq; }
 
 // mask: kIOHIDDigitizerEvent* 位组合；touch: 当前是否接触屏幕
 static void TDEmit(uint32_t mask, BOOL touch, CGFloat x, CGFloat y, uint32_t identity) {
+    if (gFixedIdentity) identity = 3;      // v1.2.3 的写法：identity 恒为 3
     IOHIDEventSystemClientRef client = TDClientForDispatch();
     if (!client) return;
 
@@ -512,11 +526,15 @@ static void TDEmit(uint32_t mask, BOOL touch, CGFloat x, CGFloat y, uint32_t ide
                                                                0);
     if (finger) {
         IOHIDEventSetIntegerValue(finger, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
-        IOHIDEventSetIntegerValue(finger, kIOHIDEventFieldDigitizerType,
-                                  kIOHIDDigitizerTransducerTypeFinger);
+        if (gSetTypeField) {
+            IOHIDEventSetIntegerValue(finger, kIOHIDEventFieldDigitizerType,
+                                      kIOHIDDigitizerTransducerTypeFinger);
+        }
         IOHIDEventSetIntegerValue(finger, kIOHIDEventFieldDigitizerTouch, isTouch);
-        IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerX, (IOHIDFloat)e.x);
-        IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerY, (IOHIDFloat)e.y);
+        if (gExplicitXY) {
+            IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerX, (IOHIDFloat)e.x);
+            IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerY, (IOHIDFloat)e.y);
+        }
         IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerMajorRadius, 0.04f);
         IOHIDEventSetFloatValue(finger, kIOHIDEventFieldDigitizerMinorRadius, 0.04f);
         IOHIDEventAppendEvent(hand, finger);
@@ -835,28 +853,39 @@ void TDswipe(CGPoint from, CGPoint to, NSTimeInterval sec) {
 typedef struct {
     const char *name;
     NSInteger variant;      // TDInjectVariant
-    BOOL legacy;            // 父坐标回退 (0,0)
+    BOOL legacyParent;      // 父事件坐标回退 (0,0)
     BOOL parentMaskConst;   // 父事件 mask 写死 Touch
+    BOOL parentRange1;      // 父事件 range=1（v1.2.3 是 0）
+    BOOL fixedIdentity;     // identity 恒为 3（v1.2.3）
+    BOOL setTypeField;      // 补 DigitizerType（v1.2.3 没补）
+    BOOL explicitXY;        // finger 显式写 X/Y（v1.2.3 只靠构造参数）
     BOOL stillMove;         // down/up 之间补一帧静止 move
-    BOOL bks;               // 调 BKSHIDEventSetDigitizerInfo
+    BOOL bks;               // BKSHIDEventSetDigitizerInfo
     BOOL builtIn;           // 补 IsBuiltIn
-    BOOL real;              // 走「真实事件副本」
-    BOOL plainClient;       // 用普通客户端 dispatch（不是 admin）
+    BOOL real;              // 走真实事件副本
+    BOOL plainClient;       // 用普通客户端 dispatch
+    NSInteger coordMode;    // -1 = 不动；0 点 / 1 归一化 / 2 像素
 } TDPlan;
 
+// 第一组必须和 v1.2.3 逐字段一致 —— 那是唯一一次确认「事件真的到过抖音」的版本。
+// 它当时的表现是「点中间却跳到我的」：一次 tap 被系统当成从 (0,0) 滑过来，
+// 或者坐标被当成 0~1 归一化后 clamp 到右下角。两种解释都能用后面的方案区分。
 static const TDPlan kPlans[] = {
-    {"真实senderID + BKS",              TDInjectVariantSampleSender, NO,  NO,  YES, YES, NO,  NO,  NO },
-    {"真实senderID + BKS + BuiltIn",    TDInjectVariantSampleSender, NO,  NO,  YES, YES, YES, NO,  NO },
-    {"真实senderID（无BKS）",            TDInjectVariantSampleSender, NO,  NO,  YES, NO,  NO,  NO,  NO },
-    {"探测senderID + BKS",              TDInjectVariantAutoSender,   NO,  NO,  YES, YES, NO,  NO,  NO },
-    {"硬编码senderID + BKS",            TDInjectVariantHardSender,   NO,  NO,  YES, YES, NO,  NO,  NO },
-    {"真实senderID + 普通client + BKS",  TDInjectVariantSampleSender, NO,  NO,  YES, YES, NO,  NO,  YES},
-    {"真实senderID + 普通client",        TDInjectVariantSampleSender, NO,  NO,  YES, NO,  NO,  NO,  YES},
-    {"真实副本（保持原字段）",            0,                           NO,  NO,  YES, NO,  NO,  YES, NO },
-    {"真实副本 + BKS",                  0,                           NO,  NO,  YES, YES, NO,  YES, NO },
-    {"真实senderID + BKS + 父0,0",       TDInjectVariantSampleSender, YES, NO,  YES, YES, NO,  NO,  NO },
-    {"真实senderID + BKS + 无move帧",    TDInjectVariantSampleSender, NO,  NO,  NO,  YES, NO,  NO,  NO },
-    {"真实senderID + BKS + 父mask写死",  TDInjectVariantSampleSender, NO,  YES, YES, YES, NO,  NO,  NO },
+    //  name                              variant                      legacy pMask range1 fixId type xy  move bks  bi   real plain coord
+    {"v1.2.3 原样",                       TDInjectVariantNoSender,     YES,   YES,  NO,   YES,  NO,  NO, NO,  NO,  NO,  NO,  NO,  -1},
+    {"v1.2.3 + 真实senderID",             TDInjectVariantSampleSender, YES,   YES,  NO,   YES,  NO,  NO, NO,  NO,  NO,  NO,  NO,  -1},
+    {"v1.2.3 + 真sender + BKS",           TDInjectVariantSampleSender, YES,   YES,  NO,   YES,  NO,  NO, NO,  YES, NO,  NO,  NO,  -1},
+    {"v1.2.3 但父坐标=目标点",             TDInjectVariantNoSender,     NO,    YES,  NO,   YES,  NO,  NO, NO,  NO,  NO,  NO,  NO,  -1},
+    {"v1.2.3 父=目标 + 真sender",          TDInjectVariantSampleSender, NO,    YES,  NO,   YES,  NO,  NO, NO,  NO,  NO,  NO,  NO,  -1},
+    {"v1.2.3 但父range=1",                TDInjectVariantSampleSender, YES,   YES,  YES,  YES,  NO,  NO, NO,  NO,  NO,  NO,  NO,  -1},
+    {"v1.2.3 但identity递增",              TDInjectVariantSampleSender, YES,   YES,  NO,   NO,   NO,  NO, NO,  NO,  NO,  NO,  NO,  -1},
+    {"v1.2.3 但补move帧",                  TDInjectVariantSampleSender, YES,   YES,  NO,   YES,  NO,  NO, YES, NO,  NO,  NO,  NO,  -1},
+    {"v1.2.3 但父mask透传",                TDInjectVariantSampleSender, YES,   NO,   NO,   YES,  NO,  NO, NO,  NO,  NO,  NO,  NO,  -1},
+    {"v1.2.3 原样 + 归一化坐标",            TDInjectVariantNoSender,     YES,   YES,  NO,   YES,  NO,  NO, NO,  NO,  NO,  NO,  NO,  1},
+    {"v1.3+ 现构造（对照）",               TDInjectVariantSampleSender, NO,    NO,   YES,  NO,   YES, YES, YES, NO,  NO,  NO,  NO,  -1},
+    {"v1.3+ 现构造 + 归一化坐标",          TDInjectVariantSampleSender, NO,    NO,   YES,  NO,   YES, YES, YES, NO,  NO,  NO,  NO,  1},
+    {"v1.3+ 现构造 + BKS",                TDInjectVariantSampleSender, NO,    NO,   YES,  NO,   YES, YES, YES, YES, NO,  NO,  NO,  -1},
+    {"真实事件副本",                       TDInjectVariantNoSender,     NO,    NO,   YES,  NO,   YES, YES, YES, NO,  NO,  YES, NO,  -1},
 };
 
 static NSInteger TDPlanCount(void) {
@@ -872,21 +901,24 @@ NSString *TDInjectPlanDesc(NSInteger i) {
                 [NSString stringWithUTF8String:p->name],
                 TDHIDSampleReady() ? @"" : @"（未学到·会退化为合成）"];
     }
-    NSMutableString *s = [NSMutableString stringWithUTF8String:p->name];
-    if (!p->stillMove) [s appendString:@" ·无move"];
-    return s;
+    return [NSString stringWithUTF8String:p->name];
 }
 
 void TDApplyInjectPlan(NSInteger i) {
     if (i < 0 || i >= TDPlanCount()) return;
     const TDPlan *p = &kPlans[i];
     if (!p->real) TDSetInjectVariant(p->variant);
-    TDSetInjectHandLegacy(p->legacy);
     TDSetInjectParentMaskConst(p->parentMaskConst);
     TDSetInjectStillMove(p->stillMove);
     TDSetInjectBKSDigitizerInfo(p->bks);
     TDSetInjectBuiltIn(p->builtIn);
+    gLegacyParent  = p->legacyParent;
+    gParentRange1  = p->parentRange1;
+    gFixedIdentity = p->fixedIdentity;
+    gSetTypeField  = p->setTypeField;
+    gExplicitXY    = p->explicitXY;
     gDispatchClient = p->plainClient ? TDPlainClient() : NULL;
+    if (p->coordMode >= 0) TDSetCoordMode(p->coordMode);
 }
 
 void TDRunInjectPlan(NSInteger i, CGPoint p) {
