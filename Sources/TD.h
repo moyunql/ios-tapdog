@@ -170,6 +170,12 @@ BOOL TDInjectBuiltInOn(void);
 /// BackBoardServices 的 digitizer 信息（可能崩，默认关，每次启动自动复位）
 void TDSetInjectBKSDigitizerInfo(BOOL on);
 BOOL TDInjectBKSDigitizerInfoOn(void);
+
+/// 父事件坐标回退成 (0,0) 的旧写法。
+/// 旧写法在抖音里会被当成「从左上角斜滑过来」的滑动手势；
+/// 新写法是干净的 tap。只有在新写法完全点不动时才切回来验证链路。
+BOOL TDInjectHandLegacy(void);
+void TDSetInjectHandLegacy(BOOL on);
 void TDInjectResetToSafeDefaults(void);
 uint64_t TDProbedSenderID(void);
 NSString *TDInjectVariantDesc(void);

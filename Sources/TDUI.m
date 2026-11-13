@@ -512,7 +512,7 @@ static NSString *TDCalibModeName(NSInteger m) {
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
     if (s == 0) return 3;
-    if (s == 1) return 2;
+    if (s == 1) return 3;
     if (s == 2) return 3;
     return 1;
 }
@@ -543,10 +543,15 @@ static NSString *TDCalibModeName(NSInteger m) {
             c.textLabel.text = @"补 IsBuiltIn = 1";
             c.detailTextLabel.text = @"声明成内建事件，有的系统只认带这个的";
             if (TDInjectBuiltInOn()) c.accessoryType = UITableViewCellAccessoryCheckmark;
-        } else {
+        } else if (ip.row == 1) {
             c.textLabel.text = @"补 BackBoard digitizer info";
             c.detailTextLabel.text = @"告诉 BackBoard 这事件属于哪块屏（⚠️ 可能闪退）";
             if (TDInjectBKSDigitizerInfoOn()) c.accessoryType = UITableViewCellAccessoryCheckmark;
+        } else {
+            c.textLabel.text = @"父事件坐标回退 (0,0)";
+            c.detailTextLabel.text = @"旧写法。会变成「从左上角滑过来」，抖音当滑动吃掉；"
+                                      "只有新写法完全点不动时才用来验证链路";
+            if (TDInjectHandLegacy()) c.accessoryType = UITableViewCellAccessoryCheckmark;
         }
     } else if (ip.section == 2) {
         NSArray<NSString *> *names = @[@"屏幕点（414×736，常规）",
@@ -585,6 +590,11 @@ static NSString *TDCalibModeName(NSInteger m) {
     if (ip.section == 1) {
         if (ip.row == 0) {
             TDSetInjectBuiltIn(!TDInjectBuiltInOn());
+            [tv reloadData];
+            return;
+        }
+        if (ip.row == 2) {
+            TDSetInjectHandLegacy(!TDInjectHandLegacy());
             [tv reloadData];
             return;
         }

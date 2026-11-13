@@ -272,27 +272,39 @@ NSString *TDhidStatus(void) {
 // hand 父事件
 //
 // 这一段是照社区验证过的写法对齐的（SimulateTouch / TouchSimulator 系列）：
-//   - 父事件的 eventMask 给 kIOHIDDigitizerEventTouch，不能是 0
 //   - 补 TiltX / TiltY / Altitude 三个字段，否则 BackBoard 认为这不是屏幕触摸
 //   - finger 的 Major/MinorRadius 给 0.04（真实手指量级），给 0 会被当噪声丢掉
-static IOHIDEventRef TDCreateHand(uint32_t mask, uint64_t ts, CGPoint e) {
+//
+// 父事件要不要带坐标，两种写法在真机上表现完全不同：
+//   带坐标（默认）→ 父与子同点，位移 0，是干净的 tap。
+//   带 0,0（legacy）→ 系统拿父事件当起点、finger 当终点，一次 tap 变成
+//                      「从左上角斜滑到点击点」，抖音会当滑动手势吃掉。
+// 万一新版反过来导致点不动，可以临时切回 legacy 确认链路。
+static NSString * const kHandLegacyKey = @"tdHandLegacy";
+
+BOOL TDInjectHandLegacy(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kHandLegacyKey];
+}
+void TDSetInjectHandLegacy(BOOL on) {
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:kHandLegacyKey];
+}
+
+static IOHIDEventRef TDCreateHand(uint32_t mask, uint64_t ts, CGPoint e, BOOL touch) {
+    BOOL legacy = TDInjectHandLegacy();
     IOHIDEventRef hand = IOHIDEventCreateDigitizerEvent(kCFAllocatorDefault,
                                                        ts,
                                                        kIOHIDDigitizerTransducerTypeHand,
                                                        0, 0,
-                                                       kIOHIDDigitizerEventTouch,
+                                                       legacy ? kIOHIDDigitizerEventTouch : mask,
                                                        0,
-                                                       (IOHIDFloat)e.x, (IOHIDFloat)e.y,
+                                                       legacy ? 0.0 : (IOHIDFloat)e.x,
+                                                       legacy ? 0.0 : (IOHIDFloat)e.y,
                                                        0.0, 0.0, 0.0,
-                                                       mask & kIOHIDDigitizerEventTouch ? 1 : 0,
-                                                       true, 0);
+                                                       touch ? 1 : 0,     // range
+                                                       touch,             // touch
+                                                       0);
     if (!hand) return NULL;
     IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
-    IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerType,
-                              kIOHIDDigitizerTransducerTypeHand);
-    // 父事件的坐标也补上：有些系统版本只读父事件的位置
-    IOHIDEventSetFloatValue(hand, kIOHIDEventFieldDigitizerX, (IOHIDFloat)e.x);
-    IOHIDEventSetFloatValue(hand, kIOHIDEventFieldDigitizerY, (IOHIDFloat)e.y);
     IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerTiltX,
                               kIOHIDDigitizerTransducerTypeHand);
     IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldDigitizerTiltY, 1);
@@ -300,28 +312,35 @@ static IOHIDEventRef TDCreateHand(uint32_t mask, uint64_t ts, CGPoint e) {
     return hand;
 }
 
+// 每次手势用一个新的 identity。
+// 固定 identity 时，只要有一次 up 没被系统收下，后面所有 down 都会被当成
+// 「同一根手指继续按着」，于是再也点不动 —— 递增最省事也最接近真实。
+static volatile uint32_t gFingerSeq = 1;
+static uint32_t TDNextIdentity(void) { return ++gFingerSeq; }
+
 // mask: kIOHIDDigitizerEvent* 位组合；touch: 当前是否接触屏幕
-static void TDEmit(uint32_t mask, BOOL touch, CGFloat x, CGFloat y) {
+static void TDEmit(uint32_t mask, BOOL touch, CGFloat x, CGFloat y, uint32_t identity) {
     IOHIDEventSystemClientRef client = TDhidClient();
     if (!client) return;
 
-    // 点击反馈：把「正要往哪点」画出来，能不能点动是另一回事，位置对不对一眼就看得到
+    // 点击反馈挪到手势发完之后（见 TDShowFeedback）：
+    // 原来在 down 之前就弹/挪反馈窗口，等于在中间插了一次 SpringBoard 窗口注册，
+    // WindowServer 侧的事件队列被打断过，tap 这种对时序敏感的序列就没了。
     BOOL isDown = (mask & kIOHIDDigitizerEventTouch) && touch;
     if (isDown) __sync_fetch_and_add(&gInjectCount, 1);
-    if (gFeedback) gFeedback(x, y, isDown);
 
     // 屏幕点 → 事件坐标空间（点 / 归一化 / 像素）
     CGPoint e = TDCoordToEventSpace(CGPointMake(x, y));
 
     uint64_t ts = mach_absolute_time();
-    IOHIDEventRef hand = TDCreateHand(mask, ts, e);
+    IOHIDEventRef hand = TDCreateHand(mask, ts, e, touch);
     if (!hand) return;
 
     int isTouch = touch ? 1 : 0;
     IOHIDEventRef finger = IOHIDEventCreateDigitizerFingerEvent(kCFAllocatorDefault,
                                                                ts,
-                                                               1,      // index
-                                                               3,      // identity
+                                                               1,          // index
+                                                               identity,   // identity
                                                                mask,
                                                                (IOHIDFloat)e.x,
                                                                (IOHIDFloat)e.y,
@@ -353,30 +372,50 @@ static const uint32_t kMaskDown = (kIOHIDDigitizerEventTouch |
 static const uint32_t kMaskMove = kIOHIDDigitizerEventPosition;
 static const uint32_t kMaskUp   = (kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventRange);
 
+// 手势整段发完之后再画红圈。注入期间屏幕上不能有任何窗口增删，
+// 否则 WindowServer 会对正在投递的序列重新排队，down/up 就被拆散了。
+static void TDShowFeedback(CGFloat x, CGFloat y) {
+    TDInjectFeedbackFn fn = gFeedback;
+    if (!fn) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        fn(x, y, YES);
+    });
+}
+
 void TDtap(CGFloat x, CGFloat y) {
-    TDEmit(kMaskDown, YES, x, y);
-    usleep(50000);                 // 50ms，接近真人点按，太短会被当抖动丢掉
-    TDEmit(kMaskUp, NO, x, y);
+    uint32_t ident = TDNextIdentity();
+    TDEmit(kMaskDown, YES, x, y, ident);
+    // 一帧静止 move：真实触摸在按住期间 HID 也会持续上报位置，
+    // 完全不给 move 帧时部分版本认不出这是一次 tap。
+    usleep(30000);
+    TDEmit(kMaskMove, YES, x, y, ident);
+    usleep(50000);
+    TDEmit(kMaskUp, NO, x, y, ident);
+    TDShowFeedback(x, y);
 }
 
 void TDlongPress(CGFloat x, CGFloat y, NSTimeInterval sec) {
-    TDEmit(kMaskDown, YES, x, y);
+    uint32_t ident = TDNextIdentity();
+    TDEmit(kMaskDown, YES, x, y, ident);
     NSTimeInterval d = sec > 0 ? sec : 0.8;
     NSInteger frames = (NSInteger)(d / 0.12);
     for (NSInteger i = 1; i <= frames; i++) {
         usleep((useconds_t)(0.12 * 1000000));
-        TDEmit(kMaskMove, YES, x, y);
+        TDEmit(kMaskMove, YES, x, y, ident);
     }
     NSTimeInterval rest = d - frames * 0.12;
     if (rest > 0) usleep((useconds_t)(rest * 1000000));
-    TDEmit(kMaskUp, NO, x, y);
+    TDEmit(kMaskUp, NO, x, y, ident);
+    TDShowFeedback(x, y);
 }
 
 void TDgesture(NSArray<NSValue *> *points, NSTimeInterval sec) {
     if (points.count < 2) return;
 
+    uint32_t ident = TDNextIdentity();
     CGPoint first = [points[0] CGPointValue];
-    TDEmit(kMaskDown, YES, first.x, first.y);
+    TDEmit(kMaskDown, YES, first.x, first.y, ident);
 
     NSTimeInterval total = sec > 0 ? sec : 0.35;
     NSInteger segments = (NSInteger)points.count - 1;
@@ -395,13 +434,14 @@ void TDgesture(NSArray<NSValue *> *points, NSTimeInterval sec) {
         NSInteger frames = MAX(2, (NSInteger)round(len / totalLen * total / 0.012));
         for (NSInteger f = 1; f <= frames; f++) {
             CGFloat t = (CGFloat)f / (CGFloat)frames;
-            TDEmit(kMaskMove, YES, a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+            TDEmit(kMaskMove, YES, a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, ident);
             usleep((useconds_t)(total / (frames * MAX(1, segments)) * 1000000));
         }
     }
 
     CGPoint last = [points.lastObject CGPointValue];
-    TDEmit(kMaskUp, NO, last.x, last.y);
+    TDEmit(kMaskUp, NO, last.x, last.y, ident);
+    TDShowFeedback(last.x, last.y);
 }
 
 void TDswipe(CGPoint from, CGPoint to, NSTimeInterval sec) {
