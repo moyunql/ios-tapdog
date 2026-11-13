@@ -139,6 +139,10 @@ NSString *TDSandboxStatus(void);
 NSString *TDcrashLogText(void);
 void TDcrashLogClear(void);
 
+/// 录制链路的执行轨迹（判断崩在回调的哪一步）
+NSString *TDtraceLogText(void);
+void TDtraceLogClear(void);
+
 #pragma mark - 全局日志通道（UI 订阅用）
 
 void TDLog(NSString *fmt, ...);

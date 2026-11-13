@@ -360,6 +360,37 @@
     return b;
 }
 
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+
+    // 上次若崩了，主动把它摆到脸上，别让用户再去翻诊断页
+    static BOOL once = NO;
+    if (once) return;
+    once = YES;
+
+    NSString *crash = TDcrashLogText();
+    if (crash.length == 0) return;
+
+    NSMutableString *msg = [NSMutableString string];
+    [msg appendString:[crash substringToIndex:MIN((NSUInteger)700, crash.length)]];
+    NSString *trace = TDtraceLogText();
+    if (trace.length) {
+        [msg appendFormat:@"\n— 录制轨迹 —\n%@",
+                          [trace substringToIndex:MIN((NSUInteger)400, trace.length)]];
+    }
+
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"上次是异常退出的"
+                                                             message:msg
+                                                      preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"清空" style:UIAlertActionStyleDestructive
+                                       handler:^(UIAlertAction *x) {
+        TDcrashLogClear();
+        TDtraceLogClear();
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     [_tv reloadData];

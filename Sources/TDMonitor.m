@@ -7,6 +7,9 @@
 #include <mach/mach_time.h>
 #include <math.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <unistd.h>
 
 // ===========================================================================
 // 录制：系统级触摸监听（display integrated digitizer）
@@ -71,6 +74,23 @@ static double TDmsBetween(uint64_t a, uint64_t b) {
 
 static int  gFingerDown = 0;      // 回调线程私有的按下状态
 static double gLastPushedX = -1e9, gLastPushedY = -1e9;
+static int  gTraceFirst = 0;
+
+// 崩溃定位用的轻量 trace：回调线程里不能发 ObjC 消息，
+// 所以路径在 start 时（主线程）就准备好，这里只做 fopen/fprintf。
+static char gTracePath[1024] = {0};
+
+static void TDTrace(const char *fmt, ...) {
+    if (gTracePath[0] == 0) return;
+    FILE *fp = fopen(gTracePath, "a");
+    if (!fp) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(fp, fmt, ap);
+    va_end(ap);
+    fputc('\n', fp);
+    fclose(fp);
+}
 
 static void TDPushSample(double x, double y, int touching) {
     os_unfair_lock_lock(&gSampleLock);
@@ -88,13 +108,16 @@ static void TDPushSample(double x, double y, int touching) {
 
 static void TDHandleRawEvent(IOHIDEventRef event) {
     if (!gArmed || !event) return;
-    if (IOHIDEventGetType(event) != kIOHIDEventTypeDigitizer) return;
+    IOHIDEventType t = IOHIDEventGetType(event);
+    if (!gTraceFirst) { gTraceFirst = 1; TDTrace("回调首次触发 type=%d", (int)t); }
+    if (t != kIOHIDEventTypeDigitizer) return;
 
     __sync_fetch_and_add(&gRawEvents, 1);
 
     CFArrayRef kids = IOHIDEventGetChildren(event);
     CFIndex n = 0;
     if (kids && CFGetTypeID(kids) == CFArrayGetTypeID()) n = CFArrayGetCount(kids);
+    if (gTraceFirst == 1) { gTraceFirst = 2; TDTrace("首次 digitizer 事件 kids=%d", (int)n); }
 
     if (n > 0) {
         // 只取第一根手指；多指手势不支持
@@ -211,55 +234,32 @@ static IOHIDEventRef TDFilterCB(void *target, void *refcon, IOHIDEventRef event)
     return YES;
 }
 
-/// 备用通道：Filter 类型（3）+ RegisterEventFilterCallback。
-/// 只在主通道 2.5 秒内一个事件都没收到时才启用，避免两条通道重复入样。
-- (BOOL)openFilterChannel {
-    if (gFilterClient) return YES;
-
-    TDCreateWithTypeFn create = (TDCreateWithTypeFn)dlsym(RTLD_DEFAULT,
-                                                           "IOHIDEventSystemClientCreateWithType");
-    TDRegisterFilterFn regF = (TDRegisterFilterFn)dlsym(RTLD_DEFAULT,
-                                                        "IOHIDEventSystemClientRegisterEventFilterCallback");
-    TDScheduleFn sched = (TDScheduleFn)dlsym(RTLD_DEFAULT,
-                                             "IOHIDEventSystemClientScheduleWithRunLoop");
-    if (!create || !regF || !sched) {
-        gStatus = @"主通道无事件，且备用通道接口缺失";
-        return NO;
-    }
-    // 3 = kIOHIDEventSystemClientTypeFilter
-    gFilterClient = create(kCFAllocatorDefault, 3, NULL);
-    if (!gFilterClient) {
-        gStatus = @"主通道无事件，备用通道也建不起来";
-        TDLog(@"备用监听通道创建失败");
-        return NO;
-    }
-    regF(gFilterClient, TDFilterCB, NULL, NULL);
-    sched(gFilterClient, CFRunLoopGetMain(), kCFRunLoopCommonModes);
-    gStatus = @"已连接（filter 备用通道）";
-    TDLog(@"主通道无事件，已启用 filter 备用通道");
-    return YES;
-}
-
-- (void)armFallbackTimer {
-    __weak typeof(self) ws = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        typeof(self) ss = ws;
-        if (!ss || !ss.recording) return;
-        if (gRawEvents > 0) return;         // 主通道有事件，不用管
-        [ss openFilterChannel];
-    });
-}
+/// 备用通道已停用（Filter 类型的 client 会插进系统事件链，
+/// 一旦回调有任何问题，整个系统的触摸都会跟着出问题，风险太大）。
+- (void)armFallbackTimer { /* 空实现，保留调用点 */ }
 
 - (BOOL)start {
     @try {
         if (self.recording) return YES;
         if ([TDEngine shared].running) [[TDEngine shared] stop];
 
-        if (![self openMonitor]) return NO;
+        // trace 路径要在主线程准备好，回调线程里才敢直接 fopen
+        if (gTracePath[0] == 0) {
+            NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                                 NSUserDomainMask, YES) firstObject];
+            NSString *p = [dir stringByAppendingPathComponent:@"trace.log"];
+            snprintf(gTracePath, sizeof(gTracePath), "%s", p.fileSystemRepresentation);
+        }
+        unlink(gTracePath);
+        gTraceFirst = 0;
+        TDTrace("start: 准备建立监听");
+
+        if (![self openMonitor]) { TDTrace("openMonitor 失败"); return NO; }
+        TDTrace("监听已建立");
 
         // 切到抖音后要保持进程活着，否则一个事件都收不到
         [TDKeepAlive ensure];
+        TDTrace("保活 ok");
 
         os_unfair_lock_lock(&gSampleLock);
         gSampleCount = 0;
@@ -296,7 +296,6 @@ static IOHIDEventRef TDFilterCB(void *target, void *refcon, IOHIDEventRef event)
         CFRelease(gFilterClient);
         gFilterClient = NULL;
     }
-
     static TDSample buf[TD_SAMPLE_MAX];
     int n = 0;
     os_unfair_lock_lock(&gSampleLock);
@@ -412,3 +411,20 @@ static IOHIDEventRef TDFilterCB(void *target, void *refcon, IOHIDEventRef event)
 }
 
 @end
+
+NSString *TDtraceLogText(void) {
+    NSString *path = nil;
+    if (gTracePath[0] != 0) {
+        path = [NSString stringWithUTF8String:gTracePath];
+    } else {
+        NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                            NSUserDomainMask, YES) firstObject];
+        path = [dir stringByAppendingPathComponent:@"trace.log"];
+    }
+    NSString *s = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:NULL];
+    return s ?: @"";
+}
+
+void TDtraceLogClear(void) {
+    if (gTracePath[0] != 0) unlink(gTracePath);
+}
