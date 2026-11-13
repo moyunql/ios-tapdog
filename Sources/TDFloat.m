@@ -14,8 +14,9 @@
 //   点 ▶  = 开始执行选中脚本（录制中则结束录制并保存）
 //   点 ■  = 停止执行 / 停止录制并保存
 //   点 ◎  = 3 秒后往屏幕中间注入一次点击（验证能不能点到别的 App）
-//   长按  = 开始/停止录制
-//   拖动  = 挪位置（位置记在 NSUserDefaults）
+//   长按 ◎ = 3 秒后从下方往上方滑一次（不录制也能验证滑动）
+//   长按 ▶/■ = 开始/停止录制
+//   拖动  = 挪位置（位置记在 NSUserDefaults；取点模式下自动禁用，否则会把取点层拖走）
 // ---------------------------------------------------------------------------
 
 NSString * const TDDataChangedNotification = @"TDDataChangedNotification";
@@ -30,6 +31,7 @@ static NSString * const kTDBallPosY = @"tdBallCenterY";
 
 static TDHUDWindow *gBallWindow = nil;
 static BOOL gFullScreen = NO;      // 取点模式下窗口铺满全屏
+static UIPanGestureRecognizer *gPan = nil;   // 拖动悬浮条；取点模式下必须关掉
 static UIView *gStartView = nil;
 static UILabel *gStartLabel = nil;
 static UIView *gStopView = nil;
@@ -162,9 +164,23 @@ static void TDFloatDoTestTap(void) {
     });
 }
 
+/// ◎ 长按 = 3 秒后从屏幕下方往上方滑一次。
+/// 有它就不用先录一段才能测滑动：在抖音里长按，看它会不会翻到下一条。
+static void TDFloatDoTestSwipe(void) {
+    CGSize sb = [UIScreen mainScreen].bounds.size;
+    CGPoint a = CGPointMake(sb.width * 0.5, sb.height * 0.72);
+    CGPoint b = CGPointMake(sb.width * 0.5, sb.height * 0.28);
+    TDLog(@"3 秒后从 (%.0f, %.0f) 上滑到 (%.0f, %.0f)…", a.x, a.y, b.x, b.y);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        TDswipe(a, b, 0.30);
+        TDLog(@"已注入上滑 (%.0f,%.0f)→(%.0f,%.0f) · %@", a.x, a.y, b.x, b.y, TDhidStatus());
+    });
+}
+
 #pragma mark - 球体视图
 
-@interface TDBallVC : UIViewController
+@interface TDBallVC : UIViewController <UIGestureRecognizerDelegate>
 @end
 
 @implementation TDBallVC {
@@ -227,8 +243,35 @@ static void TDFloatDoTestTap(void) {
     gTestView.tag = 3;
     gTestLabel.text = @"◎";
 
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPan:)];
-    [self.view addGestureRecognizer:pan];
+    // ◎ 点 = 试点击；◎ 长按 = 试滑动。
+    // 滑动没法在自家界面里验证（要滑的是抖音的列表），所以给它一个
+    // 不用录制、直接打一次的入口，出问题能立刻分清是「滑动构造不对」还是「录制不对」。
+    //
+    // 注意：makeBallAtX 给每个球都挂了「长按=录制」的手势，
+    // 这里必须先把 ◎ 上那个摘掉，否则长按 ◎ 会同时开录制又打滑动。
+    for (UIGestureRecognizer *gr in [gTestView.gestureRecognizers copy]) {
+        if ([gr isKindOfClass:[UILongPressGestureRecognizer class]]) {
+            [gTestView removeGestureRecognizer:gr];
+        }
+    }
+    UILongPressGestureRecognizer *tlp =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(onTestLong:)];
+    tlp.minimumPressDuration = 0.7;
+    [gTestView addGestureRecognizer:tlp];
+    for (UIGestureRecognizer *gr in gTestView.gestureRecognizers) {
+        if ([gr isKindOfClass:[UITapGestureRecognizer class]]) {
+            [gr requireGestureRecognizerToFail:tlp];
+        }
+    }
+
+    // 拖动挪位置。这一条只在「悬浮条」形态下成立：
+    // 取点模式窗口是铺满全屏的，pan 会认全屏任意一处滑动，把整个窗口
+    // 连同取点层一起拖走（用户看到的「滑动时悬浮窗跟着滑」就是这个）。
+    // 所以 delegate + enabled 双保险，全屏时彻底关掉。
+    gPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPan:)];
+    gPan.delegate = self;
+    gPan.enabled = !gFullScreen;
+    [self.view addGestureRecognizer:gPan];
 
     TDFloatRefresh();
 }
@@ -244,13 +287,24 @@ static void TDFloatDoTestTap(void) {
     if (g.state == UIGestureRecognizerStateBegan) TDFloatToggleRecord();
 }
 
+- (void)onTestLong:(UILongPressGestureRecognizer *)g {
+    if (g.state == UIGestureRecognizerStateBegan) TDFloatDoTestSwipe();
+}
+
 /// 屏幕坐标（用 windowScene 坐标系，窗口移动时不会被抵消）
 - (CGPoint)screenPoint:(CGPoint)p inWindow:(UIWindow *)w {
     if (w.windowScene) return [w convertPoint:p toCoordinateSpace:w.windowScene.coordinateSpace];
     return p;
 }
 
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
+    // 取点模式下屏幕上的每一次滑动都是「要录的滑动」，不是拖窗口
+    if (g == gPan && gFullScreen) return NO;
+    return YES;
+}
+
 - (void)onPan:(UIPanGestureRecognizer *)g {
+    if (gFullScreen) return;          // 再挡一次：enabled 来不及生效时不至于拖走
     UIWindow *w = self.view.window;
     if (!w) return;
     CGPoint touch = [self screenPoint:[g locationInView:w] inWindow:w];
@@ -484,6 +538,12 @@ void TDFloatSetFullScreen(BOOL on) {
     if (!gBallWindow) return;
     if (on == gFullScreen) return;
     gFullScreen = on;
+
+    // 全屏 = 每一处滑动都属于取点层，拖动必须让位
+    gPan.enabled = !on;
+    if (on && gPan && gBallWindow.rootViewController.view) {
+        [gPan setTranslation:CGPointZero inView:gBallWindow.rootViewController.view];
+    }
 
     if (on) {
         gStartView.hidden = YES;

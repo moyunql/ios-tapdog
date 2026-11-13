@@ -66,7 +66,12 @@ void TDtraceLogClear(void) {
 #pragma mark - 取点层
 
 #define TD_MARK_R 14.0
-#define TD_MOVE_THRESHOLD 12.0
+// 12pt 太灵敏：手指按下时的轻微滚动会被记成一次「滑动」，回放时抖音只会抖一下。
+// 16pt 大约是手指垫的宽度，超过它才真的算要滑。
+#define TD_MOVE_THRESHOLD 16.0
+// 滑动时长下限。录时有人的手很快，80ms 的一划系统会当成轻扫丢掉，
+// 回放出来抖音原地不动；拉到 160ms 依然像"快速一划"，但能被认。
+#define TD_SWIPE_MIN_MS 160.0
 
 @interface TDPickerView : UIView
 @property (nonatomic, strong) NSMutableArray<NSDictionary *> *steps;
@@ -108,7 +113,9 @@ void TDtraceLogClear(void) {
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (!self) return nil;
-    self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.10];
+    // 完全透明：录制滑动要靠眼睛看画面定起点，10% 的灰罩会让颜色发闷。
+    // 透明背景不影响 hitTest（view.alpha 仍是 1），触摸照收。
+    self.backgroundColor = [UIColor clearColor];
     self.multipleTouchEnabled = NO;
     self.opaque = NO;
     self.clipsToBounds = YES;
@@ -273,7 +280,7 @@ void TDtraceLogClear(void) {
         d[@"y1"] = @((NSInteger)lround(y));
         d[@"x2"] = @((NSInteger)lround(x2));
         d[@"y2"] = @((NSInteger)lround(y2));
-        d[@"ms"] = @((NSInteger)MAX(80.0, durMs));
+        d[@"ms"] = @((NSInteger)MAX(TD_SWIPE_MIN_MS, durMs));
     } else if (durMs >= 500) {
         d[@"t"] = @"long";
         d[@"x"] = @((NSInteger)lround(x));
@@ -354,11 +361,39 @@ void TDtraceLogClear(void) {
     }
 
     if (_live) {
-        CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithWhite:1 alpha:0.75].CGColor);
-        CGContextSetLineWidth(ctx, 2);
+        // 手指还按着：把「从哪起手、现在到哪、走了多远」实时画出来。
+        // 之前只画一根白线，滑动时看不出自己滑了多长，经常录出 20pt 的「假滑动」。
+        CGFloat dist = (CGFloat)hypot(_curP.x - _startP.x, _curP.y - _startP.y);
+        BOOL moving = dist > TD_MOVE_THRESHOLD;
+        UIColor *c = moving ? swipeColor : tapColor;
+
+        CGContextSetStrokeColorWithColor(ctx, [c colorWithAlphaComponent:0.85].CGColor);
+        CGContextSetLineWidth(ctx, 2.5);
+        CGContextSetLineCap(ctx, kCGLineCapRound);
         CGContextMoveToPoint(ctx, _startP.x, _startP.y);
         CGContextAddLineToPoint(ctx, _curP.x, _curP.y);
         CGContextStrokePath(ctx);
+
+        // 起点留个小空心圈，方便看这次是从哪里起手的
+        CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithWhite:1 alpha:0.7].CGColor);
+        CGContextSetLineWidth(ctx, 1.5);
+        CGContextStrokeEllipseInRect(ctx, CGRectMake(_startP.x - 8, _startP.y - 8, 16, 16));
+
+        // 当前指尖
+        CGContextSetFillColorWithColor(ctx, [c colorWithAlphaComponent:0.5].CGColor);
+        CGContextFillEllipseInRect(ctx, CGRectMake(_curP.x - 11, _curP.y - 11, 22, 22));
+        CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithWhite:1 alpha:0.9].CGColor);
+        CGContextSetLineWidth(ctx, 1.5);
+        CGContextStrokeEllipseInRect(ctx, CGRectMake(_curP.x - 11, _curP.y - 11, 22, 22));
+
+        NSString *s = moving ? [NSString stringWithFormat:@"滑动 %.0fpt", dist] : @"按住";
+        UIFont *f = [UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightBold];
+        CGSize sz = [s sizeWithAttributes:@{NSFontAttributeName: f}];
+        CGPoint tp = CGPointMake(_curP.x - sz.width / 2, _curP.y - 34);
+        tp.x = MAX(6, MIN(self.bounds.size.width - sz.width - 6, tp.x));
+        tp.y = MAX(6, MIN(self.bounds.size.height - sz.height - 6, tp.y));
+        [s drawAtPoint:tp withAttributes:@{NSFontAttributeName: f,
+                                           NSForegroundColorAttributeName: UIColor.whiteColor}];
     }
 }
 

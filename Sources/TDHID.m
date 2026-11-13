@@ -5,6 +5,7 @@
 #import <dlfcn.h>
 #include <mach/mach_time.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include <errno.h>
 
 // ---------------------------------------------------------------------------
@@ -846,36 +847,84 @@ void TDlongPress(CGFloat x, CGFloat y, NSTimeInterval sec) {
 }
 
 void TDgesture(NSArray<NSValue *> *points, NSTimeInterval sec) {
-    if (points.count < 2) return;
+    NSInteger n = (NSInteger)points.count;
+    if (n < 2) return;
+
+    CGSize sb = [UIScreen mainScreen].bounds.size;
+    if (sb.width < 1 || sb.height < 1) return;
+
+    // 累计弧长：多点轨迹按「已经走过的距离」采样。
+    // 旧写法是每段各自算帧数、段内 sleep 又除以段数，多点时实际总时长
+    // 会缩水一大半，手感像被弹了一下。
+    CGFloat *acc = (CGFloat *)calloc((size_t)n, sizeof(CGFloat));
+    if (!acc) return;
+    for (NSInteger i = 1; i < n; i++) {
+        CGPoint a = [points[i - 1] CGPointValue];
+        CGPoint b = [points[i] CGPointValue];
+        acc[i] = acc[i - 1] + (CGFloat)hypot(b.x - a.x, b.y - a.y);
+    }
+    CGFloat totalLen = acc[n - 1];
+    if (totalLen < 3) { free(acc); return; }   // 基本没动，按点击处理更合适
+
+    // 时长太短会被当成「轻扫」判无效，太长又像拖拽。真实翻页 0.2~0.6s。
+    NSTimeInterval total = sec;
+    if (!(total > 0)) total = 0.35;
+    total = MAX(0.15, MIN(1.2, total));
+
+    const NSTimeInterval kFrame = 0.008;       // 125Hz，贴近真实触摸采样率
+    NSInteger frames = (NSInteger)(total / kFrame + 0.5);
+    frames = MAX(8, MIN(150, frames));
 
     uint32_t ident = TDNextIdentity();
     CGPoint first = [points[0] CGPointValue];
     TDEmit(kMaskDown, YES, first.x, first.y, ident);
 
-    NSTimeInterval total = sec > 0 ? sec : 0.35;
-    NSInteger segments = (NSInteger)points.count - 1;
-    CGFloat totalLen = 0;
-    for (NSUInteger i = 1; i < points.count; i++) {
-        CGPoint a = [points[i - 1] CGPointValue];
-        CGPoint b = [points[i] CGPointValue];
-        totalLen += hypot(b.x - a.x, b.y - a.y);
-    }
-    if (totalLen < 1) totalLen = 1;
+    // 按下后的十几毫秒手指其实没动。补一帧原地 move，
+    // 让系统先建立「这根手指处于移动中」的序列，再开始跳坐标。
+    usleep(16000);
+    TDEmit(kMaskMove, YES, first.x, first.y, ident);
 
-    for (NSUInteger i = 1; i < points.count; i++) {
-        CGPoint a = [points[i - 1] CGPointValue];
-        CGPoint b = [points[i] CGPointValue];
-        CGFloat len = hypot(b.x - a.x, b.y - a.y);
-        NSInteger frames = MAX(2, (NSInteger)round(len / totalLen * total / 0.012));
-        for (NSInteger f = 1; f <= frames; f++) {
-            CGFloat t = (CGFloat)f / (CGFloat)frames;
-            TDEmit(kMaskMove, YES, a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, ident);
-            usleep((useconds_t)(total / (frames * MAX(1, segments)) * 1000000));
+    // 速度曲线：前 22% 加速，其余匀速。
+    // 末端绝不能减速到 0 —— 抖音靠抬手瞬间的位移速度判翻页，
+    // 一停就变成「拖到一半松手」，页面只会回弹。
+    // 所以最后一帧停在 97%，剩下 3% 交给 up 那一下完成。
+    const CGFloat kAccel = 0.22f;
+    const CGFloat kEndP  = 0.97f;
+
+    for (NSInteger f = 1; f <= frames; f++) {
+        CGFloat t = (CGFloat)f / (CGFloat)frames;
+        CGFloat p;
+        if (t <= kAccel) {
+            CGFloat u = t / kAccel;
+            p = kAccel * u * u;
+        } else {
+            p = kAccel + (1.0f - kAccel) * ((t - kAccel) / (1.0f - kAccel));
         }
+        if (p > kEndP) p = kEndP;
+
+        CGFloat want = totalLen * p;
+        NSInteger seg = 1;
+        while (seg < n - 1 && acc[seg] < want) seg++;
+        CGFloat segLen = acc[seg] - acc[seg - 1];
+        CGFloat k = segLen > 0.5f ? (want - acc[seg - 1]) / segLen : 1.0f;
+        CGPoint a = [points[seg - 1] CGPointValue];
+        CGPoint b = [points[seg] CGPointValue];
+
+        CGFloat x = a.x + (b.x - a.x) * k;
+        CGFloat y = a.y + (b.y - a.y) * k;
+        x = MAX(0, MIN(sb.width  - 1, x));
+        y = MAX(0, MIN(sb.height - 1, y));
+
+        TDEmit(kMaskMove, YES, x, y, ident);
+        usleep((useconds_t)(kFrame * 1000000));
     }
 
-    CGPoint last = [points.lastObject CGPointValue];
+    CGPoint last = [points[n - 1] CGPointValue];
+    last.x = MAX(0, MIN(sb.width  - 1, last.x));
+    last.y = MAX(0, MIN(sb.height - 1, last.y));
     TDEmit(kMaskUp, NO, last.x, last.y, ident);
+    free(acc);
+
     TDShowFeedback(last.x, last.y);
 }
 
