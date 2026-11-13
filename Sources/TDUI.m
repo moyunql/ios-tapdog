@@ -10,6 +10,15 @@
 // ---------------------------------------------------------------------------
 static NSString *gAudioStatus = @"未启动";
 
+// 切到别的 App（TapDog 进后台）时自动开跑，省得再去点悬浮球
+static BOOL TDAutoStartGet(void) {
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:@"tdAutoStartOnBackground"];
+    return v == nil ? YES : [v boolValue];
+}
+static void TDAutoStartSet(BOOL on) {
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"tdAutoStartOnBackground"];
+}
+
 @interface TDKeepAlive : NSObject
 + (void)start;
 + (NSString *)status;
@@ -351,7 +360,7 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
 }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    if (s == 0) return 5;
+    if (s == 0) return 8;
     if (s == 1) return [TDConfig shared].steps.count;
     return 4;
 }
@@ -373,6 +382,7 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
     UITableViewCell *c = [tv dequeueReusableCellWithIdentifier:@"c"];
     if (!c) c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"c"];
     c.accessoryType = UITableViewCellAccessoryNone;
+    c.accessoryView = nil;
     c.detailTextLabel.textColor = [UIColor secondaryLabelColor];
 
     if (ip.section == 0) {
@@ -387,8 +397,28 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
             c.detailTextLabel.text = TDSandboxStatus();
         } else if (ip.row == 3) {
             c.textLabel.text = @"后台保活";
-            c.detailTextLabel.text = [TDKeepAlive status];
+            c.detailTextLabel.text = [NSString stringWithFormat:@"%@ · %@",
+                                      [TDKeepAlive status],
+                                      [TDEngine shared].jetsamStatus ?: @"jetsam 未设置"];
+        } else if (ip.row == 4) {
+            c.textLabel.text = @"悬浮窗（盖在其他 App 上）";
+            c.detailTextLabel.text = TDHUDStatus();
+        } else if (ip.row == 5) {
+            c.textLabel.text = @"穿透模式（手动刷抖音时打开）";
+            c.detailTextLabel.text = TDHUDPassthrough() ? @"开：悬浮球不接管触摸" : @"关：可拖动悬浮球";
+            UISwitch *sw = [[UISwitch alloc] init];
+            sw.on = TDHUDPassthrough();
+            [sw addTarget:self action:@selector(togglePassthrough:) forControlEvents:UIControlEventValueChanged];
+            c.accessoryView = sw;
+        } else if (ip.row == 6) {
+            c.textLabel.text = @"切到抖音自动开始";
+            c.detailTextLabel.text = TDAutoStartGet() ? @"开：进入后台即开跑" : @"关：需手动点开始";
+            UISwitch *sw = [[UISwitch alloc] init];
+            sw.on = TDAutoStartGet();
+            [sw addTarget:self action:@selector(toggleAutoStart:) forControlEvents:UIControlEventValueChanged];
+            c.accessoryView = sw;
         } else {
+            c.accessoryView = nil;
             c.textLabel.text = @"随机偏移 / 阈值 / 循环";
             c.detailTextLabel.text = [NSString stringWithFormat:@"±%.0fpt   %.2f   %@",
                                       [TDConfig shared].jitterPx, [TDConfig shared].threshold,
@@ -410,9 +440,21 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
     return c;
 }
 
+- (void)togglePassthrough:(UISwitch *)sw {
+    TDHUDSetPassthrough(sw.isOn);
+    [[TDEngine shared] logMsg:@"穿透模式：%@", sw.isOn ? @"开" : @"关"];
+    [_tv reloadData];
+}
+
+- (void)toggleAutoStart:(UISwitch *)sw {
+    TDAutoStartSet(sw.isOn);
+    [[TDEngine shared] logMsg:@"切后台自动开始：%@", sw.isOn ? @"开" : @"关"];
+    [_tv reloadData];
+}
+
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
-    if (ip.section == 0 && ip.row == 4) { [self editSettings]; return; }
+    if (ip.section == 0 && ip.row == 7) { [self editSettings]; return; }
     if (ip.section != 2) return;
 
     TDPickerMode mode = (ip.row == 0) ? TDPickerTap : (ip.row == 1) ? TDPickerLong : (ip.row == 2) ? TDPickerSwipe : TDPickerRect;
@@ -589,11 +631,13 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
 
 @interface TDAppDelegate : UIResponder <UIApplicationDelegate>
 @property (nonatomic, strong) UIWindow *window;
-@property (nonatomic, strong) UIWindow *floatWindow;
+@property (nonatomic, strong) TDHUDWindow *floatWindow;
 @property (nonatomic, strong) TDFloatVC *floatVC;
 @end
 
-@implementation TDAppDelegate
+@implementation TDAppDelegate {
+    BOOL _autoStarted;
+}
 
 - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)opt {
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
@@ -602,24 +646,104 @@ typedef NS_ENUM(NSInteger, TDPickerMode) {
     self.window.rootViewController = nav;
     [self.window makeKeyAndVisible];
 
-    // 悬浮球：只在 TapDog 自己的界面里可见。
-    // 想盖到别的 App 上面需要 SpringBoard 侧的 window hosting，纯 TrollStore 环境做不到，
-    // 所以实际用法是「点开始 → 3 秒倒计时 → 自己切到抖音」。
-    self.floatWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    self.floatWindow.windowLevel = 10000000;
-    self.floatWindow.backgroundColor = [UIColor clearColor];
-    self.floatWindow.rootViewController = [TDFloatVC new];
-    self.floatVC = (TDFloatVC *)self.floatWindow.rootViewController;
+    // 悬浮球：TDHUDWindow 是「系统窗口」，配合 SBSAccessibilityWindowHostingController
+    // 把 context 托管给 SpringBoard 渲染，所以切到抖音后依然浮在最上层、还能拖、还能点。
+    TDHUDWindow *fw = [[TDHUDWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    fw.windowLevel = 10000010.0;          // 高于状态栏/键盘/系统弹窗
+    fw.backgroundColor = [UIColor clearColor];
+    fw.rootViewController = [TDFloatVC new];
+    self.floatWindow = fw;
+    self.floatVC = (TDFloatVC *)fw.rootViewController;
     __weak typeof(self) ws = self;
     self.floatVC.onTap = ^{
         TDEngine *e = [TDEngine shared];
         if (e.running) [e stop]; else [e startWithScript:@{}];
         [ws.floatVC setRunning:e.running];
     };
-    self.floatWindow.hidden = NO;
+
+    // 挂到当前 scene 上才会有 CGS context
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if ([s isKindOfClass:[UIWindowScene class]]) { fw.windowScene = (UIWindowScene *)s; break; }
+    }
+    fw.hidden = NO;
+
+    [self registerOverlayWithRetry:0];
+
+    // 回到前台 / scene 重新激活时 context 可能变了，重挂一次
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(sceneReactivated)
+                                                 name:UISceneDidActivateNotification
+                                               object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(sceneReactivated)
+                                                 name:UIApplicationDidBecomeActiveNotification
+                                               object:nil];
+    // 进入后台后再确认一次托管关系，防止被系统悄悄摘掉
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(appDidBackground)
+                                                 name:UIApplicationDidEnterBackgroundNotification
+                                               object:nil];
 
     [TDKeepAlive start];
+    [TDEngine shared].jetsamStatus = TDBypassJetsam();
+
+    BOOL ok = TDHUDRegisterWindow(fw);
+    [[TDEngine shared] logMsg:@"悬浮窗: %@", ok ? TDHUDStatus() : @"等待窗口就绪…"];
     return YES;
+}
+
+/// 窗口的 context 是异步建出来的，前几帧拿不到，需要重试几次
+- (void)registerOverlayWithRetry:(NSInteger)n {
+    __weak typeof(self) ws = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * n * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        typeof(self) ss = ws;
+        if (!ss.floatWindow) return;
+        if (TDHUDRegisterWindow(ss.floatWindow)) {
+            [[TDEngine shared] logMsg:@"悬浮窗: %@", TDHUDStatus()];
+            return;
+        }
+        // 兜底：某些情况下只有 makeKeyAndVisible 才会真正建出 CGS context
+        if (n == 2) {
+            [ss.floatWindow makeKeyAndVisible];
+            [ss.window makeKeyWindow];
+            if (TDHUDRegisterWindow(ss.floatWindow)) {
+                [[TDEngine shared] logMsg:@"悬浮窗: %@（makeKey 兜底）", TDHUDStatus()];
+                return;
+            }
+        }
+        if (n < 8) [ss registerOverlayWithRetry:n + 1];
+        else [[TDEngine shared] logMsg:@"悬浮窗: 托管失败 %@", TDHUDStatus()];
+    });
+}
+
+- (void)sceneReactivated {
+    // 回到 TapDog 就停手，免得在自己界面上乱点
+    if (_autoStarted) {
+        _autoStarted = NO;
+        [[TDEngine shared] stop];
+        [[TDEngine shared] logMsg:@"回到前台，已自动停止"];
+    }
+    if (self.floatWindow) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            TDHUDRegisterWindow(self.floatWindow);
+        });
+    }
+}
+
+- (void)appDidBackground {
+    // 进后台时窗口会被 UIKit 藏起来，这里重新托管一次，让 SpringBoard 继续画
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self.floatWindow) return;
+        self.floatWindow.hidden = NO;
+        TDHUDRegisterWindow(self.floatWindow);
+
+        if (TDAutoStartGet() && [TDConfig shared].steps.count > 0 && ![TDEngine shared].running) {
+            self->_autoStarted = YES;
+            [[TDEngine shared] startWithScript:@{}];
+        }
+        [[TDEngine shared] logMsg:@"后台：保活 %@ | 悬浮窗 %@", [TDKeepAlive status], TDHUDStatus()];
+    });
 }
 
 @end

@@ -40,6 +40,7 @@ TDMatch * _Nullable TDfindImage(UIImage *tpl, double threshold, double minScale,
 @interface TDEngine : NSObject
 + (instancetype)shared;
 @property (nonatomic, readonly) BOOL running;
+@property (nonatomic, copy, nullable) NSString *jetsamStatus;
 @property (nonatomic, copy, nullable) void (^logHandler)(NSString *msg);
 - (void)startWithScript:(NSDictionary *)script;
 - (void)stop;
@@ -65,5 +66,23 @@ TDMatch * _Nullable TDfindImage(UIImage *tpl, double threshold, double minScale,
 
 /// 屏幕点尺寸 / 像素尺寸 换算比（用于把截图像素坐标转成点击点坐标）
 CGFloat TDscreenScaleRatio(void);
+
+#pragma mark - 系统级悬浮窗（SpringBoard 托管，可盖在别的 App 上）
+
+/// 必须用这个类，普通 UIWindow 盖不到别的 App 上面
+@interface TDHUDWindow : UIWindow
+@end
+
+/// 把窗口的 context 交给 SpringBoard 渲染；返回 NO 表示还没就绪，可稍后重试
+BOOL TDHUDRegisterWindow(UIWindow *w);
+void TDHUDUnregisterWindow(UIWindow *w);
+NSString *TDHUDStatus(void);
+
+/// 穿透模式：YES 时悬浮窗完全不接管触摸，手动滑动抖音时打开
+void TDHUDSetPassthrough(BOOL on);
+BOOL TDHUDPassthrough(void);
+
+/// 把自己提升到 critical jetsam 优先级并禁止冻结，切到别的 App 后不被回收
+NSString *TDBypassJetsam(void);
 
 NS_ASSUME_NONNULL_END

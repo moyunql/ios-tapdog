@@ -104,6 +104,7 @@ static NSString *TDConfigPath(void) {
     BOOL _running;
     dispatch_queue_t _q;
     NSInteger _doneCount;
+    NSString *_jetsamStatus;
 }
 
 + (instancetype)shared {
@@ -136,10 +137,14 @@ static CGPoint TDJitter(CGPoint p, double r) {
 
 - (void)startWithScript:(NSDictionary *)script {
     if (_running) return;
-    _running = YES;
-    _doneCount = 0;
     TDConfig *cfg = [TDConfig shared];
     NSArray *steps = script[@"steps"] ?: cfg.steps;
+    if (steps.count == 0) {
+        [self logMsg:@"还没有步骤，先在「添加」里取几个点"];
+        return;
+    }
+    _running = YES;
+    _doneCount = 0;
     NSInteger loops = script[@"loop"] ? [script[@"loop"] integerValue] : cfg.loopCount;
 
     [self logMsg:@"开始，共 %lu 步，循环 %@", (unsigned long)steps.count,
