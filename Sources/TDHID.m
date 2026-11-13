@@ -32,8 +32,143 @@ static volatile int32_t gInjectCount = 0;
 void TDSetInjectFeedbackHandler(TDInjectFeedbackFn fn) { gFeedback = fn; }
 NSInteger TDInjectCount(void) { return (NSInteger)gInjectCount; }
 
-// 内建触摸屏的 senderID；系统据此认定事件来自真实屏幕
-static const uint64_t kTDSenderID = 0x8000000817319372ULL;
+// 内建触摸屏的 senderID 前缀；后 32 位是 IORegistryEntryID，每台机器不一样，
+// 所以硬编码只可能碰对，碰不对系统就当「来自不存在设备的事件」丢掉。
+static const uint64_t kTDDefaultSenderID = 0x8000000817319372ULL;
+
+// 注入参数方案（诊断页可切，见 TDInjectVC）
+static NSString * const kInjVariantKey = @"tdInjVariant";
+static NSString * const kInjBuiltInKey = @"tdInjBuiltIn";
+static NSString * const kInjBKSKey     = @"tdInjBKS";
+
+static uint64_t gProbedSender = 0;
+static BOOL gProbedTried = NO;
+
+static IOHIDEventSystemClientRef TDhidClient(void);   // 定义在本文件后面
+
+typedef CFArrayRef (*TDCopyServicesFn)(IOHIDEventSystemClientRef);
+typedef CFTypeRef (*TDServiceGetPropFn)(void *service, CFStringRef key);
+
+/// 从 IOHIDEventSystemClient 的服务列表里读真实 senderID。
+/// 读不到就返回 0（调用方会退化成「不设 senderID」）。
+uint64_t TDProbedSenderID(void) {
+    if (gProbedTried) return gProbedSender;
+    gProbedTried = YES;
+
+    IOHIDEventSystemClientRef c = TDhidClient();
+    if (!c) return 0;
+
+    TDCopyServicesFn copyServices =
+        (TDCopyServicesFn)dlsym(RTLD_DEFAULT, "IOHIDEventSystemClientCopyServices");
+    TDServiceGetPropFn getProp =
+        (TDServiceGetPropFn)dlsym(RTLD_DEFAULT, "IOHIDServiceClientGetProperty");
+    if (!copyServices || !getProp) return 0;
+
+    CFArrayRef services = copyServices(c);
+    if (!services) return 0;
+    if (CFGetTypeID(services) != CFArrayGetTypeID()) { CFRelease(services); return 0; }
+
+    CFStringRef keys[] = { CFSTR("SenderID"), CFSTR("HIDSenderID"), CFSTR("senderID") };
+    CFIndex n = CFArrayGetCount(services);
+    for (CFIndex i = 0; i < n && gProbedSender == 0; i++) {
+        void *svc = (void *)CFArrayGetValueAtIndex(services, i);
+        if (!svc) continue;
+        for (int k = 0; k < 3 && gProbedSender == 0; k++) {
+            CFTypeRef v = getProp(svc, keys[k]);
+            if (!v || CFGetTypeID(v) != CFNumberGetTypeID()) continue;
+            long long num = 0;
+            if (CFNumberGetValue((CFNumberRef)v, kCFNumberLongLongType, &num) && num != 0) {
+                gProbedSender = (uint64_t)num;
+            }
+        }
+    }
+    CFRelease(services);
+    return gProbedSender;
+}
+
+// BackBoardServices 的私有函数：告诉 BackBoard 这个 digitizer 事件属于哪块屏。
+// iOS 13 之后没有它，事件进不了 WindowServer 的投递队列（绝大多数「注入了但没反应」就是这个）。
+typedef void (*TDBKSSetDigitizerInfoFn)(IOHIDEventRef event,
+                                        uint32_t contextID,
+                                        uint32_t pathIndex,
+                                        BOOL isDisplayIntegrated,
+                                        CFStringRef displayUUID,
+                                        double minXOrY,
+                                        double maxXOrY);
+
+static void TDApplyBKSDigitizerInfo(IOHIDEventRef event) {
+    static TDBKSSetDigitizerInfoFn fn = NULL;
+    static BOOL tried = NO;
+    if (!tried) {
+        tried = YES;
+        dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices",
+               RTLD_LAZY | RTLD_GLOBAL);
+        fn = (TDBKSSetDigitizerInfoFn)dlsym(RTLD_DEFAULT, "BKSHIDEventSetDigitizerInfo");
+    }
+    if (!fn) return;
+    // contextID 给 0 = 让 BackBoard 用当前活动显示；displayUUID 给 NULL 同理
+    fn(event, 0, 0, YES, NULL, 0.0, 0.0);
+}
+
+#pragma mark - 注入调试配置
+
+void TDSetInjectVariant(NSInteger v) {
+    [[NSUserDefaults standardUserDefaults] setInteger:v forKey:kInjVariantKey];
+}
+NSInteger TDInjectVariantCurrent(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if ([d objectForKey:kInjVariantKey] == nil) return TDInjectVariantNoSender;   // 默认最保守
+    return [d integerForKey:kInjVariantKey];
+}
+
+void TDSetInjectBuiltIn(BOOL on) {
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:kInjBuiltInKey];
+}
+BOOL TDInjectBuiltInOn(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kInjBuiltInKey];
+}
+
+void TDSetInjectBKSDigitizerInfo(BOOL on) {
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:kInjBKSKey];
+}
+BOOL TDInjectBKSDigitizerInfoOn(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kInjBKSKey];
+}
+
+/// App 每次启动都回到「安全默认」：BKS 那步有崩溃风险，
+/// 万一是它把 App 弄崩的，重开就自动关掉，不会连环崩。
+void TDInjectResetToSafeDefaults(void) {
+    TDSetInjectBKSDigitizerInfo(NO);
+}
+
+NSString *TDInjectVariantDesc(void) {
+    NSInteger v = TDInjectVariantCurrent();
+    NSString *s;
+    if (v == TDInjectVariantHardSender) {
+        s = @"硬编码 senderID";
+    } else if (v == TDInjectVariantAutoSender) {
+        uint64_t sid = TDProbedSenderID();
+        s = sid ? [NSString stringWithFormat:@"自动 senderID (%llx)", sid]
+                : @"自动 senderID（没探到，等同不设）";
+    } else {
+        s = @"不设 senderID";
+    }
+    if (TDInjectBuiltInOn()) s = [s stringByAppendingString:@" + IsBuiltIn"];
+    if (TDInjectBKSDigitizerInfoOn()) s = [s stringByAppendingString:@" + BKS"];
+    return s;
+}
+
+static void TDApplyInjectOptions(IOHIDEventRef hand) {
+    uint64_t sid = 0;
+    switch (TDInjectVariantCurrent()) {
+        case TDInjectVariantHardSender: sid = kTDDefaultSenderID; break;
+        case TDInjectVariantAutoSender: sid = TDProbedSenderID(); break;
+        default: break;
+    }
+    if (sid) IOHIDEventSetSenderID(hand, sid);
+    if (TDInjectBuiltInOn()) IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldIsBuiltIn, 1);
+    if (TDInjectBKSDigitizerInfoOn()) TDApplyBKSDigitizerInfo(hand);
+}
 
 static IOHIDEventSystemClientRef TDhidClient(void) {
     if (gClient) return gClient;
@@ -120,7 +255,7 @@ static void TDEmit(uint32_t mask, BOOL touch, CGFloat x, CGFloat y) {
         CFRelease(finger);
     }
 
-    IOHIDEventSetSenderID(hand, kTDSenderID);
+    TDApplyInjectOptions(hand);
     IOHIDEventSystemClientDispatchEvent(client, hand);
     CFRelease(hand);
 }

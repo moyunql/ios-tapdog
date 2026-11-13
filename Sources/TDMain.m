@@ -87,6 +87,9 @@ extern UIViewController *TDCreateMainVC(void);
     self.window.backgroundColor = [UIColor blackColor];
     [self.window makeKeyAndVisible];
 
+    // 注入参数回到安全默认（BKS 那一步可能崩，每次启动先关掉，不连环崩）
+    TDInjectResetToSafeDefaults();
+
     [TDKeepAlive start];
     [TDEngine shared].jetsamStatus = TDBypassJetsam();
     TDFloatInstall();
@@ -99,7 +102,8 @@ extern UIViewController *TDCreateMainVC(void);
                                              selector:@selector(didBecomeActive)
                                                  name:UIApplicationDidBecomeActiveNotification
                                                object:nil];
-    TDLog(@"启动 | 注入 %@ | 截屏 %@", TDhidStatus(), TDcaptureStatus());
+    TDLog(@"启动 | 注入 %@ (%@) | 截屏 %@",
+          TDhidStatus(), TDInjectVariantDesc(), TDcaptureStatus());
     return YES;
 }
 

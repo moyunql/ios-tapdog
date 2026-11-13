@@ -140,6 +140,25 @@ void TDSetInjectFeedbackEnabled(BOOL on);
 /// 本次运行累计注入了多少次按下（诊断用）
 NSInteger TDInjectCount(void);
 
+#pragma mark - 注入调试（这台机器到底认哪种事件构造）
+
+typedef NS_ENUM(NSInteger, TDInjectVariant) {
+    TDInjectVariantNoSender   = 0,   // 不设 senderID（最保守）
+    TDInjectVariantHardSender = 1,   // 硬编码 0x8000000817319372
+    TDInjectVariantAutoSender = 2,   // 读本机 HID 服务的真实 senderID
+};
+
+void TDSetInjectVariant(NSInteger v);
+NSInteger TDInjectVariantCurrent(void);
+void TDSetInjectBuiltIn(BOOL on);
+BOOL TDInjectBuiltInOn(void);
+/// BackBoardServices 的 digitizer 信息（可能崩，默认关，每次启动自动复位）
+void TDSetInjectBKSDigitizerInfo(BOOL on);
+BOOL TDInjectBKSDigitizerInfoOn(void);
+void TDInjectResetToSafeDefaults(void);
+uint64_t TDProbedSenderID(void);
+NSString *TDInjectVariantDesc(void);
+
 /// 穿透模式：YES 时悬浮球不接管触摸（球也点不了，但完全不挡下面）
 void TDHUDSetPassthrough(BOOL on);
 BOOL TDHUDPassthrough(void);

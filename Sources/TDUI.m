@@ -124,6 +124,9 @@
 
 @end
 
+@interface TDInjectVC : UITableViewController
+@end
+
 #pragma mark - 诊断页
 
 @interface TDDiagVC : UIViewController <UITableViewDataSource>
@@ -142,7 +145,8 @@
 
     _titles = @[@"触摸注入", @"截屏", @"悬浮球托管", @"录制（全屏取点）",
                 @"后台保活", @"沙盒 / 权限", @"点击偏移 / 循环",
-                @"注入自检（点得动吗）", @"崩溃日志", @"点击反馈（200ms 红圈）"];
+                @"注入自检（点得动吗）", @"崩溃日志", @"点击反馈（200ms 红圈）",
+                @"注入调试（点不动就试这个）"];
 
     _tv = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
     _tv.dataSource = self;
@@ -195,6 +199,9 @@
         BOOL on = TDInjectFeedbackEnabled();
         c.detailTextLabel.text = on ? @"开 · 每次点击冒一个红圈，能看清点在哪"
                                     : @"关 · 回放时不显示任何标记";
+    } else if (ip.row == 10) {
+        c.detailTextLabel.text = TDInjectVariantDesc();
+        c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     }
     return c;
 }
@@ -206,6 +213,8 @@
     } else if (ip.row == 9) {
         TDSetInjectFeedbackEnabled(!TDInjectFeedbackEnabled());
         [tv reloadData];
+    } else if (ip.row == 10) {
+        [self.navigationController pushViewController:[TDInjectVC new] animated:YES];
     } else if (ip.row == 8) {
         NSString *log = TDcrashLogText();
         UIAlertController *a = [UIAlertController alertControllerWithTitle:@"崩溃日志"
@@ -218,6 +227,170 @@
         [a addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
         [self presentViewController:a animated:YES completion:nil];
     }
+}
+
+@end
+
+#pragma mark - 注入调试
+
+/// 「点得动吗」手术台：把事件构造的几种可能拆成开关，
+/// 一次安装就能在这台机器上把组合试完，不用每轮都重新出包。
+@implementation TDInjectVC {
+    NSInteger _trialLeft;
+    NSTimer   *_trialTimer;
+}
+
+- (instancetype)init { return [super initWithStyle:UITableViewStyleInsetGrouped]; }
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"注入调试";
+    self.view.backgroundColor = TD_BG;
+    self.tableView.backgroundColor = TD_BG;
+    self.tableView.separatorColor = TD_LINE;
+    TDProbedSenderID();          // 先把真实 ID 探出来，界面上直接显示结果
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 3; }
+
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
+    return @[@"① 事件里的 senderID 怎么给",
+             @"② 再补哪些字段",
+             @"③ 试一次"][s];
+}
+
+- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
+    if (s == 0) {
+        uint64_t sid = TDProbedSenderID();
+        return [NSString stringWithFormat:@"当前：%@\n本机真实 senderID：%@",
+                TDInjectVariantDesc(),
+                sid ? [NSString stringWithFormat:@"0x%llx", sid] : @"读不到（不设也不影响）"];
+    }
+    if (s == 1) {
+        return @"BackBoard digitizer info 是 iOS 13 之后的关键一步，"
+               @"但参数不对会直接闪退。每次启动 App 都会自动关掉它。";
+    }
+    return @"点一下 → 5 秒后往屏幕正中注入一次。这时按 Home 切到抖音等着："
+            "红圈冒出来而且视频暂停/继续，就说明这个组合对了。";
+}
+
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
+    return s == 0 ? 3 : (s == 1 ? 2 : 1);
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    UITableViewCell *c = [tv dequeueReusableCellWithIdentifier:@"i"];
+    if (!c) c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"i"];
+    c.backgroundColor = TD_CARD;
+    c.textLabel.textColor = TD_TEXT;
+    c.detailTextLabel.textColor = TD_DIM;
+    c.detailTextLabel.numberOfLines = 0;
+    c.accessoryType = UITableViewCellAccessoryNone;
+
+    if (ip.section == 0) {
+        NSArray<NSString *> *names = @[@"不设 senderID（最保守）",
+                                       @"硬编码 0x8000000817319372",
+                                       @"读本机真实 senderID"];
+        NSArray<NSString *> *subs = @[@"让 admin 客户端自己填，不会被当成外来设备",
+                                      @"社区流传的那个值，机型不对就被丢掉",
+                                      @"从 HID 服务列表里读，理论上最准"];
+        c.textLabel.text = names[ip.row];
+        c.detailTextLabel.text = subs[ip.row];
+        if (TDInjectVariantCurrent() == ip.row) {
+            c.accessoryType = UITableViewCellAccessoryCheckmark;
+        }
+    } else if (ip.section == 1) {
+        if (ip.row == 0) {
+            c.textLabel.text = @"补 IsBuiltIn = 1";
+            c.detailTextLabel.text = @"声明成内建事件，有的系统只认带这个的";
+            if (TDInjectBuiltInOn()) c.accessoryType = UITableViewCellAccessoryCheckmark;
+        } else {
+            c.textLabel.text = @"补 BackBoard digitizer info";
+            c.detailTextLabel.text = @"告诉 BackBoard 这事件属于哪块屏（⚠️ 可能闪退）";
+            if (TDInjectBKSDigitizerInfoOn()) c.accessoryType = UITableViewCellAccessoryCheckmark;
+        }
+    } else {
+        if (_trialLeft > 0) {
+            c.textLabel.text = [NSString stringWithFormat:@"%ld 秒后注入… 现在切抖音", (long)_trialLeft];
+            c.textLabel.textColor = [UIColor colorWithRed:1.0 green:0.62 blue:0.15 alpha:1.0];
+            c.detailTextLabel.text = @"按 Home 切过去等着";
+        } else {
+            c.textLabel.text = @"5 秒后往屏幕中间注入一次";
+            c.textLabel.textColor = [UIColor colorWithRed:0.24 green:0.80 blue:0.42 alpha:1.0];
+            c.detailTextLabel.text = @"看到红圈 + 视频暂停 = 这个组合对了";
+        }
+    }
+    return c;
+}
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+
+    if (ip.section == 0) {
+        TDSetInjectVariant(ip.row);
+        [tv reloadData];
+        return;
+    }
+    if (ip.section == 1) {
+        if (ip.row == 0) {
+            TDSetInjectBuiltIn(!TDInjectBuiltInOn());
+            [tv reloadData];
+            return;
+        }
+        if (TDInjectBKSDigitizerInfoOn()) {
+            TDSetInjectBKSDigitizerInfo(NO);
+            [tv reloadData];
+            return;
+        }
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:@"可能闪退"
+                             message:@"这一项会调用系统私有函数 BKSHIDEventSetDigitizerInfo。"
+                                      "参数对就通了，不对会当场闪退。闪退后重开 App 会自动关掉它，"
+                                      "不会连崩。\n\n继续吗？"
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"继续" style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *x) {
+            TDSetInjectBKSDigitizerInfo(YES);
+            [tv reloadData];
+        }]];
+        [a addAction:[UIAlertAction actionWithTitle:@"算了" style:UIAlertActionStyleCancel handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+        return;
+    }
+    [self startTrial];
+}
+
+- (void)startTrial {
+    [_trialTimer invalidate];
+    _trialLeft = 5;
+    [self refreshTrialSection];
+
+    CGSize sb = [UIScreen mainScreen].bounds.size;
+    // 注入用 GCD 定时，不依赖主线程 runloop 的 tick（后台更稳）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        TDtap(sb.width / 2.0, sb.height * 0.45);
+        TDLog(@"已注入一次（%@）", TDInjectVariantDesc());
+    });
+
+    __weak typeof(self) ws = self;
+    _trialTimer = [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *tm) {
+        typeof(self) ss = ws;
+        if (!ss) { [tm invalidate]; return; }
+        ss->_trialLeft--;
+        if (ss->_trialLeft <= 0) {
+            [tm invalidate];
+            ss->_trialTimer = nil;
+            ss->_trialLeft = 0;
+        }
+        [ss refreshTrialSection];
+    }];
+}
+
+- (void)refreshTrialSection {
+    if (self.tableView.numberOfSections < 3) return;
+    [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:2]
+                  withRowAnimation:UITableViewRowAnimationNone];
 }
 
 @end
