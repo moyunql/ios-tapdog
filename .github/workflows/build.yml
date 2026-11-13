@@ -1,0 +1,44 @@
+name: Build TapDog IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain info
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Build
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TapDog-ipa
+          path: build/TapDog.ipa
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: TapDog v1.0.${{ github.run_number }}
+          body: |
+            自动构建产物（TrollStore 安装）
+            - 识图点击 / 点击 / 长按 / 滑动 / 轨迹手势 / 随机偏移
+          files: build/TapDog.ipa
