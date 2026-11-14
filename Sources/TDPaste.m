@@ -7,19 +7,21 @@
 // 一池话术，一行一条，存 Documents/comment_pool.txt。
 // 回放到「粘贴」步骤时：随机取一条 → 写系统剪贴板 → 落字。
 //
-// 落字有三条路（v1.15 加的后两条，因为 v1.14 的 Cmd+V 在这台机器上完全没反应）：
+// 落字有几条路（v1.15 起不再默认 Cmd+V，因为这条在这台机器上完全没反应）：
 //   0) Cmd+V         HID 键盘事件。工程上最干净，但这台机器的键盘通道对非平台进程
 //                    是关着的：事件看着发出去了，前台 App 一个都没收到。
 //   1) 长按 + 点菜单  长按输入框 → 系统弹出「拷贝/粘贴」编辑菜单 → 点「粘贴」。
-//                    全程触摸注入（已确认可用），落点 = 脚本里点评论框那一下。
-//   2) 长按 + 识图    同上，但用识图找「粘贴」两个字（需要 tpl_paste.png 模板），
-//                    菜单位置飘了也不会点错。
+//   2) 长按 + 识图    同上，但用识图找「粘贴」两个字（需要 tpl_paste.png 模板）。
+//   3) 双击 + 点菜单  双击输入框同样会弹编辑菜单，而且不会触发放大镜 / 顺手选中
+//                    一大片文字，对空输入框比长按更温和 —— 长按不弹菜单就换这个。
 //
-// 注意三点：
+// 注意四点：
 //   1) 写剪贴板到系统可见有一小段延迟，写完立刻落字会贴到上一条旧内容（150ms 够）。
 //   2) UIPasteboard 归 UI 侧管，统一回主线程写，免得偶发「写进去了但同步不出去」。
 //   3) 长按/点菜单都会改「上次落点」，粘贴结束要把它还回去，否则连着贴两次会按
 //      上一次菜单的位置去长按。
+//   4) 长按之前先单击一下锚点。脚本里点的是底部「写下你的评论」，那一下只是把
+//      输入框叫出来，焦点不一定在框里；不先点一下就拿不到编辑菜单的「粘贴」。
 // ---------------------------------------------------------------------------
 
 static NSString *TDPoolPath(void) {
@@ -105,11 +107,11 @@ NSInteger TDPasteMethod(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     if ([d objectForKey:kPasteMethodKey] == nil) return 1;   // 默认：长按 + 点菜单
     NSInteger m = [d integerForKey:kPasteMethodKey];
-    return (m < 0 || m > 2) ? 1 : m;
+    return (m < 0 || m > 3) ? 1 : m;
 }
 
 void TDSetPasteMethod(NSInteger m) {
-    if (m < 0 || m > 2) m = 1;
+    if (m < 0 || m > 3) m = 1;
     [[NSUserDefaults standardUserDefaults] setInteger:m forKey:kPasteMethodKey];
 }
 
@@ -117,6 +119,7 @@ NSString *TDPasteMethodDesc(void) {
     switch (TDPasteMethod()) {
         case 0:  return @"Cmd+V";
         case 2:  return @"长按 + 识图「粘贴」";
+        case 3:  return @"双击 + 点菜单";
         default: return @"长按 + 点菜单";
     }
 }
@@ -237,8 +240,21 @@ void TDPasteTextAt(NSString *text, CGPoint anchor) {
     BOOL hadKeep = TDLastTapPointReady();
     CGPoint keep = TDLastTapPoint();
 
-    TDlongPress(a.x, a.y, MAX(0.5, TDPasteHoldMs() / 1000.0));
-    usleep(700 * 1000);     // 等编辑菜单浮出来
+    if (method == 3) {
+        // 双击：间隔必须短（>300ms 系统就不认成双击了），800ms 后菜单一定出来了
+        TDtap(a.x, a.y);
+        usleep(85 * 1000);
+        TDtap(a.x, a.y);
+        usleep(680 * 1000);
+        TDLog(@"粘贴：双击 (%.0f,%.0f) 等菜单", a.x, a.y);
+    } else {
+        // 先单击拿焦点：脚本里点「评论」只是把输入框叫出来，光标不一定在框里；
+        // 没有焦点时长按只会弹放大镜，不会给「粘贴」菜单。
+        TDtap(a.x, a.y);
+        usleep(230 * 1000);
+        TDlongPress(a.x, a.y, MAX(0.5, TDPasteHoldMs() / 1000.0));
+        usleep(720 * 1000);     // 等编辑菜单浮出来
+    }
 
     if (method == 2) {
         NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
@@ -261,8 +277,9 @@ void TDPasteTextAt(NSString *text, CGPoint anchor) {
 
     CGPoint off = TDPasteMenuOffset();
     TDtap(a.x + off.x, a.y + off.y);
-    TDLog(@"粘贴：长按 (%.0f,%.0f)［%@］→ 点菜单 (%.0f,%.0f)",
-          a.x, a.y, TDPasteAnchorDesc(), a.x + off.x, a.y + off.y);
+    TDLog(@"粘贴：%@ (%.0f,%.0f)［%@］→ 点菜单 (%.0f,%.0f)",
+          method == 3 ? @"双击" : @"长按", a.x, a.y, TDPasteAnchorDesc(),
+          a.x + off.x, a.y + off.y);
     usleep(150 * 1000);
     if (hadKeep) TDSetLastTapPoint(keep);
 }

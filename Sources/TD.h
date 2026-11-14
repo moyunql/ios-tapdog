@@ -125,10 +125,11 @@ NSString *TDPasteVariantDesc(void);
 #pragma mark - 粘贴方式（Cmd+V 走不通时的替代方案）
 
 /// 这台机器实测：HID 键盘事件（Cmd+V）打不进抖音的评论框 —— 输入法那条通道
-/// 对非平台进程是关着的。所以粘贴改成三条路，评论池页可以现场切：
+/// 对非平台进程是关着的。所以粘贴改成四条路，评论池页可以现场切：
 ///   0 = Cmd+V（HID 键盘事件，老方案，留着）
 ///   1 = 长按输入框 → 系统弹出编辑菜单 → 点菜单里的「粘贴」（全触摸注入，默认）
 ///   2 = 长按弹菜单 → 用识图找「粘贴」两个字再点（需要模板 tpl_paste.png）
+///   3 = 双击输入框弹菜单 → 点「粘贴」（长按不弹菜单时换这条）
 NSInteger TDPasteMethod(void);
 void TDSetPasteMethod(NSInteger m);
 NSString *TDPasteMethodDesc(void);
@@ -229,8 +230,9 @@ void TDSetScaleHint(NSString * _Nullable tplName, double scale);
 /// 步骤本身还可以带 "run"：执行概率 0~1（小于 1 时这一步有机会整步跳过、不点）
 ///
 /// v1.14 新增：
-///   {"t":"paste","text":"","gap":300}   粘贴步骤。text 留空 = 从「评论池」里随机取一条，
-///                                       走「写剪贴板 + Cmd+V」，所以前面的步骤要先点开输入框。
+///   {"t":"paste","text":"","gap":300}   粘贴步骤。text 留空 = 从「评论池」里随机取一条。
+///                                       落字走触摸（长按/双击输入框 → 点「粘贴」），
+///                                       所以前面的步骤要先点开输入框。
 ///
 /// 脚本级还有两块配置（都可选，缺省等于关）：
 ///   loop     {"on":1,"count":5,"gap":800}   整套脚本循环几次（count=0 无限），每轮之间歇多久

@@ -1535,7 +1535,7 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 3; }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    if (s == 0) return 3;              // 启用 + 只触发一次 + 在哪儿判断
+    if (s == 0) return 4;              // 启用 + 只触发一次 + 在哪判断 + 检查哪张图
     if (s == 1) return [self on] ? 3 : 0;
     return [self on] ? (NSInteger)[self steps].count : 0;
 }
@@ -1548,8 +1548,9 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
     if (s == 0) {
-        return @"「找不到自定义识图图片」时不再只是跳过：会先跑一遍下面的兜底动作，再继续主脚本。\n"
-                "目标模板留空 = 任何一个识图失败都算。\n\n"
+        return @"「找不到自定义识图图片」时不再只是跳过：会先跑一遍下面的兜底动作，再继续主脚本。\n\n"
+                "检查哪张图：默认取图库（内置点赞/评论/收藏 + 自己截的模板）。\n"
+                "选「任意识图」= 拿脚本里第一个识图步骤的图来判断。\n\n"
                 "在哪判断：\n"
                 "· 识图失败 → 跑到那一步发现没图上，当场做兜底（原来的行为）\n"
                 "· 脚本开始 → 每轮开跑前先看一眼画面，图不在就先做兜底再跑主脚本\n"
@@ -1588,7 +1589,7 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
             [sw addTarget:self action:@selector(onceChanged:) forControlEvents:UIControlEventValueChanged];
             c.accessoryView = sw;
             c.detailTextLabel.text = @"关 = 每次找不到都兜底";
-        } else {
+        } else if (ip.row == 2) {
             c.textLabel.text = @"在哪判断";
             UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:
                                        @[@"识图失败", @"脚本开始", @"脚本末尾"]];
@@ -1605,6 +1606,16 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
             [seg addTarget:self action:@selector(posChanged:) forControlEvents:UIControlEventValueChanged];
             c.accessoryView = seg;
             c.selectionStyle = UITableViewCellSelectionStyleNone;
+        } else {
+            // 判断看哪张图：默认就是图库（内置点赞/评论/收藏 + 自己截的）
+            NSString *tpl = [self fs][@"tpl"];
+            c.textLabel.text = @"检查哪张图";
+            c.detailTextLabel.text = (tpl.length == 0)
+                ? @"任意识图（自动取第一个识图步骤）"
+                : TDTplDisplay(tpl);
+            c.textLabel.textColor = (tpl.length == 0) ? ED_TEXT : ED_ACCENT;
+            c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            c.selectionStyle = UITableViewCellSelectionStyleDefault;
         }
         return c;
     }
@@ -1659,6 +1670,10 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
 
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
+    if (ip.section == 0) {
+        if (ip.row == 3) [self chooseTpl];
+        return;
+    }
     if (ip.section == 1) {
         if (ip.row == 0) [self recordAction];
         else if (ip.row == 1) [self addStep];
@@ -1666,6 +1681,48 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
         return;
     }
     if (ip.section == 2) { [self editStepAtIndex:ip.row]; return; }
+}
+
+/// 检查哪张图：默认列出图库（内置模板排最前），第一项是「任意识图」
+- (void)chooseTpl {
+    NSString *cur = [self fs][@"tpl"] ?: @"";
+    NSArray<NSString *> *list = TDTemplateList();
+
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"检查哪张图"
+                         message:@"判断「这张图在不在画面里」。图库里的模板都可以直接选。"
+                  preferredStyle:UIAlertControllerStyleActionSheet];
+
+    NSString *autoTitle = [NSString stringWithFormat:@"任意识图（自动取第一个识图步骤）%@",
+                           cur.length == 0 ? @"  ✓" : @""];
+    [a addAction:[UIAlertAction actionWithTitle:autoTitle style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction *x) {
+        [self fs][@"tpl"] = @"";
+        [self commit];
+        TDLog(@"判断：检查的图改成「任意识图」");
+    }]];
+
+    for (NSString *n in list) {
+        NSString *disp = TDTplDisplay(n);
+        if ([n isEqualToString:cur]) disp = [disp stringByAppendingString:@"  ✓"];
+        [a addAction:[UIAlertAction actionWithTitle:disp style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *x) {
+            [self fs][@"tpl"] = [n copy];
+            [self commit];
+            TDLog(@"判断：检查的图改成 %@", n);
+        }]];
+    }
+
+    [a addAction:[UIAlertAction actionWithTitle:@"图库管理（导入 / 删除）"
+                                          style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) {
+        [self.navigationController pushViewController:[TDTplListVC new] animated:YES];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+
+    a.popoverPresentationController.sourceView = self.view;
+    a.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2, 120, 1, 1);
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 - (void)alertTitle:(NSString *)t message:(NSString *)m {
@@ -1799,7 +1856,8 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
                                         target:self action:@selector(onClose)];
 
     _hint = [[UILabel alloc] initWithFrame:CGRectZero];
-    _hint.text = @"一行一条，回放时随机取一条。以 # 开头的行当备注，不参与随机。";
+    _hint.text = @"一行一条，回放时随机取一条。以 # 开头的行当备注。\n"
+                  @"下面两个按钮：粘贴方式（点切 / 长按调菜单偏移）、锚点（点切 / 长按调位置）。";
     _hint.font = [UIFont systemFontOfSize:12];
     _hint.textColor = ED_DIM;
     _hint.numberOfLines = 2;
@@ -1817,7 +1875,7 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
     [self.view addSubview:_tv];
 
     _tryBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_tryBtn setTitle:@"试粘贴一条" forState:UIControlStateNormal];
+    [_tryBtn setTitle:@"试粘贴（4 秒后）" forState:UIControlStateNormal];
     [_tryBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     _tryBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
     _tryBtn.backgroundColor = ED_ACCENT;
@@ -1888,7 +1946,8 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
 }
 
 - (void)onCycleMode {
-    NSInteger v = (TDPasteMethod() + 1) % 3;
+    // 0 → 1 → 2 → 3 → 0，四种方式轮着来（0 Cmd+V / 1 长按+点菜单 / 2 长按+识图 / 3 双击+点菜单）
+    NSInteger v = (TDPasteMethod() + 1) % 4;
     TDSetPasteMethod(v);
     [self refreshModeBtn];
     TDLog(@"粘贴方式切到：%@", TDPasteMethodDesc());
@@ -2032,9 +2091,13 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
     }
 
     __weak typeof(self) ws = self;
-    [self alertTitle:@"4 秒后粘贴"
-             message:[NSString stringWithFormat:@"「%@」\n\n现在切到抖音、把评论框点开（光标在框里），"
-                       "4 秒后会在上次的落点上长按并点「粘贴」。", show]];
+    NSString *act = (TDPasteMethod() == 3) ? @"双击" : @"单击 + 长按";
+    [self alertTitle:@"4 秒后落字"
+             message:[NSString stringWithFormat:
+                      @"「%@」\n\n切到抖音 → 点开评论框（光标在框里）→ 等 4 秒。\n\n"
+                      @"动作：在%@上%@，再点菜单里的「粘贴」。\n"
+                      @"没弹菜单就把锚点 ay 往大调，点偏了就调菜单偏移。",
+                      show, TDPasteAnchorDesc(), act]];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         typeof(self) ss = ws;

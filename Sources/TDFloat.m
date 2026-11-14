@@ -21,11 +21,12 @@
 //   nil 只是「本进程没人接」，触摸会被这个窗口接住后丢弃，不会转发给下面
 //   的抖音。窗口铺满全屏 = 抖音整屏都点不动。
 //
-// 交互：
-//   点 ●  = 开始 / 结束录制（穿透录制，抖音照常能点）
+// 交互（从左到右：▶ ● ■）：
 //   点 ▶  = 开始执行选中脚本（录制中则结束录制并保存）
+//   点 ●  = 开始 / 结束录制（穿透录制，抖音照常能点）
 //   点 ■  = 停止执行 / 停止录制并保存
-//   长按 ▶ = 取点录制：全屏取样，抖音会被挡住，纯标点用
+//   长按 ● = 全屏取点录制（先弹确认，因为这一层会把抖音挡住）
+//   长按 ▶ / ■ = 不做事（以前长按 ▶ 直接进取点录制，手按久一点就被当成"开始录制"）
 //   拖动  = 挪位置（位置记在 NSUserDefaults；取点模式下自动禁用，否则会把取点层拖走）
 // ---------------------------------------------------------------------------
 
@@ -84,8 +85,11 @@ static TDLogWindow *gLogWindow = nil;
 static void TDFloatLayoutBalls(void) {
     if (!gStartView || !gStopView) return;
     CGFloat y = kTDStripH + 4;
-    UIView *balls[3] = { gRecView, gStartView, gStopView };
-    UILabel *labels[3] = { gRecLabel, gStartLabel, gStopLabel };
+    // 顺序必须和老版本一致：▶ 在最左、■ 在最右，● 录制塞中间。
+    // 上一版把 ● 排到最左，结果点「播放」点成了「开始录制」——
+    // 手指记的是位置，不是图标。谁再改顺序，先想想这条。
+    UIView *balls[3] = { gStartView, gRecView, gStopView };
+    UILabel *labels[3] = { gStartLabel, gRecLabel, gStopLabel };
     for (int i = 0; i < 3; i++) {
         UIView *b = balls[i];
         if (!b) continue;
@@ -194,7 +198,7 @@ void TDFloatRefresh(void) {
     }
 
     if (r.recording) {
-        // 录制中：▶ 让位（点它也只是结束录制），真正在闪的是左边那个 ●
+        // 录制中：▶ 让位（点它也只是结束录制），真正在闪的是中间那个 ●
         gStartView.backgroundColor = [UIColor colorWithRed:0.18 green:0.68 blue:0.32 alpha:0.95];
         gStartLabel.text = @"▶";
         gStartView.alpha = 0.35;
@@ -414,6 +418,7 @@ static void TDFloatStartLiveRecord(void) {
 - (void)buildToggle;
 - (void)refreshToggle;
 - (void)onToggleLog;
+- (void)confirmPointRecord;
 @end
 
 @implementation TDBallVC {
@@ -551,9 +556,26 @@ static void TDFloatStartLiveRecord(void) {
     // 录制中长按任何一个球 = 结束录制（这时屏幕上主要就剩这几个球可点）
     if ([TDRecorder shared].recording) { TDFloatFinishRecording(); TDFloatRefresh(); return; }
 
-    // 长按 ▶ = 取点录制（全屏取样，抖音会被挡住）。
-    // 日常用 ● 就够了；这一条只在「需要绝对坐标」或 HID 监听起不来时兜底。
-    if (g.view.tag == 1) TDFloatToggleRecord();
+    // 长按 ● = 全屏取点录制。要确认一次：这一层会把抖音整个挡住，
+    // 被误触的话人就懵了（"我点播放怎么屏幕不动了"）。
+    if (g.view.tag == 3) { [self confirmPointRecord]; return; }
+
+    // 长按 ▶ / ■ 什么都不做。以前长按 ▶ 就直接进取点录制，
+    // 点播放时手指压久了一点就变成"开始录制"，这个坑不能再留。
+}
+
+- (void)confirmPointRecord {
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"全屏取点录制？"
+                         message:@"这一层会盖住抖音（点不动），只适合坐在那儿手工标点。\n"
+                                  "边刷边录请直接点 ●。"
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"开始" style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction *x) {
+        TDFloatToggleRecord();
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 /// 屏幕坐标（用 windowScene 坐标系，窗口移动时不会被抵消）

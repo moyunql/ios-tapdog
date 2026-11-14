@@ -521,7 +521,10 @@ static CGPoint TDJitter(CGPoint p, double r) {
     if (![fs[@"on"] boolValue]) return;
 
     NSString *want = [fs[@"tpl"] isKindOfClass:[NSString class]] ? fs[@"tpl"] : @"";
-    if (want.length && ![want isEqualToString:tpl]) {
+    // 「检查哪张图」只用来限制「识图失败当场」这一种：那时是某一步的模板失败了，
+    // 选的图对不上就不该乱兜底。首尾两种是闸门自己判定过的，再卡一次会变成
+    // 「点了脚本末尾却永远不触发」。
+    if (_fsPos == 0 && want.length && ![want isEqualToString:tpl]) {
         [self logMsg:@"判断只对 %@ 生效，这次失败的是 %@", want, tpl];
         return;
     }
