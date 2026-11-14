@@ -537,6 +537,15 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
         if ([cmd[@"loop"] isKindOfClass:[NSDictionary class]]) {
             target.loop = [cmd[@"loop"] mutableCopy];
         }
+        // 顺带能把评论池一起灌进来（一行一条），省得在手机上一条条敲
+        if ([cmd[@"pool"] isKindOfClass:[NSArray class]]) {
+            NSMutableArray *lines = [NSMutableArray array];
+            for (id ln in cmd[@"pool"]) {
+                if ([ln isKindOfClass:[NSString class]] && [ln length]) [lines addObject:ln];
+            }
+            TDCommentPoolSet(lines);
+            TDLog(@"远程调试：评论池写入 %lu 条", (unsigned long)lines.count);
+        }
         NSInteger idx = (NSInteger)[store.scripts indexOfObjectIdenticalTo:target];
         if (idx >= 0) store.selected = idx;
         [store save];
