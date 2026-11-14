@@ -444,9 +444,34 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
         NSString *s = [cmd[@"s"] isKindOfClass:[NSString class]] ? cmd[@"s"] : @"";
         if (s.length == 0) return @{@"ok": @0, @"msg": @"文本为空"};
         CGPoint at = CGPointMake([cmd[@"x"] doubleValue], [cmd[@"y"] doubleValue]);
-        TDPasteTextAt(s, at);       // 写剪贴板 + 双击弹菜单 + 识图点「粘贴」
-        TDLog(@"远程调试：输入 %lu 字", (unsigned long)s.length);
+        NSInteger mode = cmd[@"mode"] ? [cmd[@"mode"] integerValue] : -1;
+        TDPasteTextAtMode(s, at, mode);      // 写剪贴板 + 按指定方式落字
+        TDLog(@"远程调试：输入 %lu 字（方式 %@）", (unsigned long)s.length, @(mode));
         return @{@"ok": @1, @"msg": @"text", @"shot": @1};
+    }
+
+    if ([c isEqualToString:@"env"]) {
+        // 剪贴板体检：写一次、主线程读、后台读，连 uid 一起带回
+        NSDictionary *d = TDclipDiagnose();
+        gCmdCount++;
+        TDputJSON(@"env.json", d);
+        return @{@"ok": @1,
+                 @"msg": [NSString stringWithFormat:@"uid=%@ ok=%@ read=%@ items=%@ types=%@",
+                          d[@"uid"], d[@"ok"], d[@"readMain"], d[@"items"], d[@"types"]]};
+    }
+
+    if ([c isEqualToString:@"clipget"]) {
+        // 只读剪贴板内容，确认别的 App 写进去的东西我们看不看得到
+        return @{@"ok": @1, @"msg": [NSString stringWithFormat:@"剪贴板=「%@」",
+                                     TDPasteClipboardText()]};
+    }
+
+    if ([c isEqualToString:@"kbd"]) {
+        // HID 键盘直打（只能打 ASCII）。用来验「键盘通道」到底通不通：
+        // 打得出来说明 Cmd+V 那条路也能用，打不出来就只能靠点屏幕输入。
+        NSString *s = [cmd[@"s"] isKindOfClass:[NSString class]] ? cmd[@"s"] : @"abc";
+        TDtypeASCII(s);
+        return @{@"ok": @1, @"msg": [NSString stringWithFormat:@"kbd %@", s], @"shot": @1};
     }
 
     if ([c isEqualToString:@"open"]) {

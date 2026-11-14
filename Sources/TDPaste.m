@@ -1,5 +1,6 @@
 #import "TD.h"
 #include <stdlib.h>
+#include <unistd.h>
 
 // ---------------------------------------------------------------------------
 // 评论池 + 粘贴
@@ -284,9 +285,43 @@ static BOOL TDPasteTapPasteBubble(CGPoint near, double threshold) {
     return NO;
 }
 
+/// 剪贴板体检：写一次、主线程读、后台读，把 uid 一起带回来。
+///
+/// 起因：远程发 text 时日志一直是「剪贴板已写入 4 字」紧接着「回读和要贴的内容不一致」，
+/// 屏幕上自然也就没有「粘贴」按钮。TrollStore 装的 App 如果是 root 身份的进程，
+/// pasteboardd 会直接拒收它的写入 —— 写不报错、读回来是空，症状完全对得上。
+/// 所以先把 uid 和三条读回路径的真实结果摊开，别再靠猜。
+NSDictionary *TDclipDiagnose(void) {
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"uid"] = @(getuid());
+    d[@"euid"] = @(geteuid());
+    NSString *probe = @"TapDog剪贴板";
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        UIPasteboard *pb = [UIPasteboard generalPasteboard];
+        d[@"pbName"] = pb.name.length ? pb.name : @"(空)";
+        pb.string = probe;
+    });
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        UIPasteboard *pb = [UIPasteboard generalPasteboard];
+        d[@"readMain"] = pb.string.length ? pb.string : @"(nil)";
+        d[@"items"] = @(pb.numberOfItems);
+        d[@"types"] = pb.types.count ? [pb.types componentsJoinedByString:@","] : @"(空)";
+    });
+    UIPasteboard *pb2 = [UIPasteboard generalPasteboard];   // 后台线程再读一次
+    d[@"readBg"] = pb2.string.length ? pb2.string : @"(nil)";
+    d[@"ok"] = @([d[@"readMain"] isEqualToString:probe]);
+    return d;
+}
+
 /// 在 anchor 处粘贴一条文本。anchor 只是「上次落点」的候选，
 /// 真正用哪个由「锚点」设置决定（见上面那段注释）。
 void TDPasteTextAt(NSString *text, CGPoint anchor) {
+    TDPasteTextAtMode(text, anchor, -1);     // -1 = 按设置里的老办法
+}
+
+/// mode：0 = 先单击聚焦再发 Cmd+V（最省事，只要剪贴板真的有东西）
+///       1 = 长按弹菜单  2 = 双击弹菜单  3 = 只写剪贴板，不落字  -1 = 照设置来
+void TDPasteTextAtMode(NSString *text, CGPoint anchor, NSInteger modeIn) {
     if (text.length == 0) return;
 
     if (!TDPasteCopyToClipboard(text)) {
@@ -294,7 +329,23 @@ void TDPasteTextAt(NSString *text, CGPoint anchor) {
     }
     TDLog(@"粘贴：剪贴板已写入 %lu 字", (unsigned long)text.length);
 
+    if (modeIn == 3) return;      // 只写剪贴板：给「先复制、再手动粘贴」留的路
+
+    if (modeIn == 0) {
+        // Cmd+V 这条路不依赖屏幕上有没有「粘贴」气泡：单击把光标放进输入框，
+        // 再把 Cmd+V 打进系统，UIKit 自己会翻成 paste:。
+        // 之前默认走双击菜单，双击第二下正好落在评论列表的表情条上，
+        // 于是「粘不进去」还顺手塞了个 🌹 进去。
+        TDtap(anchor.x, anchor.y);
+        usleep(420 * 1000);       // 等键盘起来、输入框拿到焦点
+        TDsendCmdV();
+        TDLog(@"粘贴：单击 (%.0f,%.0f) 聚焦后发 Cmd+V", anchor.x, anchor.y);
+        return;
+    }
+
     NSInteger method = TDPasteMethod();
+    if (modeIn == 1) method = 1;             // 强制长按
+    else if (modeIn == 2) method = 3;        // 强制双击
     CGPoint a = anchor;
 
     if (method != 0) {
@@ -337,15 +388,26 @@ void TDPasteTextAt(NSString *text, CGPoint anchor) {
 
     BOOL done = NO;
     if (method == 2 || method == 4) {
-        done = TDPasteTapPasteBubble(a, 0.62);
+        // 阈值从 0.62 提到 0.86：0.62 太松，屏幕上任意一处白字黑底都能凑到 0.6x，
+        // 之前就是它把「粘贴」认到了表情条上，结果点出一朵 🌹。
+        done = TDPasteTapPasteBubble(a, 0.86);
     }
 
     if (!done) {
-        CGPoint off = TDPasteMenuOffset();
-        TDtap(a.x + off.x, a.y + off.y);
-        TDLog(@"粘贴：%@ (%.0f,%.0f)［%@］→ 按偏移点菜单 (%.0f,%.0f)",
-              dbl ? @"双击" : @"长按", a.x, a.y, TDPasteAnchorDesc(),
-              a.x + off.x, a.y + off.y);
+        // 以前这里会「按校准偏移盲点一下菜单」。识别没成功时这一下基本是乱点
+        // （实测会点到表情条），所以改成默认不点，只留日志；真要用偏移校准的，
+        // 在设置里把 TDBlindMenu 打开。
+        BOOL blind = [[NSUserDefaults standardUserDefaults] boolForKey:@"TDBlindMenu"];
+        if (blind) {
+            CGPoint off = TDPasteMenuOffset();
+            TDtap(a.x + off.x, a.y + off.y);
+            TDLog(@"粘贴：%@ (%.0f,%.0f)［%@］→ 按偏移点菜单 (%.0f,%.0f)",
+                  dbl ? @"双击" : @"长按", a.x, a.y, TDPasteAnchorDesc(),
+                  a.x + off.x, a.y + off.y);
+        } else {
+            TDLog(@"粘贴：%@ (%.0f,%.0f) 没弹出可认的「粘贴」，这次不落字",
+                  dbl ? @"双击" : @"长按", a.x, a.y);
+        }
     }
 
     usleep(180 * 1000);

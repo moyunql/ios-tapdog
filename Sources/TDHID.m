@@ -1127,6 +1127,44 @@ void TDsendCmdV(void) {
     TDsendKey(0xE3, NO);      // Command 抬起
 }
 
+/// ASCII → HID keyboard usage(0x07)。返回 0 表示这个字符打不了。
+static uint16_t TDusageForASCII(char ch, BOOL *needShift) {
+    *needShift = NO;
+    if (ch >= 'a' && ch <= 'z') return (uint16_t)(0x04 + (ch - 'a'));
+    if (ch >= 'A' && ch <= 'Z') { *needShift = YES; return (uint16_t)(0x04 + (ch - 'A')); }
+    if (ch >= '1' && ch <= '9') return (uint16_t)(0x1E + (ch - '1'));
+    switch (ch) {
+        case '0': return 0x27;
+        case ' ': return 0x2C;
+        case '\n': return 0x28;
+        case '.': return 0x37;
+        case ',': return 0x36;
+        case '/': return 0x38;
+        case '-': return 0x2D;
+        case '_': *needShift = YES; return 0x2D;
+        case '@': *needShift = YES; return 0x1F;
+        case ':': *needShift = YES; return 0x33;
+        default: return 0;
+    }
+}
+
+void TDtypeASCII(NSString *s) {
+    if (s.length == 0) return;
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar u = [s characterAtIndex:i];
+        if (u > 127) continue;                 // 非 ASCII 直接跳过（中文打不了）
+        BOOL sh = NO;
+        uint16_t usage = TDusageForASCII((char)u, &sh);
+        if (!usage) continue;
+        if (sh) { TDsendKey(0xE1, YES); usleep(8000); }
+        TDsendKey(usage, YES);
+        usleep(12000);
+        TDsendKey(usage, NO);
+        usleep(9000);
+        if (sh) { TDsendKey(0xE1, NO); usleep(7000); }
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // 注入方案表

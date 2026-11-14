@@ -116,6 +116,9 @@ void TDsendKey(uint16_t usage, BOOL down);
 /// Cmd+V：按下 Command → 按 v → 松 v → 松 Command。
 /// 作用是把剪贴板内容粘进「当前有键盘焦点的输入框」（抖音评论框）。
 void TDsendCmdV(void);
+/// 直打一串 ASCII（a-z A-Z 0-9 空格和几个常用符号）。中文打不了 ——
+/// 中文要么走剪贴板粘贴，要么老老实实点键盘拼音再点候选字。
+void TDtypeASCII(NSString *s);
 /// 键盘事件的「来源」用哪一种：0 不设 / 1 学到的真实触摸 senderID / 2 探测到的 senderID。
 /// 这台机器的 HID 校验很严，哪个认就留哪个（评论池页可以现场切着试）。
 NSInteger TDPasteVariant(void);
@@ -165,6 +168,13 @@ void TDSetLastTapPoint(CGPoint p);
 
 /// 写剪贴板 → 双击/长按输入框 → 点「粘贴」。anchor 不合法就退回 Cmd+V。
 void TDPasteTextAt(NSString *text, CGPoint anchor);
+
+/// mode：0 = 单击聚焦后发 Cmd+V
+///       1 = 长按弹菜单   2 = 双击弹菜单   3 = 只写剪贴板不落字   -1 = 按设置
+void TDPasteTextAtMode(NSString *text, CGPoint anchor, NSInteger mode);
+
+/// 剪贴板体检：uid / 主线程与后台读回的真实内容 / items / types
+NSDictionary *TDclipDiagnose(void);
 
 #pragma mark - 评论池（话术）
 
