@@ -216,6 +216,9 @@ static CGPoint TDJitter(CGPoint p, double r) {
     _running = YES;
     _gen++;
     NSUInteger gen = _gen;
+    // 回放期间把每次识图的整屏画面留一份：编辑页的「框选区域」拿它当底图，
+    // 否则在编辑页里只能截到我们自己的界面，框了也没意义。
+    TDSetShotCacheEnabled(YES);
     _loopsDone = 0;
     _curIndex = 0;
     _floatBarWarned = NO;
@@ -287,6 +290,9 @@ static CGPoint TDJitter(CGPoint p, double r) {
         self->_stoppedAt = (userStopped && self->_curIndex >= 0) ? self->_curIndex : -1;
         self->_running = NO;
         self->_curIndex = -1;
+        // 收尾就关掉：留在内存里的最后一张才是「抖音画面」，
+        // 再开着的话，App 里的试识别会把这张换成我们自己的界面。
+        TDSetShotCacheEnabled(NO);
         [self logMsg:@"结束，跑了 %ld 轮", (long)round];
         void (^f)(void) = self.onFinish;
         if (f) dispatch_async(dispatch_get_main_queue(), ^{ f(); });
@@ -485,6 +491,16 @@ static CGPoint TDJitter(CGPoint p, double r) {
             return;
         }
 
+        // 识别区域：每个识图事件可以单独框一块，只在框里找。
+        // 判定按「模板中心落在框内」，框比模板小也能用（只框住按钮的一角）。
+        CGRect roi = CGRectNull;
+        NSArray *ra = st[@"roi"];
+        if ([ra isKindOfClass:[NSArray class]] && ra.count >= 4) {
+            roi = CGRectMake([ra[0] doubleValue], [ra[1] doubleValue],
+                             [ra[2] doubleValue], [ra[3] doubleValue]);
+            if (roi.size.width < 2 || roi.size.height < 2) roi = CGRectNull;
+        }
+
         // 识图本身有一次「等画面稳定」的语义：抖音翻页动画没结束时截到的是糊图，
         // 所以给了超时就在这里轮询，而不是一帧没命中就判死。
         CFTimeInterval deadline = CACurrentMediaTime() + MAX(0.0, timeoutMs) / 1000.0;
@@ -495,14 +511,20 @@ static CGPoint TDJitter(CGPoint p, double r) {
             tries++;
             // smart 查找内部按「记住的尺度 → 原尺度 → 尺度扫描」逐级退让：
             // 内置的小图标（38px）第一次会扫出真正的倍数并记住，之后就走窄扫。
-            m = TDfindImageSmart(tpl, name, th, &scaledHit);
+            m = TDfindImageSmartInRect(tpl, name, th, roi, &scaledHit);
             if (m) break;
             if (timeoutMs <= 0 || CACurrentMediaTime() >= deadline) break;
             usleep(200 * 1000);
         }
 
         if (!m) {
-            [self logMsg:@"识图没找到 %@（阈值 %.2f，试了 %ld 次）", name, th, (long)tries];
+            if (CGRectIsNull(roi)) {
+                [self logMsg:@"识图没找到 %@（阈值 %.2f，试了 %ld 次）", name, th, (long)tries];
+            } else {
+                [self logMsg:@"识图没找到 %@（阈值 %.2f，只在框 (%.0f,%.0f %.0f×%.0f) 里找，试了 %ld 次）",
+                              name, th, roi.origin.x, roi.origin.y,
+                              roi.size.width, roi.size.height, (long)tries];
+            }
             if (self->_fsPos == 0) [self runFailsafeFor:name];
             return;
         }
@@ -517,7 +539,8 @@ static CGPoint TDJitter(CGPoint p, double r) {
         } else {
             TDtap(p.x, p.y);
         }
-        [self logMsg:@"识图 %@ %.2f → 点 (%.0f,%.0f)", name, m.score, p.x, p.y];
+        [self logMsg:@"识图 %@ %.2f → 点 (%.0f,%.0f)%@", name, m.score, p.x, p.y,
+                      CGRectIsNull(roi) ? @"" : @"（框内命中）"];
         usleep((useconds_t)(interval * 1000));
         return;
     }

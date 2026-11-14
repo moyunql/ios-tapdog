@@ -205,6 +205,31 @@ TDMatch * _Nullable TDfindImage(UIImage *tpl, double threshold, double minScale,
 TDMatch * _Nullable TDfindImageSmart(UIImage *tpl, NSString * _Nullable tplName,
                                     double threshold, BOOL * _Nullable scanned);
 
+/// 只在屏幕上的某个矩形里找（roi 用屏幕点，CGRectNull / 宽高 < 2 = 全屏）。
+/// 判定标准是「模板中心落在框内」，不是左上角 —— 这样框比模板还小也能用。
+TDMatch * _Nullable TDfindImageInRect(UIImage *tpl, CGRect roi,
+                                      double threshold, double minScale, double maxScale, int scaleSteps);
+TDMatch * _Nullable TDfindImageSmartInRect(UIImage *tpl, NSString * _Nullable tplName,
+                                           double threshold, CGRect roi, BOOL * _Nullable scanned);
+
+/// 回放期间把每一帧被识别的整屏画面留一份，给编辑页的「框选区域」当底图。
+/// 开着才有内存代价（一张 1080×1920 ≈ 8MB，后一张覆盖前一张），所以默认关。
+void TDSetShotCacheEnabled(BOOL on);
+/// 最近一次识图时的整屏画面（可能是 nil），像素尺寸用 TDLastTargetShotPixelSize()
+UIImage * _Nullable TDLastTargetShot(void);
+CGSize TDLastTargetShotPixelSize(void);
+/// 屏幕点 / 该画面像素 的换算比（框选页把手指坐标换成屏幕点要用）
+CGFloat TDLastTargetShotRatio(void);
+
+#pragma mark - 框选识别区域
+
+/// 「(40,120 · 374×380)」或「全屏」，列表里显示用
+NSString *TDRegionDesc(CGRect roi);
+/// 打开框选页。shot 为底图（可传 TDLastTargetShot()），initial 为已有的框（CGRectNull = 空）。
+/// done(roi, ok)：ok=NO 表示取消；ok=YES 且 roi=CGRectNull 表示选了「全屏」。
+void TDPickRegion(UIViewController * _Nullable host, UIImage * _Nullable shot,
+                  CGRect initial, void (^ _Nullable done)(CGRect roi, BOOL ok));
+
 /// 读/写某个模板记住的尺度（1.0 = 原尺度，0 = 没记过）
 double TDScaleHint(NSString * _Nullable tplName);
 void TDSetScaleHint(NSString * _Nullable tplName, double scale);

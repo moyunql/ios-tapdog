@@ -419,7 +419,7 @@ didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> 
 
 typedef NS_ENUM(NSInteger, TDStepKind) { KTap = 0, KLong, KSwipe, KWait, KPaste };
 typedef NS_ENUM(NSInteger, TDRowKind) {
-    RKind = 0, RMode, RNum, RTpl, RTest, RPhys, RDelete, RNote, RText, RPool, RPasteTest
+    RKind = 0, RMode, RNum, RTpl, RTest, RPhys, RDelete, RNote, RText, RPool, RPasteTest, RRoi
 };
 typedef NS_ENUM(NSInteger, TDField) {
     F_X = 0, F_Y, F_X1, F_Y1, F_X2, F_Y2, F_MS, F_GAP,
@@ -453,6 +453,7 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
 - (void)poolModeChanged:(UISegmentedControl *)seg;
 - (void)textChanged:(UITextField *)tf;
 - (void)tryPaste;
+- (void)pickRoi;
 @end
 
 @implementation TDStepEditVC {
@@ -471,6 +472,10 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
 
     double _v[F_COUNT];
     NSArray<NSArray<NSDictionary *> *> *_plan;
+
+    // 识别区域（只有识图事件用）：屏幕点坐标，_roiOn=NO 表示全屏
+    BOOL _roiOn;
+    CGRect _roi;
 }
 
 - (instancetype)initWithStep:(NSMutableDictionary *)step
@@ -513,6 +518,19 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
     _v[F_DX] = [_d[@"dx"] doubleValue];
     _v[F_DY] = [_d[@"dy"] doubleValue];
     _v[F_TO] = _d[@"to"] ? [_d[@"to"] doubleValue] : 1500;
+
+    // 识别区域：老脚本没有这个键 = 全屏，行为和以前完全一样
+    _roiOn = NO;
+    _roi = CGRectNull;
+    NSArray *ra = [_d[@"roi"] isKindOfClass:[NSArray class]] ? _d[@"roi"] : nil;
+    if (ra.count >= 4) {
+        CGRect r = CGRectMake([ra[0] doubleValue], [ra[1] doubleValue],
+                              [ra[2] doubleValue], [ra[3] doubleValue]);
+        if (r.size.width >= 2 && r.size.height >= 2) {
+            _roi = r;
+            _roiOn = YES;
+        }
+    }
 
     // 没有位置信息的（识图、等待）给个屏幕中心的默认值，方便改
     if (_kind == KTap || _kind == KLong) {
@@ -576,6 +594,7 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
         [sec1 addObject:@{@"k": @(RPasteTest)}];
     } else if (_imgMode) {
         [sec1 addObject:@{@"k": @(RTpl)}];
+        [sec1 addObject:@{@"k": @(RRoi)}];
         [sec1 addObject:RowNum(F_TH, @"相似度阈值", @"0~1", YES)];
         [sec1 addObject:RowNum(F_DX, @"落点偏移 X", @"点", NO)];
         [sec1 addObject:RowNum(F_DY, @"落点偏移 Y", @"点", NO)];
@@ -734,6 +753,25 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
         } else {
             c.imageView.image = nil;
         }
+        return c;
+    }
+
+    if (k == RRoi) {
+        UITableViewCell *c = [self baseCell:@"roi"];
+        c.textLabel.text = @"识别区域";
+        if (_roiOn) {
+            CGSize scr = [UIScreen mainScreen].bounds.size;
+            double pct = _roi.size.width * _roi.size.height /
+                         MAX(1.0, scr.width * scr.height) * 100.0;
+            c.detailTextLabel.text = [NSString stringWithFormat:@"%@ · %.0f%%",
+                                      TDRegionDesc(_roi), pct];
+            c.detailTextLabel.textColor = ED_GREEN;
+        } else {
+            c.detailTextLabel.text = @"全屏 · 点这里框选";
+            c.detailTextLabel.textColor = ED_DIM;
+        }
+        c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        c.selectionStyle = UITableViewCellSelectionStyleDefault;
         return c;
     }
 
@@ -941,6 +979,7 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
     TDRowKind k = (TDRowKind)[row[@"k"] integerValue];
 
     if (k == RTpl) { [self pickTemplate]; return; }
+    if (k == RRoi) { [self pickRoi]; return; }
     if (k == RTest) { [self runTest]; return; }
     if (k == RPasteTest) { [self tryPaste]; return; }
     if (k == RDelete) { [self confirmDelete]; return; }
@@ -1080,6 +1119,131 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
     [self presentViewController:a animated:YES completion:nil];
 }
 
+#pragma mark 识别区域
+
+/// 一个识图事件只在某块画面里找。
+/// 底图用回放时抓到的那一帧 —— 编辑页在前台截不到抖音，拿我们自己的界面框是错的。
+- (void)pickRoi {
+    [self.view endEditing:YES];
+    UIImage *shot = TDLastTargetShot();
+    NSString *note = shot
+        ? [NSString stringWithFormat:@"底图：上次回放时的画面（%.0f×%.0f 像素）。\n框选按屏幕点保存，和 X/Y 同一套量纲。",
+           shot.size.width, shot.size.height]
+        : @"还没有底图。先在抖音里回放一次脚本，再来框选就能看到真实画面。\n现在只能凭位置感框，或者直接手动输入。";
+
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"识别区域"
+                                                              message:note
+                                                       preferredStyle:UIAlertControllerStyleActionSheet];
+
+    NSString *pickTitle = _roiOn ? @"重新框选" : @"框选区域";
+    [a addAction:[UIAlertAction actionWithTitle:pickTitle style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction *x) { [self openRegionPicker]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"快捷区域（半屏）" style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction *x) { [self chooseQuickRoi]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"手动输入坐标" style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction *x) { [self manualRoi]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"全屏（不限区域）" style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction *x) {
+        self->_roiOn = NO;
+        self->_roi = CGRectNull;
+        [self rebuildPlan];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    a.popoverPresentationController.sourceView = self.view;
+    a.popoverPresentationController.sourceRect =
+        CGRectMake(self.view.bounds.size.width / 2, 200, 1, 1);
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)openRegionPicker {
+    __weak typeof(self) ws = self;
+    TDPickRegion(self, TDLastTargetShot(), _roiOn ? _roi : CGRectNull,
+                 ^(CGRect roi, BOOL ok) {
+        typeof(self) ss = ws;
+        if (!ss || !ok) return;
+        if (CGRectIsNull(roi) || roi.size.width < 2 || roi.size.height < 2) {
+            ss->_roiOn = NO;
+            ss->_roi = CGRectNull;
+        } else {
+            ss->_roiOn = YES;
+            ss->_roi = roi;
+        }
+        [ss rebuildPlan];
+        [ss.tableView reloadData];
+    });
+}
+
+- (void)chooseQuickRoi {
+    CGSize s = [UIScreen mainScreen].bounds.size;
+    NSArray<NSString *> *names = @[@"上半屏", @"下半屏", @"左半屏", @"右半屏"];
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"快捷区域"
+                                                              message:@"按整块屏幕切一半，大多数「只在评论区/只在某侧找」够用"
+                                                       preferredStyle:UIAlertControllerStyleActionSheet];
+    for (NSInteger i = 0; i < names.count; i++) {
+        NSInteger idx = i;
+        [a addAction:[UIAlertAction actionWithTitle:names[i] style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *x) {
+            CGRect r;
+            switch (idx) {
+                case 0:  r = CGRectMake(0, 0, s.width, s.height / 2.0); break;
+                case 1:  r = CGRectMake(0, s.height / 2.0, s.width, s.height / 2.0); break;
+                case 2:  r = CGRectMake(0, 0, s.width / 2.0, s.height); break;
+                default: r = CGRectMake(s.width / 2.0, 0, s.width / 2.0, s.height); break;
+            }
+            self->_roiOn = YES;
+            self->_roi = CGRectIntegral(r);
+            [self rebuildPlan];
+        }]];
+    }
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    a.popoverPresentationController.sourceView = self.view;
+    a.popoverPresentationController.sourceRect =
+        CGRectMake(self.view.bounds.size.width / 2, 200, 1, 1);
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)manualRoi {
+    CGRect cur = _roiOn ? _roi : CGRectMake(0, 0, 0, 0);
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"手动输入区域"
+                                                              message:@"单位是屏幕点：左上角 X / Y，再给宽高"
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    NSArray<NSString *> *ph = @[@"X", @"Y", @"宽", @"高"];
+    NSArray<NSNumber *> *vals = @[@(cur.origin.x), @(cur.origin.y),
+                                  @(cur.size.width), @(cur.size.height)];
+    for (NSInteger i = 0; i < 4; i++) {
+        NSString *p = ph[i];
+        NSString *v = [NSString stringWithFormat:@"%.0f", vals[i].doubleValue];
+        [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+            tf.placeholder = p;
+            tf.text = ([v doubleValue] > 0) ? v : @"";
+            tf.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
+            tf.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightMedium];
+        }];
+    }
+    __weak UIAlertController *wa = a;
+    [a addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction *x) {
+        UIAlertController *al = wa;
+        if (!al || al.textFields.count < 4) return;
+        CGRect r = CGRectMake([al.textFields[0].text doubleValue],
+                              [al.textFields[1].text doubleValue],
+                              [al.textFields[2].text doubleValue],
+                              [al.textFields[3].text doubleValue]);
+        CGSize scr = [UIScreen mainScreen].bounds.size;
+        r = CGRectIntersection(r, CGRectMake(0, 0, scr.width, scr.height));
+        if (CGRectIsNull(r) || r.size.width < 2 || r.size.height < 2) {
+            self->_roiOn = NO;
+            self->_roi = CGRectNull;
+        } else {
+            self->_roiOn = YES;
+            self->_roi = CGRectIntegral(r);
+        }
+        [self rebuildPlan];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
 - (void)runTest {
     if (_tpl.length == 0) {
         UIAlertController *a = [UIAlertController alertControllerWithTitle:@"还没选模板"
@@ -1094,21 +1258,28 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
     double th = _v[F_TH];
     double dx = _v[F_DX];
     double dy = _v[F_DY];
+    CGRect roi = _roiOn ? _roi : CGRectNull;
     __weak typeof(self) ws = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         UIImage *tpl = [UIImage imageWithContentsOfFile:TDTplPath(name)];
         BOOL scaled = NO;
         // 和回放完全同一条路：记住的尺度 → 原尺度 → 尺度扫描
-        TDMatch *m = tpl ? TDfindImageSmart(tpl, name, th, &scaled) : nil;
+        TDMatch *m = tpl ? TDfindImageSmartInRect(tpl, name, th, roi, &scaled) : nil;
         NSString *msg;
         if (!tpl) {
             msg = @"模板文件读不出来";
         } else if (!m) {
-            msg = [NSString stringWithFormat:
+            msg = CGRectIsNull(roi)
+                ? [NSString stringWithFormat:
                    @"没找到（阈值 %.2f，连 ±15%% 尺度扫描也没有）。\n"
                     "模板 %.0f×%.0f px —— 如果比屏幕上那个图案大很多/小很多，"
                     "说明这张图的尺度和本机不匹配，换一张本机截屏最稳。",
-                   th, tpl.size.width, tpl.size.height];
+                   th, tpl.size.width, tpl.size.height]
+                : [NSString stringWithFormat:
+                   @"只在框 %@ 里找，没找到（阈值 %.2f）。\n"
+                    "要么图不在框里，要么框太小。\n"
+                    "注意：「试识别」是在我们自己的界面上找的，抖音里的效果要看回放日志。",
+                   TDRegionDesc(roi), th];
         } else {
             msg = [NSString stringWithFormat:@"命中 %.3f%@\n模板 %.0f×%.0f px\n屏幕位置 (%.0f, %.0f)\n加偏移后：(%.0f, %.0f)",
                    m.score,
@@ -1179,6 +1350,13 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
         _d[@"dx"] = @((NSInteger)lround(_v[F_DX]));
         _d[@"dy"] = @((NSInteger)lround(_v[F_DY]));
         _d[@"to"] = @((NSInteger)MAX(0, lround(_v[F_TO])));
+        // 识别区域：只在框里找。没设就不写这个键 —— 老脚本照样全屏找。
+        if (_roiOn && !CGRectIsNull(_roi) && _roi.size.width >= 2 && _roi.size.height >= 2) {
+            _d[@"roi"] = @[@((NSInteger)lround(_roi.origin.x)),
+                           @((NSInteger)lround(_roi.origin.y)),
+                           @((NSInteger)lround(_roi.size.width)),
+                           @((NSInteger)lround(_roi.size.height))];
+        }
         if (_kind == KLong) _d[@"ms"] = @((NSInteger)MAX(120, lround(_v[F_MS])));
     } else {
         _d[@"t"] = (_kind == KLong ? @"long" : @"tap");

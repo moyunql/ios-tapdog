@@ -136,10 +136,17 @@ static NSString *TDScriptsPath(void) {
         if (![name isKindOfClass:[NSString class]] || name.length == 0) name = @"(未选模板)";
         if ([name hasPrefix:@"tpl_"]) name = [name substringToIndex:MIN((NSUInteger)13, name.length)];
         BOOL lng = [st[@"ms"] doubleValue] > 0;
-        return [NSString stringWithFormat:@"识图%@ %@ ≥%.2f · 偏(%+.0f,%+.0f)",
+        // 设了识别区域就在后面标一下，列表里一眼能看出这条只在小框里找
+        NSArray *roi = [st[@"roi"] isKindOfClass:[NSArray class]] ? st[@"roi"] : nil;
+        NSString *box = @"";
+        if (roi.count >= 4) {
+            box = [NSString stringWithFormat:@" · 框%.0f×%.0f",
+                   [roi[2] doubleValue], [roi[3] doubleValue]];
+        }
+        return [NSString stringWithFormat:@"识图%@ %@ ≥%.2f · 偏(%+.0f,%+.0f)%@",
                 lng ? @"长按" : @"点击", name,
                 st[@"th"] ? [st[@"th"] doubleValue] : 0.85,
-                [st[@"dx"] doubleValue], [st[@"dy"] doubleValue]];
+                [st[@"dx"] doubleValue], [st[@"dy"] doubleValue], box];
     }
     return t ?: @"?";
 }

@@ -129,15 +129,87 @@ static UIImage *TDResizeImage(UIImage *img, CGFloat scale) {
     return r;
 }
 
-TDMatch *TDfindImage(UIImage *tpl, double threshold, double minScale, double maxScale, int scaleSteps) {
+// ---------------------------------------------------------------------------
+// 「上次识图时的那一帧」
+//
+// 编辑页要让人在抖音画面上拉框，但编辑页在前台时截到的是我们自己的界面，
+// 没法当底图。所以回放期间每识别一次就留一份整屏图 —— 那才是用户想框的那个画面。
+// 只在回放时开：一张 1080×1920 是 8MB，平时没必要占着。
+// ---------------------------------------------------------------------------
+
+static UIImage *gLastShot = nil;
+static CGSize gLastShotPx = CGSizeZero;
+static volatile int32_t gShotCacheOn = 0;
+
+void TDSetShotCacheEnabled(BOOL on) { gShotCacheOn = on ? 1 : 0; }
+UIImage *TDLastTargetShot(void) { return gLastShot; }
+CGSize TDLastTargetShotPixelSize(void) { return gLastShotPx; }
+
+CGFloat TDLastTargetShotRatio(void) {
+    CGSize pt = [UIScreen mainScreen].bounds.size;
+    if (gLastShotPx.width < 1 || pt.width < 1) return TDscreenScaleRatio();
+    return pt.width / gLastShotPx.width;
+}
+
+// ---------------------------------------------------------------------------
+// 搜索范围
+//
+// roi 用「屏幕点」，判定标准是**模板中心落在框内**：
+// 框比模板小的时候（比如只框住评论按钮的一小块）左上角语义会直接把范围算成空，
+// 中心语义不会 —— 允许模板溢出框，只要中心在里头。
+// ---------------------------------------------------------------------------
+
+/// 把「中心必须落在 ROI 内」换算成「左上角允许的范围」，并对齐到当前层（粗搜是 1/4）
+static void TDBoundsForROI(int *x0, int *y0, int *x1, int *y1,
+                           CGRect rpx, int tw, int th, double f, int iw, int ih) {
+    int rx0 = (int)floor(rpx.origin.x / f);
+    int ry0 = (int)floor(rpx.origin.y / f);
+    int rx1 = (int)ceil((rpx.origin.x + rpx.size.width) / f);
+    int ry1 = (int)ceil((rpx.origin.y + rpx.size.height) / f);
+
+    int cx0 = rx0 - tw / 2, cx1 = rx1 - tw / 2;
+    int cy0 = ry0 - th / 2, cy1 = ry1 - th / 2;
+
+    if (cx0 < 0) cx0 = 0;
+    if (cy0 < 0) cy0 = 0;
+    int mx = iw - tw, my = ih - th;
+    if (mx < 0) mx = 0;
+    if (my < 0) my = 0;
+    if (cx1 > mx) cx1 = mx;
+    if (cy1 > my) cy1 = my;
+
+    *x0 = cx0; *y0 = cy0; *x1 = cx1; *y1 = cy1;
+}
+
+/// 真正干活的：roi 传 CGRectNull 或宽高 < 2 就是全屏找
+static TDMatch *TDFindCore(UIImage *tpl, CGRect roi, double threshold,
+                           double minScale, double maxScale, int scaleSteps) {
     if (!tpl) return nil;
 
     UIImage *screen = TDscreenshot();
     if (!screen) return nil;
 
+    if (gShotCacheOn) {
+        gLastShot = screen;                 // 后一张覆盖前一张，不留历史
+        gLastShotPx = screen.size;
+    }
+
     int sw = 0, sh = 0;
     uint8_t *sg = TDGray(screen, &sw, &sh);
     if (!sg) return nil;
+
+    // ROI：屏幕点 → 画面像素
+    CGFloat ratio = TDscreenScaleRatio();   // 点 / 像素
+    if (!(ratio > 0)) ratio = 1;
+    BOOL limit = (!CGRectIsNull(roi) && roi.size.width >= 2 && roi.size.height >= 2);
+    CGRect rpx = CGRectZero;
+    if (limit) {
+        rpx = CGRectMake(roi.origin.x / ratio, roi.origin.y / ratio,
+                         roi.size.width / ratio, roi.size.height / ratio);
+        CGRect clip = CGRectMake(0, 0, sw, sh);
+        rpx = CGRectIntersection(rpx, clip);
+        if (CGRectIsNull(rpx) || rpx.size.width < 2 || rpx.size.height < 2) limit = NO;
+    }
 
     int sw4 = 0, sh4 = 0;
     uint8_t *sg4 = TDDownscale(sg, sw, sh, 4, &sw4, &sh4);
@@ -163,7 +235,11 @@ TDMatch *TDfindImage(UIImage *tpl, double threshold, double minScale, double max
             uint8_t *tg4 = TDDownscale(tg, tw, th, 4, &tw4, &th4);
             if (tg4 && tw4 >= 3 && th4 >= 3 && tw4 <= sw4 && th4 <= sh4) {
                 int bx = 0, by = 0;
-                double sc = TDNCC(sg4, sw4, sh4, tg4, tw4, th4, 0, 0, sw4 - tw4, sh4 - th4, &bx, &by);
+                int q0 = 0, r0 = 0, q1 = sw4 - tw4, r1 = sh4 - th4;
+                if (limit) {
+                    TDBoundsForROI(&q0, &r0, &q1, &r1, rpx, tw4, th4, 4.0, sw4, sh4);
+                }
+                double sc = TDNCC(sg4, sw4, sh4, tg4, tw4, th4, q0, r0, q1, r1, &bx, &by);
                 if (sc > bestScore) {
                     bestScore = sc;
                     bestX = bx * 4;
@@ -185,20 +261,34 @@ TDMatch *TDfindImage(UIImage *tpl, double threshold, double minScale, double max
         int tw = 0, th = 0;
         uint8_t *tg = tsBest ? TDGray(tsBest, &tw, &th) : NULL;
         if (tg) {
-            int bx = 0, by = 0;
-            double sc = TDNCC(sg, sw, sh, tg, tw, th,
-                              bestX - 8, bestY - 8, bestX + 8, bestY + 8, &bx, &by);
+            int fx0 = bestX - 8, fy0 = bestY - 8, fx1 = bestX + 8, fy1 = bestY + 8;
+            if (limit) {
+                // 精修也不能跑到框外去：同样的「中心在框内」条件
+                int cx0 = (int)floor(rpx.origin.x) - tw / 2;
+                int cy0 = (int)floor(rpx.origin.y) - th / 2;
+                int cx1 = (int)ceil(rpx.origin.x + rpx.size.width) - tw / 2;
+                int cy1 = (int)ceil(rpx.origin.y + rpx.size.height) - th / 2;
+                fx0 = MAX(fx0, cx0);
+                fy0 = MAX(fy0, cy0);
+                fx1 = MIN(fx1, cx1);
+                fy1 = MIN(fy1, cy1);
+            }
+            int bx = bestX, by = bestY;
+            double sc = 0;
+            if (fx1 >= fx0 && fy1 >= fy0) {
+                sc = TDNCC(sg, sw, sh, tg, tw, th, fx0, fy0, fx1, fy1, &bx, &by);
+            }
             if (sc > bestScore) {
                 bestScore = sc;
                 bestX = bx;
                 bestY = by;
             }
             // 中心点换算成屏幕「点」坐标
-            CGFloat ratio = TDscreenScaleRatio();
+            CGFloat ratio2 = TDscreenScaleRatio();
             TDMatch *m = [TDMatch new];
             m.score = bestScore;
             m.scale = bestScale;
-            m.point = CGPointMake((bestX + tw / 2.0) * ratio, (bestY + th / 2.0) * ratio);
+            m.point = CGPointMake((bestX + tw / 2.0) * ratio2, (bestY + th / 2.0) * ratio2);
             free(tg);
             free(sg);
             if (bestScore < threshold) return nil;
@@ -208,6 +298,15 @@ TDMatch *TDfindImage(UIImage *tpl, double threshold, double minScale, double max
 
     free(sg);
     return nil;
+}
+
+TDMatch *TDfindImage(UIImage *tpl, double threshold, double minScale, double maxScale, int scaleSteps) {
+    return TDFindCore(tpl, CGRectNull, threshold, minScale, maxScale, scaleSteps);
+}
+
+TDMatch *TDfindImageInRect(UIImage *tpl, CGRect roi, double threshold,
+                           double minScale, double maxScale, int scaleSteps) {
+    return TDFindCore(tpl, roi, threshold, minScale, maxScale, scaleSteps);
 }
 
 // ---------------------------------------------------------------------------
@@ -236,19 +335,20 @@ void TDSetScaleHint(NSString *name, double s) {
     [[NSUserDefaults standardUserDefaults] setObject:@(s) forKey:TDScaleHintKey(name)];
 }
 
-TDMatch *TDfindImageSmart(UIImage *tpl, NSString *tplName, double threshold, BOOL *scanned) {
+TDMatch *TDfindImageSmartInRect(UIImage *tpl, NSString *tplName, double threshold,
+                                CGRect roi, BOOL *scanned) {
     if (scanned) *scanned = NO;
     if (!tpl) return nil;
 
     // 1. 有记忆尺度：窄扫三档。失败说明画面/图标尺寸变了，落到下面重来
     double hint = TDScaleHint(tplName);
     if (hint > 0.05) {
-        TDMatch *m = TDfindImage(tpl, threshold, hint * 0.94, hint * 1.06, 3);
+        TDMatch *m = TDfindImageInRect(tpl, roi, threshold, hint * 0.94, hint * 1.06, 3);
         if (m) { TDSetScaleHint(tplName, m.scale); return m; }
     }
 
     // 2. 原尺度（截屏裁出来的模板走这条，命中率最高也最快）
-    TDMatch *m = TDfindImage(tpl, threshold, 1.0, 1.0, 1);
+    TDMatch *m = TDfindImageInRect(tpl, roi, threshold, 1.0, 1.0, 1);
     if (m) { TDSetScaleHint(tplName, 1.0); return m; }
 
     // 3. 尺度扫描。小模板（内置图标 / 相册小图）可能差好几倍，范围放宽到 0.6~3.2
@@ -256,10 +356,14 @@ TDMatch *TDfindImageSmart(UIImage *tpl, NSString *tplName, double threshold, BOO
     double lo = small ? 0.60 : 0.85;
     double hi = small ? 3.20 : 1.15;
     int steps = small ? 9 : 7;
-    m = TDfindImage(tpl, threshold, lo, hi, steps);
+    m = TDfindImageInRect(tpl, roi, threshold, lo, hi, steps);
     if (m) {
         TDSetScaleHint(tplName, m.scale);
         if (scanned) *scanned = YES;
     }
     return m;
+}
+
+TDMatch *TDfindImageSmart(UIImage *tpl, NSString *tplName, double threshold, BOOL *scanned) {
+    return TDfindImageSmartInRect(tpl, tplName, threshold, CGRectNull, scanned);
 }

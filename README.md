@@ -3,11 +3,15 @@
 免越狱的 iOS 自动化工具，给作者自己的 iPhone 7 Plus / iOS 15.8.2 写的。
 和 AutoTap 的区别：**多一个「识图点击」和「随机偏移」**，这就是它存在的全部理由。
 
+> 详细技术文档（点击注入链路、随机参数、构建发布流水线）见
+> [`docs/点击注入与随机参数.md`](docs/点击注入与随机参数.md)
+
 ## 能做什么
 
 | 能力 | 说明 |
 |---|---|
 | 识图点击 | 截全屏 → 灰度金字塔 + 归一化互相关找模板 → 命中后点它中心。阈值可调，支持 0.7~1.3 倍缩放 |
+| 识别区域 | 每个识图事件可以单独框一块区域，只在框里找（按「模板中心落在框内」判定，框比图标小也能用）|
 | 点击 / 长按 | 全局注入，点任意 App |
 | 滑动 | 起终点 + 真实时长，中途多帧 move（不是两点瞬移） |
 | 轨迹手势 | 任意多点折线，按总时长匀速插值 |
@@ -23,7 +27,7 @@ iOS 上想让一个 App 去点「别的 App」，只有一条路：**往系统 H
 IOHIDEventCreateDigitizerEvent(hand)
         └── IOHIDEventCreateDigitizerFingerEvent(finger)   ← 手指子事件
 IOHIDEventSetIntegerValue(hand, IsDisplayIntegrated, 1)     ← 关键：当成屏上触摸
-IOHIDEventSetSenderID(hand, 0x8000000817319372)             ← 关键：伪装成内建触摸屏
+IOHIDEventSetSenderID(hand, <本机真实 senderID>)              ← 关键：必须是本机会话里的真实来源
 IOHIDEventSystemClientDispatchEvent(client, hand)           ← 派发给前台 App
 ```
 
