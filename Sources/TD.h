@@ -191,7 +191,13 @@ BOOL TDcaptureReady(void);
 NSString *TDcaptureStatus(void);
 UIImage * _Nullable TDscreenshot(void);
 /// variant 0 = 自动；1=RGBA 2=BGRA 3=ABGR 4=ARGB（排查通道错位用）
+/// 11..18 = 按 10 位打包拆位（11..14 小端 layout 0..3，15..18 大端），
+/// 用于 'b3a8' 这类 30 位深色 surface —— 8 位路径怎么调都是假彩色。
 UIImage * _Nullable TDscreenshotFmt(int variant);
+/// 直接读 framebuffer 某像素的原始 4 字节（不做任何色彩解释），反推字节排布用
+BOOL TDpeekRaw(int x, int y, uint8_t out4[4],
+               uint32_t * _Nullable fmtOut, size_t * _Nullable bprOut,
+               size_t * _Nullable wOut, size_t * _Nullable hOut);
 /// framebuffer 实际报的像素格式（四字符码）与每行字节数，排查颜色问题要看这个
 uint32_t TDcapturePixelFormat(void);
 size_t TDcaptureBytesPerRow(void);

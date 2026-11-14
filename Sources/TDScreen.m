@@ -112,7 +112,16 @@ static size_t gLastBpr = 0;
 uint32_t TDcapturePixelFormat(void) { return gLastFmt; }
 size_t TDcaptureBytesPerRow(void) { return gLastBpr; }
 
-UIImage *TDscreenshot(void) { return TDscreenshotFmt(0); }
+// 下面两个实现在文件后半段（探针那节），这里先声明，供 TDscreenshotFmt 用
+static inline void TDunpack10(uint32_t w, int layout, int be, uint8_t *rgb);
+static void TDfreeProviderBuf(void *info, const void *data, size_t size);
+
+UIImage *TDscreenshot(void) {
+    // 默认走「实测出来的拆位方式」。没测过就是 0（老路径），
+    // 测出来之后可以用远程命令 pixfmt 存下来，重启也还在。
+    int v = (int)[[NSUserDefaults standardUserDefaults] integerForKey:@"TDPixLayout"];
+    return TDscreenshotFmt(v);
+}
 
 /// variant：0 = 按 IOSurface 报的像素格式自动判断（默认路径），
 /// 1..4 = 强制指定字节排列，用来排查「截出来颜色不对」到底该按哪种解。
@@ -132,6 +141,41 @@ UIImage *TDscreenshotFmt(int variant) {
     if (w == 0 || h == 0 || base == NULL) {
         gSurfUnlock(surf, kTDIOFBLockReadOnly, NULL);
         return nil;
+    }
+
+    // variant 11..18：按 10 位打包自己拆位（11..14 小端 layout 0..3，15..18 大端）。
+    // 这是 'b3a8' 这类 30 位深色 surface 唯一能正确出图的路子。
+    if (variant >= 11 && variant <= 18) {
+        int idx = variant - 11;
+        int layout = idx & 3, be = idx >> 2;
+        size_t bpr8 = w * 4;
+        uint8_t *buf = malloc(bpr8 * h);
+        if (!buf) { gSurfUnlock(surf, kTDIOFBLockReadOnly, NULL); return nil; }
+        const uint8_t *src = (const uint8_t *)base;
+        for (size_t yy = 0; yy < h; yy++) {
+            const uint8_t *row = src + yy * bpr;
+            uint8_t *dst = buf + yy * bpr8;
+            for (size_t xx = 0; xx < w; xx++) {
+                uint32_t word;
+                memcpy(&word, row + xx * 4, 4);
+                TDunpack10(word, layout, be, dst + xx * 4);
+            }
+        }
+        gSurfUnlock(surf, kTDIOFBLockReadOnly, NULL);
+        CGColorSpaceRef cs2 = CGColorSpaceCreateDeviceRGB();
+        CGDataProviderRef prov = CGDataProviderCreateWithData(buf, buf, bpr8 * h, TDfreeProviderBuf);
+        CGImageRef cg2 = CGImageCreate(w, h, 8, 32, bpr8, cs2,
+                                       (CGBitmapInfo)(kCGImageAlphaNoneSkipLast | kCGBitmapByteOrder32Big),
+                                       prov, NULL, false, kCGRenderingIntentDefault);
+        CGDataProviderRelease(prov);
+        CGColorSpaceRelease(cs2);
+        if (!cg2) return nil;
+        gLastPixelSize = CGSizeMake((CGFloat)w, (CGFloat)h);
+        gLastFmt = fmt;
+        gLastBpr = bpr;
+        UIImage *im2 = [UIImage imageWithCGImage:cg2 scale:1.0 orientation:UIImageOrientationUp];
+        CGImageRelease(cg2);
+        return im2;
     }
 
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
@@ -171,6 +215,63 @@ UIImage *TDscreenshotFmt(int variant) {
     UIImage *img = [UIImage imageWithCGImage:cg scale:1.0 orientation:UIImageOrientationUp];
     CGImageRelease(cg);
     return img;
+}
+
+#pragma mark - 原始字节探针 / 10 位打包解码
+
+/// 直接把 framebuffer 里某像素的 4 个字节原封不动读出来，不做任何色彩解释。
+///
+/// 为什么需要它：iPhone 的主显示 surface 报的是 'b3a8' —— 30 位深色（每个通道
+/// 10 位挤在 32 位里），不是普通的 8 位 RGBA。拿 CGBitmapContext 按 8 位去解释，
+/// 出来的就是「白色变紫、灰色变彩」的假彩色图；换 bitmapInfo 的字节顺序只是在
+/// 轮换这几个字节，怎么调都不对。要修只能自己拆位，而拆位前得先知道真实排布，
+/// 所以留了这个探针：喂已知颜色进去，把原始 4 字节读回来反推。
+BOOL TDpeekRaw(int x, int y, uint8_t out4[4],
+               uint32_t *fmtOut, size_t *bprOut, size_t *wOut, size_t *hOut) {
+    IOSurfaceRef surf = TDGrabSurface();
+    if (!surf) return NO;
+    gSurfLock(surf, kTDIOFBLockReadOnly, NULL);
+    size_t w = gSurfGetWidth(surf);
+    size_t h = gSurfGetHeight(surf);
+    size_t bpr = gSurfGetBytesPerRow ? gSurfGetBytesPerRow(surf) : w * 4;
+    uint8_t *base = (uint8_t *)gSurfGetBase(surf);
+    BOOL ok = NO;
+    if (base && x >= 0 && y >= 0 && x < (int)w && y < (int)h) {
+        memcpy(out4, base + (size_t)y * bpr + (size_t)x * 4, 4);
+        ok = YES;
+    }
+    if (fmtOut) *fmtOut = gSurfGetFormat ? gSurfGetFormat(surf) : 0;
+    if (bprOut) *bprOut = bpr;
+    if (wOut) *wOut = w;
+    if (hOut) *hOut = h;
+    gSurfUnlock(surf, kTDIOFBLockReadOnly, NULL);
+    return ok;
+}
+
+/// 把一个 32 位深色像素按候选排布拆成 8 位 RGB。
+/// layout 0/1：低 10 位起依次是 B,G,R / R,G,B，最高 2 位是 alpha；
+/// layout 2/3：低 2 位是 alpha，之后依次是 B,G,R / R,G,B（Metal 的 BGR10A2）。
+static inline void TDunpack10(uint32_t w, int layout, int be, uint8_t *rgb) {
+    if (be) {
+        w = ((w & 0xFF) << 24) | ((w & 0xFF00) << 8) | ((w >> 8) & 0xFF00) | ((w >> 24) & 0xFF);
+    }
+    uint32_t c0, c1, c2;
+    if (layout < 2) {
+        c0 = w & 0x3FF; c1 = (w >> 10) & 0x3FF; c2 = (w >> 20) & 0x3FF;
+    } else {
+        c0 = (w >> 2) & 0x3FF; c1 = (w >> 12) & 0x3FF; c2 = (w >> 22) & 0x3FF;
+    }
+    // layout 偶数是 B,G,R，奇数是 R,G,B
+    uint32_t r = (layout % 2) ? c0 : c2;
+    uint32_t g = c1;
+    uint32_t b = (layout % 2) ? c2 : c0;
+    rgb[0] = (uint8_t)((r * 255 + 511) / 1023);
+    rgb[1] = (uint8_t)((g * 255 + 511) / 1023);
+    rgb[2] = (uint8_t)((b * 255 + 511) / 1023);
+}
+
+static void TDfreeProviderBuf(void *info, const void *data, size_t size) {
+    free(info);
 }
 
 // 点坐标 / 像素坐标 的换算比。iPhone 7 Plus 是 414x736 点、1080x1920 像素，

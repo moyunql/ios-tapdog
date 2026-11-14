@@ -2,6 +2,7 @@
 
 #import <UIKit/UIKit.h>
 #import <Vision/Vision.h>
+#include <unistd.h>
 
 // ---------------------------------------------------------------------------
 // 远程调试通道
@@ -234,6 +235,80 @@ static UIImage *TDMono(UIImage *img) {
     UIImage *r = [UIImage imageWithCGImage:out scale:1 orientation:UIImageOrientationUp];
     CGImageRelease(out);
     return r;
+}
+
+/// 颜色探针：铺一张 4x2 的纯色色带窗口，再直接读 framebuffer 的原始 4 字节。
+///
+/// 目的不是「看出来」而是「量出来」——iPhone 的主显示 surface 是 'b3a8'
+/// （每通道 10 位挤在 32 位里），光看截图只能知道颜色不对，看不出字节怎么排。
+/// 这里喂已知 RGB，把原始 4 字节原封不动带回来，就能反推准确的拆位方式。
+/// 注意：画面必须是 TapDog 自己在前台，后台的窗口根本不会渲染到 framebuffer。
+static NSDictionary *TDrunPatternProbe(void) {
+    __block UIWindow *win = nil;
+    __block int rows = 4, cols = 2;
+    NSArray<NSString *> *hexes = @[@"FF0000", @"00FF00",
+                                   @"0000FF", @"FFFFFF",
+                                   @"000000", @"808080",
+                                   @"FF8000", @"FF00FF"];
+    CGSize scr = [UIScreen mainScreen].bounds.size;
+
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        UIWindow *w = [[UIWindow alloc] initWithFrame:CGRectMake(0, 0, scr.width, scr.height)];
+        w.windowLevel = UIWindowLevelAlert + 100;
+        // 这个 App 是老的 AppDelegate 生命周期，没有 Scene 配置，窗口能直接显示；
+        // 但万一哪天加了 Scene，不挂 windowScene 的窗口是不会渲染的，先兼容一下。
+        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]]) { w.windowScene = (UIWindowScene *)s; break; }
+        }
+        UIViewController *root = [[UIViewController alloc] init];
+        root.view.backgroundColor = [UIColor blackColor];
+        w.rootViewController = root;
+        CGFloat cw = scr.width / cols, ch = scr.height / rows;
+        for (int i = 0; i < rows * cols; i++) {
+            unsigned int v = 0;
+            sscanf(hexes[i].UTF8String, "%x", &v);
+            UIView *v2 = [[UIView alloc] initWithFrame:CGRectMake((i % cols) * cw,
+                                                                 (i / cols) * ch, cw, ch)];
+            v2.backgroundColor = [UIColor colorWithRed:((v >> 16) & 0xFF) / 255.0
+                                                 green:((v >> 8) & 0xFF) / 255.0
+                                                  blue:(v & 0xFF) / 255.0 alpha:1];
+            [root.view addSubview:v2];
+        }
+        w.hidden = NO;
+        win = w;
+    });
+
+    usleep(600 * 1000);   // 等两帧，framebuffer 里才是新画面
+
+    CGFloat cw = scr.width / cols, ch = scr.height / rows;
+    uint32_t fmt = 0; size_t bpr = 0, pw = 0, ph = 0;
+    uint8_t probe[4] = {0, 0, 0, 0};
+    TDpeekRaw(0, 0, probe, &fmt, &bpr, &pw, &ph);           // 先量一次拿到像素尺寸
+    CGFloat k = (pw > 0 && scr.width > 0) ? (pw / scr.width) : 3.0;   // 点 → 像素
+    NSMutableArray *samples = [NSMutableArray array];
+    for (int i = 0; i < rows * cols; i++) {
+        int px = (int)(((i % cols) * cw + cw * 0.5) * k);
+        int py = (int)(((i / cols) * ch + ch * 0.5) * k);
+        uint8_t b[4] = {0, 0, 0, 0};
+        BOOL ok = TDpeekRaw(px, py, b, &fmt, &bpr, &pw, &ph);
+        [samples addObject:@{@"want": hexes[i],
+                             @"px": @(px), @"py": @(py), @"ok": @(ok),
+                             @"raw": ok ? [NSString stringWithFormat:@"%02x%02x%02x%02x",
+                                           b[0], b[1], b[2], b[3]] : @"-"}];
+    }
+
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        win.hidden = YES;
+        win = nil;
+    });
+
+    char fc[5] = { (char)(fmt >> 24), (char)(fmt >> 16), (char)(fmt >> 8), (char)fmt, 0 };
+    return @{@"fmt": [NSString stringWithFormat:@"%s", fc],
+             @"fmtHex": [NSString stringWithFormat:@"0x%08x", fmt],
+             @"bpr": @(bpr), @"w": @(pw), @"h": @(ph),
+             @"fg": @([[UIApplication sharedApplication] applicationState] == UIApplicationStateActive),
+             @"samples": samples,
+             @"msg": [NSString stringWithFormat:@"探针完成 · 格式 '%s' %zux%zu bpr %zu", fc, pw, ph, bpr]};
 }
 
 static BOOL TDuploadShot(CGFloat maxW, CGFloat quality) {
@@ -585,10 +660,33 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
     }
 
     NSString *c = [cmd[@"c"] isKindOfClass:[NSString class]] ? cmd[@"c"] : @"";
+
+    if ([c isEqualToString:@"pat"]) {
+        NSDictionary *rep = TDrunPatternProbe();
+        gCmdCount++;
+        TDputJSON(@"pattern.json", rep);
+        TDputJSON(@"ack.json", @{@"id": cmd[@"id"] ?: @"", @"ok": @1,
+                                 @"msg": rep[@"msg"] ?: @"探针完成", @"ts": @(now)});
+        return;
+    }
+
+    if ([c isEqualToString:@"pixfmt"]) {
+        // 记下拆位方式，之后所有截图（包括 App 内自己裁模板）都走这条路
+        int v = cmd[@"v"] ? [cmd[@"v"] intValue] : 0;
+        [[NSUserDefaults standardUserDefaults] setInteger:v forKey:@"TDPixLayout"];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        gCmdCount++;
+        TDputJSON(@"ack.json", @{@"id": cmd[@"id"] ?: @"", @"ok": @1,
+                                 @"msg": [NSString stringWithFormat:@"拆位方式=%@", @(v)],
+                                 @"ts": @(now)});
+        return;
+    }
+
     if ([c isEqualToString:@"shot"]) {
         // 截图要整屏原图还是缩略，都行；默认缩到 500 宽，流量小一半
         CGFloat w = cmd[@"full"] ? 0 : 500;
-        gShotFmt = cmd[@"fmt"] ? [cmd[@"fmt"] intValue] : 0;
+        gShotFmt = cmd[@"fmt"] ? [cmd[@"fmt"] intValue]
+                               : (int)[[NSUserDefaults standardUserDefaults] integerForKey:@"TDPixLayout"];
         BOOL ok = TDuploadShot(w, cmd[@"q"] ? [cmd[@"q"] doubleValue] : 0.6);
         uint32_t f = TDcapturePixelFormat();
         char fc[5] = { (char)(f >> 24), (char)(f >> 16), (char)(f >> 8), (char)f, 0 };
