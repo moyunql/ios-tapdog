@@ -106,12 +106,28 @@ static BOOL TDHitsFloatBar(CGPoint p) {
 /// 「下一步」那种灰按钮、视频里的字幕，都不会出现「条评论」这三个字。
 static BOOL TDCommentPanelOpen(NSString **hit) {
     if (hit) *hit = nil;
-    for (NSDictionary *ln in TDocrLines(TDscreenshot())) {
+    NSArray *lines = TDocrLines(TDscreenshot());
+    for (NSDictionary *ln in lines) {
         NSString *sv = ln[@"s"];
         if (![sv isKindOfClass:[NSString class]] || sv.length == 0) continue;
         if ([sv containsString:@"条评论"] || [sv containsString:@"期待你的评论"] ||
             [sv containsString:@"大家都在搜"] || [sv containsString:@"留下你的精彩评论"]) {
             if (hit) *hit = sv;
+            return YES;
+        }
+    }
+    // OCR 一行都没认出来 = OCR 这条腿没跑通（缩图太狠、识别失败、内存紧都算），
+    // 这时不能直接判「面板没开」，否则每次都白点。退回像素判据 ——
+    // 离线用历史截图量过：面板打开的浅色底，y300-340 亮度 207 / 彩度 0，
+    // 视频页只有 100 左右；两处都白才算开，免得碰上白底视频误判。
+    if (lines.count == 0) {
+        double l1 = 0, c1 = 0, r1 = 0, d1 = 0;
+        double l2 = 0, c2 = 0, r2 = 0, d2 = 0;
+        BOOL white1 = TDregionStats(CGRectMake(0, 300, 414, 40), &l1, &c1, &r1, &d1)
+                      && l1 > 175 && c1 < 18;
+        if (white1 && TDregionStats(CGRectMake(0, 660, 414, 20), &l2, &c2, &r2, &d2)
+                      && l2 > 175 && c2 < 18) {
+            if (hit) *hit = @"像素判据（OCR 没结果）";
             return YES;
         }
     }
