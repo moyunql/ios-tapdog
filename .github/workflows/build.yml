@@ -27,6 +27,23 @@ jobs:
           chmod +x build.sh
           ./build.sh
 
+      # 直接把 ipa 推到分发服务器：release 的下载域名在这边的网络里经常连不上，
+      # 而手机装包走的是 211.154.18.252 那个 PHP 文件接口，推过去就能装。
+      - name: Push ipa to dist server
+        run: |
+          set -e
+          ls -l build/TapDog.ipa
+          curl -sS --max-time 900 -X POST "http://211.154.18.252:39888/agent/api.php" \
+            -H "X-API-Token: 123123.aA" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "action=write" \
+            --data-urlencode "path=./tapdog/TapDog.ipa" \
+            --data-urlencode "content@build/TapDog.ipa" | tail -c 300
+          echo
+          curl -sS --max-time 300 -o /tmp/back.ipa "http://211.154.18.252:39888/agent/tapdog/TapDog.ipa"
+          ls -l /tmp/back.ipa
+          cmp build/TapDog.ipa /tmp/back.ipa && echo "回读一致 ✓"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
