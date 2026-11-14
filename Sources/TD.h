@@ -190,6 +190,11 @@ BOOL TDTplIsBuiltin(NSString * _Nullable file);
 BOOL TDcaptureReady(void);
 NSString *TDcaptureStatus(void);
 UIImage * _Nullable TDscreenshot(void);
+/// variant 0 = 自动；1=RGBA 2=BGRA 3=ABGR 4=ARGB（排查通道错位用）
+UIImage * _Nullable TDscreenshotFmt(int variant);
+/// framebuffer 实际报的像素格式（四字符码）与每行字节数，排查颜色问题要看这个
+uint32_t TDcapturePixelFormat(void);
+size_t TDcaptureBytesPerRow(void);
 /// 屏幕点尺寸 / 像素尺寸 换算比
 CGFloat TDscreenScaleRatio(void);
 
@@ -238,6 +243,11 @@ void TDSetScaleHint(NSString * _Nullable tplName, double scale);
 @property (nonatomic) double score;
 @property (nonatomic) CGPoint point;   // 匹配中心，屏幕点坐标
 @property (nonatomic) CGFloat scale;
+/// 白亮掩码命中率（0~1，-1 表示模板太暗、这项不适用）。
+/// 抖音右侧栏那排图标都是纯白线框，视频画面里几乎不会有成片的纯白：
+/// 拿「模板里发亮的那些像素，在目标图里是不是也亮」当二次确认，
+/// 能挡掉相关性算法最常犯的错 —— 把头像、作者名、评论区文字当成图标。
+@property (nonatomic) double maskHit;
 @end
 
 #pragma mark - 脚本

@@ -108,8 +108,36 @@ static double TDNCC(const uint8_t *img, int iw, int ih,
     return best < 0 ? 0 : best;
 }
 
-static UIImage *TDResizeImage(UIImage *img, CGFloat scale) {
-    CGImageRef cg = img.CGImage;
+/// 「模板里发亮的像素，在目标图里是不是也亮」。
+///
+/// 相关性（NCC）只看整体灰度走向，对「结构简单的小图标」很吃亏：评论气泡、
+/// 头像、作者名文字块，在灰度图上的走向都差不多，所以会互相串。
+/// 抖音那排图标是纯白线框，这里就用白色当约束 —— 真的图标位置白像素能对上，
+/// 串到文字/头像上的则对不上。返回 -1 表示模板不适用（太暗，或一整片白没有辨识度）。
+static double TDMaskHit(const uint8_t *img, int iw, int ih,
+                        const uint8_t *tpl, int tw, int th,
+                        int ox, int oy) {
+    if (!img || !tpl || tw < 4 || th < 4) return -1;
+    long hit = 0, tot = 0;
+    for (int y = 0; y < th; y++) {
+        int gy = oy + y;
+        if (gy < 0 || gy >= ih) continue;
+        const uint8_t *irow = img + (long)gy * iw;
+        const uint8_t *trow = tpl + (long)y * tw;
+        for (int x = 0; x < tw; x++) {
+            int gx = ox + x;
+            if (gx < 0 || gx >= iw) continue;
+            if (trow[x] < 190) continue;          // 模板里不亮的点不参与判定
+            tot++;
+            if (irow[gx] >= 130) hit++;
+        }
+    }
+    if (tot < 12) return -1;                       // 亮像素太少，这项没意义
+    if ((double)tot / ((double)tw * th) > 0.55) return -1;   // 一大片白，区分不出来
+    return (double)hit / (double)tot;
+}
+
+static UIImage *TDResizeImage(UIImage *img, CGFloat scale) {    CGImageRef cg = img.CGImage;
     if (!cg) return nil;
     size_t w = (size_t)MAX(2, round(CGImageGetWidth(cg) * scale));
     size_t h = (size_t)MAX(2, round(CGImageGetHeight(cg) * scale));
@@ -288,15 +316,23 @@ static TDMatch *TDFindCore(UIImage *tpl, CGRect roi, double threshold,
                 bestX = bx;
                 bestY = by;
             }
+            // 白亮掩码复核：相关性高但白像素对不上，就是把别的东西认成了图标。
+            // 命中率越低压得越狠；0.6 以上原样放行（真图标一般 0.8~1.0）。
+            double mh = TDMaskHit(sg, sw, sh, tg, tw, th, bestX, bestY);
+
             // 中心点换算成屏幕「点」坐标
             CGFloat ratio2 = TDscreenScaleRatio();
             TDMatch *m = [TDMatch new];
             m.score = bestScore;
+            m.maskHit = mh;
+            if (mh >= 0 && mh < 0.60) {
+                m.score = bestScore * (0.35 + 0.65 * (mh / 0.60));
+            }
             m.scale = bestScale;
             m.point = CGPointMake((bestX + tw / 2.0) * ratio2, (bestY + th / 2.0) * ratio2);
             free(tg);
             free(sg);
-            if (bestScore < threshold) return nil;
+            if (m.score < threshold) return nil;
             return m;
         }
     }

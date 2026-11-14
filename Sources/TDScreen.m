@@ -106,7 +106,19 @@ BOOL TDcaptureReady(void) {
 
 NSString *TDcaptureStatus(void) { return gCapStatus; }
 
-UIImage *TDscreenshot(void) {
+static uint32_t gLastFmt = 0;
+static size_t gLastBpr = 0;
+
+uint32_t TDcapturePixelFormat(void) { return gLastFmt; }
+size_t TDcaptureBytesPerRow(void) { return gLastBpr; }
+
+UIImage *TDscreenshot(void) { return TDscreenshotFmt(0); }
+
+/// variant：0 = 按 IOSurface 报的像素格式自动判断（默认路径），
+/// 1..4 = 强制指定字节排列，用来排查「截出来颜色不对」到底该按哪种解。
+/// 之所以要这个：iPhone 7 Plus / iOS 15 上读出来的图，白色图标会变成红色、
+/// 边缘还有彩色镶边 —— 典型的通道错位。灰度识图还能用，但对比度被拉坏了。
+UIImage *TDscreenshotFmt(int variant) {
     IOSurfaceRef surf = TDGrabSurface();
     if (surf == NULL) return nil;
 
@@ -124,14 +136,29 @@ UIImage *TDscreenshot(void) {
 
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     uint32_t info;
-    if (fmt == 0x52474241 /* 'RGBA' */) {
+    if (variant == 1) {
+        info = (uint32_t)kCGImageAlphaNoneSkipLast | (uint32_t)kCGBitmapByteOrder32Big;      // RGBA
+    } else if (variant == 2) {
+        info = (uint32_t)kCGImageAlphaNoneSkipFirst | (uint32_t)kCGBitmapByteOrder32Little;  // BGRA
+    } else if (variant == 3) {
+        info = (uint32_t)kCGImageAlphaNoneSkipLast | (uint32_t)kCGBitmapByteOrder32Little;   // ABGR
+    } else if (variant == 4) {
+        info = (uint32_t)kCGImageAlphaNoneSkipFirst | (uint32_t)kCGBitmapByteOrder32Big;     // ARGB
+    } else if (fmt == 0x52474241 /* 'RGBA' */) {
         info = (uint32_t)kCGImageAlphaNoneSkipLast | (uint32_t)kCGBitmapByteOrder32Big;
     } else {
         // 'BGRA'（0x42475241）及未知格式统一按 BGRA 处理
         info = (uint32_t)kCGImageAlphaNoneSkipFirst | (uint32_t)kCGBitmapByteOrder32Little;
     }
 
-    CGContextRef ctx = CGBitmapContextCreate(base, w, h, 8, bpr, cs, info);
+    uint32_t infoTry = info;
+    CGContextRef ctx = CGBitmapContextCreate(base, w, h, 8, bpr, cs, infoTry);
+    if (!ctx) {
+        // 声明的排列和实际数据对不上时 CGBitmapContextCreate 会返回 NULL，
+        // 退回最常用的 BGRA 再试一次，别让整个截屏功能失效。
+        ctx = CGBitmapContextCreate(base, w, h, 8, bpr, cs,
+                                    (uint32_t)kCGImageAlphaNoneSkipFirst | (uint32_t)kCGBitmapByteOrder32Little);
+    }
     CGImageRef cg = ctx ? CGBitmapContextCreateImage(ctx) : NULL;
     if (ctx) CGContextRelease(ctx);
     CGColorSpaceRelease(cs);
@@ -139,6 +166,8 @@ UIImage *TDscreenshot(void) {
 
     if (!cg) return nil;
     gLastPixelSize = CGSizeMake((CGFloat)w, (CGFloat)h);
+    gLastFmt = fmt;
+    gLastBpr = bpr;
     UIImage *img = [UIImage imageWithCGImage:cg scale:1.0 orientation:UIImageOrientationUp];
     CGImageRelease(cg);
     return img;

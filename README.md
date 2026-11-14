@@ -12,6 +12,7 @@
 |---|---|
 | 识图点击 | 截全屏 → 灰度金字塔 + 归一化互相关找模板 → 命中后点它中心。阈值可调，支持 0.7~1.3 倍缩放 |
 | 识别区域 | 每个识图事件可以单独框一块区域，只在框里找（按「模板中心落在框内」判定，框比图标小也能用）|
+| 远程调试 | 截图 / 日志 / 状态写到自建服务器中转站，远端下发点击、滑动、输入、OCR、识图命令（详见 `tools/dbg.py`）|
 | 点击 / 长按 | 全局注入，点任意 App |
 | 滑动 | 起终点 + 真实时长，中途多帧 move（不是两点瞬移） |
 | 轨迹手势 | 任意多点折线，按总时长匀速插值 |
@@ -77,6 +78,31 @@ brew install ldid
 5. 屏幕右侧有悬浮球，点一下停/继续
 
 脚本存在 `Documents/tapdog.json`，模板图存 `Documents/tpl_N.png`，可直接用文件 App 改。
+
+## 远程调试通道
+
+手机上的一切都能从远端看和动，链路是「自己的服务器当文件中转站」：
+
+```
+手机 → POST api.php action=write → ./tapdog/dbg/{state.json,shot.jpg,ack.json,ocr.json}
+手机 ← GET  ./tapdog/dbg/cmd.json ← 本机 tools/dbg.py
+```
+
+- 轮询 1.4 秒一轮；命令带 `ts`，超过 90 秒的直接丢弃（设备离线再上线不会补执行旧点击）
+- 状态 10 秒一次；截图只在 `shot` 命令或 `auto` 模式下上传（默认缩到 500 宽、q0.55，约 30KB）
+- 命令：`tap / long / swipe / back / text / open / ocr / find / tpl / shot / auto / run / stop / script`
+- `text` 走的还是评论池那条落字链路（剪贴板 + 双击 + 识图点「粘贴」），键盘通道对非平台进程无效
+- `ocr` 用 Vision 认字并回传屏幕坐标；`tpl` 能从当前画面裁模板，配合 `find` 立刻验证
+- 开关在 App 里「远程调试」页，默认开；关掉后线程保留但不再上传
+
+```bash
+python tools/dbg.py status          # 设备在不在线、屏幕/引擎/最近日志
+python tools/dbg.py shot            # 拉一张当前画面到 docs/dbg/
+python tools/dbg.py ocr             # 认屏上的字（带坐标）
+python tools/dbg.py tap 207 640
+python tools/dbg.py text "第一条评论"
+python tools/dbg.py watch 40        # 连续 40 秒每 3 秒一张
+```
 
 ## 调参建议（抖音场景）
 

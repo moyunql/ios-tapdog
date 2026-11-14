@@ -191,10 +191,13 @@ static NSDictionary *TDgetJSON(NSString *name) {
 
 #pragma mark - 截图 / OCR
 
+/// 本次截图用的像素排列（0=自动）。远程排查颜色时才临时改，平时都是 0。
+static int gShotFmt = 0;
+
 /// 截当前整屏，缩到指定宽度（0 = 不缩）。TDscreenshot 读的是 framebuffer，
 /// 所以哪怕我们在后台、前台是抖音，抓到的也是用户看到的画面。
 static UIImage *TDshotScaled(CGFloat maxW) {
-    UIImage *img = TDscreenshot();
+    UIImage *img = TDscreenshotFmt(gShotFmt);
     if (!img) return nil;
     if (maxW <= 0 || img.size.width <= maxW) return img;
     CGFloat k = maxW / img.size.width;
@@ -204,6 +207,33 @@ static UIImage *TDshotScaled(CGFloat maxW) {
     UIImage *out = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
     return out ?: img;
+}
+
+/// 把裁下来的图标压成「黑底白图」。
+///
+/// 直接截一块图标，模板里必然混进当时的视频画面：换个视频，模板就对不上了 ——
+/// 这是以前识图「时灵时不灵」的主要原因。图标本身是纯白的，所以只留亮像素、
+/// 其余抹黑，模板就只剩形状，和背景彻底脱钩。
+static UIImage *TDMono(UIImage *img) {
+    CGImageRef cg = img.CGImage;
+    if (!cg) return nil;
+    int w = (int)CGImageGetWidth(cg), h = (int)CGImageGetHeight(cg);
+    if (w < 2 || h < 2) return nil;
+    uint8_t *buf = calloc((size_t)w * (size_t)h, 1);
+    if (!buf) return nil;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
+    CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, w, cs, kCGImageAlphaNone);
+    CGColorSpaceRelease(cs);
+    if (!ctx) { free(buf); return nil; }
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
+    for (int i = 0; i < w * h; i++) buf[i] = (buf[i] >= 175) ? 255 : 0;
+    CGImageRef out = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    free(buf);
+    if (!out) return nil;
+    UIImage *r = [UIImage imageWithCGImage:out scale:1 orientation:UIImageOrientationUp];
+    CGImageRelease(out);
+    return r;
 }
 
 static BOOL TDuploadShot(CGFloat maxW, CGFloat quality) {
@@ -291,7 +321,8 @@ static NSDictionary *TDstateDict(void) {
 
 #pragma mark - 命令执行
 
-/// 命令都在主线程跑（要碰 UI / openURL），网络留在后台队列。
+/// 命令在后台串行队列上执行；只有 openURL 那条自己 dispatch_async 回主线程。
+/// 网络（上传截图/状态）和计算（OCR/识图）绝不能占主线程 —— 会被 watchdog 杀掉。
 /// 返回值：ok / msg，另有 shot=1 表示「执行完再传一张截图」。
 static NSDictionary *TDexecCommand(NSDictionary *cmd) {
     NSString *c = [cmd[@"c"] isKindOfClass:[NSString class]] ? cmd[@"c"] : @"";
@@ -347,7 +378,11 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
         NSString *u = [cmd[@"url"] isKindOfClass:[NSString class]] ? cmd[@"url"] : @"snssdk1128://";
         NSURL *url = [NSURL URLWithString:u];
         if (!url) return @{@"ok": @0, @"msg": @"url 不合法"};
-        [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+        // openURL 必须在主线程；用 async 丢过去，不占住主线程等它返回 ——
+        // 换成 sync 的话，这里会一直堵到 SpringBoard 把 App 唤起来为止。
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+        });
         TDLog(@"远程调试：打开 %@", u);
         return @{@"ok": @1, @"msg": [NSString stringWithFormat:@"open %@", u]};
     }
@@ -396,12 +431,17 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
         if (!sub) return @{@"ok": @0, @"msg": @"裁剪失败（框出界了？）"};
         UIImage *one = [UIImage imageWithCGImage:sub scale:1 orientation:UIImageOrientationUp];
         CGImageRelease(sub);
+        BOOL mono = [cmd[@"mono"] boolValue];
+        if (mono) {
+            UIImage *bw = TDMono(one);
+            if (bw) one = bw;
+        }
         NSString *p = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)
                        .firstObject stringByAppendingPathComponent:name];
         NSData *png = UIImagePNGRepresentation(one);
         if (!png || ![png writeToFile:p atomically:YES]) return @{@"ok": @0, @"msg": @"写文件失败"};
-        return @{@"ok": @1, @"msg": [NSString stringWithFormat:@"存了 %@ %.0f×%.0f",
-                                      name, one.size.width, one.size.height]};
+        return @{@"ok": @1, @"msg": [NSString stringWithFormat:@"存了 %@ %.0f×%.0f%@",
+                                      name, one.size.width, one.size.height, mono ? @"（黑白）" : @""]};
     }
 
     // 识图：给了 roi 就只在那块里找
@@ -423,14 +463,16 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
                          @"shot": @1};
         if ([cmd[@"tap"] boolValue]) TDtap(m.point.x, m.point.y);
         return @{@"ok": @1,
-                 @"msg": [NSString stringWithFormat:@"%@ (%.0f,%.0f) 相似度 %.3f",
-                          name, m.point.x, m.point.y, m.score],
+                 @"msg": [NSString stringWithFormat:@"%@ (%.0f,%.0f) 相似度 %.3f · 白掩码 %.2f",
+                          name, m.point.x, m.point.y, m.score, m.maskHit],
                  @"x": @(lround(m.point.x)), @"y": @(lround(m.point.y)),
-                 @"score": @(m.score), @"shot": @1};
+                 @"score": @(m.score), @"mask": @(m.maskHit), @"shot": @1};
     }
 
     if ([c isEqualToString:@"ocr"]) {
-        UIImage *shot = TDscreenshot();
+        // 缩小再认：Vision 对分辨率不敏感，1242×2208 缩到 700 宽，速度快几倍。
+        // 上一版直接把整屏原图丢给它在主线程认，直接触发 watchdog 把 App 杀了。
+        UIImage *shot = TDshotScaled(700);
         NSArray *lines = TDocr(shot);
         NSData *d = [NSJSONSerialization dataWithJSONObject:lines options:0 error:NULL];
         TDput(@"ocr.json", d);
@@ -546,10 +588,16 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
     if ([c isEqualToString:@"shot"]) {
         // 截图要整屏原图还是缩略，都行；默认缩到 500 宽，流量小一半
         CGFloat w = cmd[@"full"] ? 0 : 500;
+        gShotFmt = cmd[@"fmt"] ? [cmd[@"fmt"] intValue] : 0;
         BOOL ok = TDuploadShot(w, cmd[@"q"] ? [cmd[@"q"] doubleValue] : 0.6);
+        uint32_t f = TDcapturePixelFormat();
+        char fc[5] = { (char)(f >> 24), (char)(f >> 16), (char)(f >> 8), (char)f, 0 };
+        NSString *desc = [NSString stringWithFormat:@"截图已上传 · 格式 '%s' bpr %zu",
+                          fc, TDcaptureBytesPerRow()];
+        gShotFmt = 0;
         gCmdCount++;
         TDputJSON(@"ack.json", @{@"id": cmd[@"id"] ?: @"", @"ok": @(ok),
-                                 @"msg": ok ? @"截图已上传" : (gLastErr ?: @"截图失败"),
+                                 @"msg": ok ? desc : (gLastErr ?: @"截图失败"),
                                  @"ts": @(now)});
         return;
     }
@@ -567,10 +615,12 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
         return;
     }
 
-    __block NSDictionary *res = nil;
-    dispatch_sync(dispatch_get_main_queue(), ^{
-        res = TDexecCommand(cmd) ?: @{@"ok": @0, @"msg": @"无返回"};
-    });
+    // 命令直接在后台队列上跑，不再 dispatch_sync 到主线程 ——
+    // OCR（Vision 整屏识别）和识图（金字塔扫描）都是几百毫秒到几秒的重活，
+    // 放在主线程会把 UI 卡死，主线程超时就会被系统 watchdog 直接杀掉：
+    // 表现就是「远程发了条 ocr，App 自己闪退，而且永远收不到回执」。
+    // 真正需要主线程的只有 openURL，那一条在分支里自己 dispatch_async 过去了。
+    NSDictionary *res = TDexecCommand(cmd) ?: @{@"ok": @0, @"msg": @"无返回"};
     gCmdCount++;
     TDRemoteNote([NSString stringWithFormat:@"执行 %@：%@", c, res[@"msg"] ?: @""]);
 
@@ -583,6 +633,7 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
     if (res[@"x"]) ack[@"x"] = res[@"x"];
     if (res[@"y"]) ack[@"y"] = res[@"y"];
     if (res[@"score"]) ack[@"score"] = res[@"score"];
+    if (res[@"mask"]) ack[@"mask"] = res[@"mask"];
     if (res[@"text"]) ack[@"text"] = res[@"text"];
     TDputJSON(@"ack.json", ack);
     TDputJSON(@"state.json", TDstateDict());
