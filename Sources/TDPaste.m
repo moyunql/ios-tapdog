@@ -234,8 +234,50 @@ BOOL TDPasteCopyToClipboard(NSString *text) {
     return [back isEqualToString:text];
 }
 
-NSString *TDPasteClipboardText(void) {
-    __block NSString *s = nil;
+/// 后台到底能不能写剪贴板？把几种写法各试一遍，逐步回读。
+/// 判据是 changeCount：它变了才说明 pasteboardd 真的收下了（回读可能还是旧缓存）。
+NSArray<NSString *> *TDclipTryWrite(NSString *text) {
+    NSMutableArray *out = [NSMutableArray array];
+    [out addObject:[NSString stringWithFormat:@"state=%ld",
+                    (long)[UIApplication sharedApplication].applicationState]];
+
+    void (^run)(NSString *, void (^)(UIPasteboard *)) = ^(NSString *name, void (^act)(UIPasteboard *)) {
+        __block NSInteger before = -1, after = -1;
+        __block NSString *back = nil;
+        void (^job)(void) = ^{
+            UIPasteboard *pb = [UIPasteboard generalPasteboard];
+            before = (NSInteger)pb.changeCount;
+            act(pb);
+            after = (NSInteger)pb.changeCount;
+            back = pb.string;
+        };
+        if ([NSThread isMainThread]) job();
+        else dispatch_sync(dispatch_get_main_queue(), job);
+
+        NSString *read;
+        if ([text isEqualToString:back ?: @""]) {
+            read = @"对";
+        } else if (back.length == 0) {
+            read = @"空";
+        } else {
+            NSString *t = back.length > 12 ? [back substringToIndex:12] : back;
+            read = [NSString stringWithFormat:@"「%@」", t];
+        }
+        [out addObject:[NSString stringWithFormat:@"%@ 收下%@ 回读%@ chg%ld→%ld",
+                        name, (after != before ? @"✓" : @"✗"), read,
+                        (long)before, (long)after]];
+    };
+
+    run(@"A:string=", ^(UIPasteboard *pb) { pb.string = text; });
+    run(@"B:setString", ^(UIPasteboard *pb) { [pb setString:text]; });
+    run(@"C:setItems", ^(UIPasteboard *pb) { [pb setItems:@[@{@"public.utf8-plain-text": text}]]; });
+    run(@"D:setValue", ^(UIPasteboard *pb) {
+        [pb setValue:text forPasteboardType:@"public.utf8-plain-text"];
+    });
+    return out;
+}
+
+NSString *TDPasteClipboardText(void) {    __block NSString *s = nil;
     void (^get)(void) = ^{ s = [UIPasteboard generalPasteboard].string; };
     if ([NSThread isMainThread]) get();
     else dispatch_sync(dispatch_get_main_queue(), get);

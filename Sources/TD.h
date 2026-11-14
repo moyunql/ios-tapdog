@@ -145,6 +145,9 @@ CGPoint TDPasteMenuOffset(void);
 
 /// 把一条话术写进系统剪贴板，写完立刻回读校验（返回 YES = 真的进去了）。
 BOOL TDPasteCopyToClipboard(NSString *text);
+
+/// 后台能否写剪贴板：几种写法各试一次，逐步回读（诊断用）
+NSArray<NSString *> *TDclipTryWrite(NSString *text);
 /// 看一眼剪贴板现在是什么（最多 40 字）
 NSString *TDPasteClipboardText(void);
 void TDPasteSetHoldMs(double holdMs);

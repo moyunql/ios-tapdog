@@ -466,6 +466,15 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
                                      TDPasteClipboardText()]};
     }
 
+    if ([c isEqualToString:@"clipset"]) {
+        // 诊断：抖音在前台（我们处于后台）时，到底能不能写进系统剪贴板
+        NSString *s = [cmd[@"s"] isKindOfClass:[NSString class]] ? cmd[@"s"] : @"TDRC探针";
+        NSArray<NSString *> *r = TDclipTryWrite(s);
+        gCmdCount++;
+        TDputJSON(@"clipset.json", @{@"text": s, @"steps": r});
+        return @{@"ok": @1, @"msg": [r componentsJoinedByString:@" | "]};
+    }
+
     if ([c isEqualToString:@"kbd"]) {
         // HID 键盘直打（只能打 ASCII）。用来验「键盘通道」到底通不通：
         // 打得出来说明 Cmd+V 那条路也能用，打不出来就只能靠点屏幕输入。
@@ -485,6 +494,50 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
         });
         TDLog(@"远程调试：打开 %@", u);
         return @{@"ok": @1, @"msg": [NSString stringWithFormat:@"open %@", u]};
+    }
+
+    if ([c isEqualToString:@"paste"]) {
+        // 系统只在「自己在前台」时接受剪贴板写入：后台写会静默丢弃
+        // （回读立刻就是旧值，症状是粘出上一次的内容）。
+        // 所以这里自己切到前台写、再切回目标 App 发 Cmd+V，一条命令走完。
+        NSString *s = [cmd[@"s"] isKindOfClass:[NSString class]] ? cmd[@"s"] : @"";
+        if (s.length == 0) return @{@"ok": @0, @"msg": @"文本为空"};
+        NSString *app = [cmd[@"app"] isKindOfClass:[NSString class]] ? cmd[@"app"] : @"snssdk1128://";
+        BOOL needTap = [cmd[@"tap"] boolValue];
+        CGPoint at = CGPointMake([cmd[@"x"] doubleValue], [cmd[@"y"] doubleValue]);
+        NSURL *back = [NSURL URLWithString:app];
+
+        // 1) 自唤起：从后台把 TapDog 拉回前台（查证后台写不了才需要这步，self=0 可跳过）
+        BOOL selfFirst = cmd[@"self"] ? [cmd[@"self"] boolValue] : YES;
+        if (selfFirst) {
+            NSURL *selfURL = [NSURL URLWithString:@"tapdog://"];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [[UIApplication sharedApplication] openURL:selfURL options:@{} completionHandler:nil];
+            });
+            usleep(1300 * 1000);
+        }
+
+        // 2) 前台写剪贴板，并回读校验
+        BOOL ok = TDPasteCopyToClipboard(s);
+        TDLog(@"粘贴：自前台写入剪贴板 成功=%@ (%lu 字)", ok ? @"是" : @"否", (unsigned long)s.length);
+        usleep(350 * 1000);
+
+        // 3) 切回目标 App
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[UIApplication sharedApplication] openURL:back options:@{} completionHandler:nil];
+        });
+        usleep(1700 * 1000);
+
+        // 4) 需要时先点一下把光标放进输入框（键盘已弹出时不要点，会点偏）
+        if (needTap && at.x > 0 && at.y > 0) {
+            TDtap(at.x, at.y);
+            usleep(520 * 1000);
+        }
+        TDsendCmdV();
+        TDLog(@"粘贴：已切回 %@ 并发 Cmd+V", app);
+        return @{@"ok": @1,
+                 @"msg": [NSString stringWithFormat:@"paste 剪贴板%@", ok ? @"已写入" : @"写入失败"],
+                 @"shot": @1};
     }
 
     if ([c isEqualToString:@"run"] || [c isEqualToString:@"stop"]) {

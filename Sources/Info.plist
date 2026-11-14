@@ -10,14 +10,25 @@
 	<string>TapDog</string>
 	<key>CFBundleDisplayName</key>
 	<string>TapDog</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.local.tapdog</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>tapdog</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.23.0</string>
+	<string>1.24.0</string>
 	<key>CFBundleVersion</key>
-	<string>51</string>
+	<string>52</string>
 	<key>MinimumOSVersion</key>
 	<string>15.0</string>
 	<key>CFBundleSupportedPlatforms</key>
