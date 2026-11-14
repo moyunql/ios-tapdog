@@ -1117,15 +1117,19 @@ void TDsendKey(uint16_t usage, BOOL down) {
     CFRelease(e);
 }
 
-void TDsendCmdV(void) {
+/// Command + 任一键。0x04=a(全选) 0x19=v(粘贴) 0x1D=z(撤销) 0x2C=空格
+void TDsendCmdKey(uint16_t usage) {
     TDsendKey(0xE3, YES);     // 左 Command 按下
     usleep(12000);
-    TDsendKey(0x19, YES);     // v 按下
+    TDsendKey(usage, YES);
     usleep(25000);
-    TDsendKey(0x19, NO);      // v 抬起
+    TDsendKey(usage, NO);
     usleep(10000);
     TDsendKey(0xE3, NO);      // Command 抬起
 }
+
+void TDsendCmdV(void) { TDsendCmdKey(0x19); }     // ⌘V 粘贴
+void TDsendCmdA(void) { TDsendCmdKey(0x04); }     // ⌘A 全选（再粘贴会整段覆盖）
 
 /// ASCII → HID keyboard usage(0x07)。返回 0 表示这个字符打不了。
 static uint16_t TDusageForASCII(char ch, BOOL *needShift) {

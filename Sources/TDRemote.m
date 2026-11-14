@@ -2,6 +2,7 @@
 
 #import <UIKit/UIKit.h>
 #import <Vision/Vision.h>
+#import <objc/message.h>
 #include <unistd.h>
 
 // ---------------------------------------------------------------------------
@@ -399,6 +400,41 @@ static NSDictionary *TDstateDict(void) {
 /// 命令在后台串行队列上执行；只有 openURL 那条自己 dispatch_async 回主线程。
 /// 网络（上传截图/状态）和计算（OCR/识图）绝不能占主线程 —— 会被 watchdog 杀掉。
 /// 返回值：ok / msg，另有 shot=1 表示「执行完再传一张截图」。
+// ---------------------------------------------------------------------------
+// 把自己拉回前台
+//
+// 系统只在 App 处于 active 时接受剪贴板写入；后台调用一律丢弃（实测四种写法
+// changeCount 都是 0→0，回读全空）。所以「往别的 App 里喂中文」必须先让自己
+// 前台一次。两条路：自己的 URL scheme，和 LSApplicationWorkspace 强制激活。
+static BOOL TDwaitActive(int ticks) {           // 每 tick 200ms
+    for (int i = 0; i < ticks; i++) {
+        usleep(200 * 1000);
+        if ((NSInteger)[UIApplication sharedApplication].applicationState == 0) return YES;
+    }
+    return NO;
+}
+
+static BOOL TDForegroundSelf(int *via) {        // via: 1=scheme 2=LSWorkspace 0=没成功
+    if (via) *via = 0;
+    NSURL *u = [NSURL URLWithString:@"tapdog://"];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:nil];
+    });
+    if (TDwaitActive(13)) { if (via) *via = 1; return YES; }
+
+    Class wsCls = NSClassFromString(@"LSApplicationWorkspace");
+    if (wsCls) {
+        id (*msgSend0)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+        void (*msgSend1)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
+        id ws = msgSend0(wsCls, sel_registerName("defaultWorkspace"));
+        if (ws) {
+            msgSend1(ws, sel_registerName("openApplicationWithBundleID:"), @"com.local.tapdog");
+            if (TDwaitActive(18)) { if (via) *via = 2; return YES; }
+        }
+    }
+    return NO;
+}
+
 static NSDictionary *TDexecCommand(NSDictionary *cmd) {
     NSString *c = [cmd[@"c"] isKindOfClass:[NSString class]] ? cmd[@"c"] : @"";
 
@@ -507,20 +543,23 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
         CGPoint at = CGPointMake([cmd[@"x"] doubleValue], [cmd[@"y"] doubleValue]);
         NSURL *back = [NSURL URLWithString:app];
 
-        // 1) 自唤起：从后台把 TapDog 拉回前台（查证后台写不了才需要这步，self=0 可跳过）
+        // 切回前台要经过 inactive 才到 active，固定睡一段时间常常踩在 inactive 上，
+        // 写剪贴板还是会被丢。所以改成轮询 state，真到 active 才下笔。
         BOOL selfFirst = cmd[@"self"] ? [cmd[@"self"] boolValue] : YES;
+        BOOL written = NO;
+        NSInteger st = -1;
+        int via = 0;
         if (selfFirst) {
-            NSURL *selfURL = [NSURL URLWithString:@"tapdog://"];
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [[UIApplication sharedApplication] openURL:selfURL options:@{} completionHandler:nil];
-            });
-            usleep(1300 * 1000);
+            BOOL front = TDForegroundSelf(&via);
+            st = (NSInteger)[UIApplication sharedApplication].applicationState;
+            if (front) written = TDPasteCopyToClipboard(s);
+            TDLog(@"粘贴：自前台 方式=%d 前台=%@ 写剪贴板=%@ state=%ld",
+                  via, front ? @"是" : @"否", written ? @"是" : @"否", (long)st);
+        } else {
+            written = TDPasteCopyToClipboard(s);
+            st = (NSInteger)[UIApplication sharedApplication].applicationState;
         }
-
-        // 2) 前台写剪贴板，并回读校验
-        BOOL ok = TDPasteCopyToClipboard(s);
-        TDLog(@"粘贴：自前台写入剪贴板 成功=%@ (%lu 字)", ok ? @"是" : @"否", (unsigned long)s.length);
-        usleep(350 * 1000);
+        usleep(250 * 1000);
 
         // 3) 切回目标 App
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -531,12 +570,18 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
         // 4) 需要时先点一下把光标放进输入框（键盘已弹出时不要点，会点偏）
         if (needTap && at.x > 0 && at.y > 0) {
             TDtap(at.x, at.y);
-            usleep(520 * 1000);
+            usleep(560 * 1000);
+        }
+        // 5) ⌘A 全选：粘贴直接覆盖旧内容，不会越贴越长
+        if ([cmd[@"clear"] boolValue]) {
+            TDsendCmdA();
+            usleep(220 * 1000);
         }
         TDsendCmdV();
         TDLog(@"粘贴：已切回 %@ 并发 Cmd+V", app);
         return @{@"ok": @1,
-                 @"msg": [NSString stringWithFormat:@"paste 剪贴板%@", ok ? @"已写入" : @"写入失败"],
+                 @"msg": [NSString stringWithFormat:@"paste 方式=%d 写%@ state=%ld",
+                          via, written ? @"✓" : @"✗", (long)st],
                  @"shot": @1};
     }
 

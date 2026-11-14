@@ -116,6 +116,9 @@ void TDsendKey(uint16_t usage, BOOL down);
 /// Cmd+V：按下 Command → 按 v → 松 v → 松 Command。
 /// 作用是把剪贴板内容粘进「当前有键盘焦点的输入框」（抖音评论框）。
 void TDsendCmdV(void);
+/// ⌘ + 任意键（0x04=a 全选，0x19=v 粘贴）
+void TDsendCmdKey(uint16_t usage);
+void TDsendCmdA(void);
 /// 直打一串 ASCII（a-z A-Z 0-9 空格和几个常用符号）。中文打不了 ——
 /// 中文要么走剪贴板粘贴，要么老老实实点键盘拼音再点候选字。
 void TDtypeASCII(NSString *s);
