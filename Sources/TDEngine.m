@@ -534,7 +534,7 @@ static CGPoint TDJitter(CGPoint p, double r) {
         double ux = st[@"ux"] ? [st[@"ux"] doubleValue] : 368;   // 相册右上「多选」
         double uy = st[@"uy"] ? [st[@"uy"] doubleValue] : 47;
         double nx = st[@"nx"] ? [st[@"nx"] doubleValue] : 110;   // 「下一步」
-        double ny = st[@"ny"] ? [st[@"ny"] doubleValue] : 707;
+        double ny = st[@"ny"] ? [st[@"ny"] doubleValue] : 688;
         double sx = st[@"sx"] ? [st[@"sx"] doubleValue] : 375;   // 发送
         double sy = st[@"sy"] ? [st[@"sy"] doubleValue] : 396;
         NSString *app = [st[@"app"] isKindOfClass:[NSString class]] ? st[@"app"] : @"snssdk1128://";
@@ -542,7 +542,7 @@ static CGPoint TDJitter(CGPoint p, double r) {
         if (txt.length == 0) txt = TDCommentPick();
         if (txt.length == 0) { [self logMsg:@"%@ 评论池是空的（先加几条话术）", tag]; return; }
         NSArray *cells = [st[@"cells"] isKindOfClass:[NSArray class]] ? st[@"cells"]
-                          : @[@[@155, @386], @[@259, @386], @[@362, @386]];
+                          : @[@[@52, @195], @[@155, @195], @[@257, @195]];
 
         void (^closePanel)(void) = ^{
             TDswipe(CGPointMake(207, 250), CGPointMake(207, 700), 0.30);
@@ -579,18 +579,28 @@ static CGPoint TDJitter(CGPoint p, double r) {
         TDtap(mx, my);
         usleep(2100 * 1000);
         double l2 = 0, c2 = 0, r2 = 0, d2 = 0;
-        BOOL album = TDregionStats(CGRectMake(150, 52, 200, 20), &l2, &c2, &r2, &d2) && l2 > 225;
+        BOOL album = TDregionStats(CGRectMake(40, 120, 340, 24), &l2, &c2, &r2, &d2) && l2 > 220;
         if (!album) {
             [self logMsg:@"%@ 相册没打开（%.0f），再点一次", tag, l2];
             TDtap(mx, my);
             usleep(2100 * 1000);
-            album = TDregionStats(CGRectMake(150, 52, 200, 20), &l2, &c2, &r2, &d2) && l2 > 225;
+            album = TDregionStats(CGRectMake(40, 120, 340, 24), &l2, &c2, &r2, &d2) && l2 > 220;
         }
         if (!album) { [self logMsg:@"%@ 相册打不开，这条跳过", tag]; closePanel(); return; }
 
-        // 4) 切多选：单选模式下点格子会直接返回，选不到多张
+        // 4) 切多选：单选模式下点格子会直接带着一张图返回，选不到多张。
+        //    多选模式一开，底部会冒出一个通红的「下一步」—— 拿这个当证据，
+        //    没变红就说明没切进去，此时点格子会直接退出相册，绝不能继续。
         TDtap(ux, uy);
         usleep(1200 * 1000);
+        double l5 = 0, c5 = 0, red5 = 0, d5 = 0;
+        BOOL multi = TDregionStats(CGRectMake(60, 672, 300, 26), &l5, &c5, &red5, &d5)
+                     && red5 > 0.18;
+        if (!multi) {
+            [self logMsg:@"%@ 没进多选（底部没有红色下一步，红 %.2f），这条跳过", tag, red5];
+            closePanel();
+            return;
+        }
 
         // 5) 挨个点格子选图（多选模式下点格子本体就是勾选，不必精确点小圆圈）
         NSInteger picked = 0;
