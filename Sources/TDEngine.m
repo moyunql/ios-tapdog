@@ -85,10 +85,29 @@ void TDLog(NSString *fmt, ...) {
     [[TDEngine shared] logMsg:@"%@", s];
 }
 
+/// 回放的这一下会不会砸到我们自己的悬浮条上。
+///
+/// 悬浮条是一个真实的 SystemWide 窗口（级别比抖音高），注入的触摸落进它的矩形里，
+/// 命中的就是我们的 ▶ / ● / ■，不是抖音。用户看到的两件怪事都是它：
+///   · 落在 ● → 一路走 TDFloatStartLiveRecord →「播着播着变成录制了」；
+///   · 落在 ■ → 当场 [engine stop] → 下次 ▶ 又从第 0 步起 →「每次都从 0 开始」。
+/// 所以回放阶段凡是落点压在悬浮条上的步骤，一律跳过并明确告诉用户。
+static BOOL TDHitsFloatBar(CGPoint p) {
+    CGRect r = TDFloatTouchRect();
+    if (CGRectIsNull(r) || CGRectIsEmpty(r)) return NO;
+    return CGRectContainsPoint(CGRectInset(r, -4, -4), p);
+}
+
 @implementation TDEngine {
-    BOOL _running;
+    volatile BOOL _running;
     dispatch_queue_t _q;
     NSInteger _loopsDone;
+    // 每一轮运行一个「凭证」。旧线程收尾时只能清自己那一轮的 _running，
+    // 否则「按 ■ 立刻再按 ▶」会被上一个线程尾巴上的 _running = NO 直接掐死。
+    volatile NSUInteger _gen;
+    NSInteger _curIndex;        // 当前跑到 plan 的第几步（0 起，-1 = 不在步骤里）
+    NSInteger _stoppedAt;       // 上一次被用户停在第几步（-1 = 没被中断）
+    BOOL _floatBarWarned;       // 悬浮条压点只提示一次，别刷屏
     NSString *_jetsamStatus;
     NSArray *_currentPlan;      // 当前这一轮要跑的步骤，日志里用来取序号
     NSDictionary *_failsafe;    // 本次运行的「判断」配置（nil = 关）
@@ -104,12 +123,17 @@ void TDLog(NSString *fmt, ...) {
     dispatch_once(&once, ^{
         e = [TDEngine new];
         e->_q = dispatch_queue_create("tapdog.engine", DISPATCH_QUEUE_SERIAL);
+        e->_stoppedAt = -1;
+        e->_curIndex = -1;
     });
     return e;
 }
 
 - (BOOL)running { return _running; }
 - (NSInteger)loopsDone { return _loopsDone; }
+- (NSInteger)stoppedStep { return _stoppedAt; }
+- (NSInteger)curStep { return _curIndex; }
+- (NSInteger)planCount { return (NSInteger)_currentPlan.count; }
 - (NSString *)jetsamStatus { return _jetsamStatus; }
 - (void)setJetsamStatus:(NSString *)s { _jetsamStatus = [s copy]; }
 
@@ -148,11 +172,17 @@ static CGPoint TDJitter(CGPoint p, double r) {
 }
 
 - (void)playSteps:(NSArray<NSDictionary *> *)steps loop:(NSInteger)loops {
-    [self startPlan:steps loops:loops failsafe:nil loopGap:0];
+    [self startPlan:steps loops:loops failsafe:nil loopGap:0 from:0];
 }
 
 /// 跑一条脚本：循环次数、每轮间隔、识图失败兜底全部按脚本自己的配置。
 - (void)playScript:(TDScript *)script {
+    [self playScript:script fromStep:0];
+}
+
+/// fromStep 只影响第一轮：从第几步开始跑。0 = 老行为（从头）。
+/// 调试某一步、或者「接着上次停的地方」都用它，第二轮以后照样从 0 起。
+- (void)playScript:(TDScript *)script fromStep:(NSInteger)startIndex {
     if (!script) {
         [self logMsg:@"没有选中的脚本"];
         return;
@@ -167,13 +197,14 @@ static CGPoint TDJitter(CGPoint p, double r) {
         gap = MAX(0.0, [script.loop[@"gap"] doubleValue]);
     }
     NSDictionary *fs = [script failsafeEnabled] ? script.failsafe : nil;
-    [self startPlan:plan loops:loops failsafe:fs loopGap:gap];
+    [self startPlan:plan loops:loops failsafe:fs loopGap:gap from:startIndex];
 }
 
 - (void)startPlan:(NSArray<NSDictionary *> *)steps
             loops:(NSInteger)loops
          failsafe:(NSDictionary *)failsafe
-          loopGap:(double)loopGap {
+          loopGap:(double)loopGap
+             from:(NSInteger)startIndex {
     if (_running) {
         [self logMsg:@"已经在跑了"];
         return;
@@ -183,7 +214,11 @@ static CGPoint TDJitter(CGPoint p, double r) {
         return;
     }
     _running = YES;
+    _gen++;
+    NSUInteger gen = _gen;
     _loopsDone = 0;
+    _curIndex = 0;
+    _floatBarWarned = NO;
     _failsafe = failsafe;
     _failsafeFired = NO;
     _inFailsafe = NO;
@@ -192,6 +227,15 @@ static CGPoint TDJitter(CGPoint p, double r) {
     if (_fsPos < 0 || _fsPos > 2) _fsPos = 0;
     NSArray *plan = [steps copy];
     _currentPlan = plan;
+
+    NSInteger firstFrom = MAX(0, MIN(startIndex, (NSInteger)plan.count - 1));
+    if (startIndex > 0 && firstFrom > 0) {
+        [self logMsg:@"从第 %ld 步开始跑（共 %lu 步）", (long)firstFrom + 1, (unsigned long)plan.count];
+    }
+    if (_stoppedAt >= 0) {
+        [self logMsg:@"上次停在第 %ld 步，这次仍从第 %ld 步起", (long)_stoppedAt + 1, (long)firstFrom + 1];
+        _stoppedAt = -1;
+    }
 
     [self logMsg:@"开始：%lu 步，循环 %@%@", (unsigned long)plan.count,
                   loops == 0 ? @"无限" : [NSString stringWithFormat:@"%ld 次", (long)loops],
@@ -208,20 +252,24 @@ static CGPoint TDJitter(CGPoint p, double r) {
 
     dispatch_async(_q, ^{
         NSInteger round = 0;
-        while (self->_running) {
+        NSInteger from = firstFrom;
+        while (self->_running && self->_gen == gen) {
             // 判断放在「脚本开始」：开跑之前先看一眼画面，
             // 图不在就直接做兜底动作，然后再按原样跑主脚本。
             if (self->_fsPos == 1) { @autoreleasepool { [self failsafeGate:@"脚本开始"]; } }
-            if (!self->_running) break;
+            if (!self->_running || self->_gen != gen) break;
 
-            for (NSDictionary *st in plan) {
-                if (!self->_running) break;
-                @autoreleasepool { [self execStep:st]; }
+            for (NSInteger i = from; i < (NSInteger)plan.count; i++) {
+                if (!self->_running || self->_gen != gen) break;
+                self->_curIndex = i;
+                @autoreleasepool { [self execStep:plan[i]]; }
             }
-            if (!self->_running) break;
+            from = 0;                       // 只有第一轮认起点，后面都从头
+            self->_curIndex = -1;
 
             // 判断放在「脚本末尾」：这一轮跑完了再回头检查，图不在就补一段兜底。
             if (self->_fsPos == 2) { @autoreleasepool { [self failsafeGate:@"脚本末尾"]; } }
+            if (self->_gen != gen) return;  // 已经开了新一轮，收尾不归我
 
             round++;
             self->_loopsDone = round;
@@ -229,7 +277,16 @@ static CGPoint TDJitter(CGPoint p, double r) {
             // 每轮之间歇一下：整段播完立刻从头再点，节奏比人快得多
             if (loopGap > 0) usleep((useconds_t)(MIN(loopGap, 30000.0) * 1000));
         }
+
+        // 只清理自己这一轮：用户「按 ■ 立刻再按 ▶」时，新线程已经接管了 _running，
+        // 老线程的尾巴绝对不能再写它（否则新的一轮刚起来就被掐死）。
+        if (self->_gen != gen) return;
+        // 还在「跑」的状态下走到这儿 = 正常跑完 / 轮次用完；
+        // 已经是 NO 了 = 被用户按 ■ 打断 —— 记下停在哪一步，下次日志里说出来。
+        BOOL userStopped = !self->_running;
+        self->_stoppedAt = (userStopped && self->_curIndex >= 0) ? self->_curIndex : -1;
         self->_running = NO;
+        self->_curIndex = -1;
         [self logMsg:@"结束，跑了 %ld 轮", (long)round];
         void (^f)(void) = self.onFinish;
         if (f) dispatch_async(dispatch_get_main_queue(), ^{ f(); });
@@ -303,6 +360,22 @@ static CGPoint TDJitter(CGPoint p, double r) {
     if (hasPhys) TDSetInjectTouchPhysics(0.0, 0.04, 0.0, 0.0);
 }
 
+/// 落点压在悬浮条上就否决这一步。
+/// 悬浮条是比抖音更高的真实窗口，注入的触摸落进去命中的是我们自己的球：
+/// 落在 ● 上会一路开始录制（用户看到的「播放变成录制」），落在 ■ 上会当场停脚本
+/// （用户看到的「每次播都从 0 开始」）。所以宁可跳过并说清楚，也不能让它砸上去。
+/// 返回 YES = 这一步被拦下了。
+- (BOOL)vetoFloatBarAt:(CGPoint)p step:(NSDictionary *)st {
+    if (!TDHitsFloatBar(p)) return NO;
+    if (!_floatBarWarned) {
+        _floatBarWarned = YES;
+        CGRect r = TDFloatTouchRect();
+        [self logMsg:@"%@ 落点 (%.0f,%.0f) 压在悬浮条 (%.0f,%.0f %.0f×%.0f) 上，已跳过 —— 把悬浮条拖到别处再跑",
+                      [self stepTag:st], p.x, p.y, r.origin.x, r.origin.y, r.size.width, r.size.height];
+    }
+    return YES;
+}
+
 /// 真正执行的那一段。拆出来是为了不管走哪个分支，
 /// 退出时都能把压力/半径改回安全值（否则后面的步骤会带着随机压力跑）。
 - (void)execBody:(NSDictionary *)st type:(NSString *)t
@@ -317,6 +390,10 @@ static CGPoint TDJitter(CGPoint p, double r) {
 
     if ([t isEqualToString:@"tap"]) {
         CGPoint p = TDJitter(CGPointMake([st[@"x"] doubleValue], [st[@"y"] doubleValue]), jitter);
+        if ([self vetoFloatBarAt:p step:st]) {
+            usleep((useconds_t)(interval * 1000));
+            return;
+        }
         TDtap(p.x, p.y);
         usleep((useconds_t)(interval * 1000));
         return;
@@ -343,6 +420,10 @@ static CGPoint TDJitter(CGPoint p, double r) {
 
     if ([t isEqualToString:@"long"]) {
         CGPoint p = TDJitter(CGPointMake([st[@"x"] doubleValue], [st[@"y"] doubleValue]), jitter);
+        if ([self vetoFloatBarAt:p step:st]) {
+            usleep((useconds_t)(interval * 1000));
+            return;
+        }
         double ms = st[@"ms"] ? [st[@"ms"] doubleValue] : 800;
         TDlongPress(p.x, p.y, MAX(120.0, ms * msScale) / 1000.0);
         usleep((useconds_t)(interval * 1000));
@@ -352,6 +433,11 @@ static CGPoint TDJitter(CGPoint p, double r) {
     if ([t isEqualToString:@"swipe"]) {
         CGPoint a = TDJitter(CGPointMake([st[@"x1"] doubleValue], [st[@"y1"] doubleValue]), jitter);
         CGPoint b = TDJitter(CGPointMake([st[@"x2"] doubleValue], [st[@"y2"] doubleValue]), jitter);
+        // 滑动只看起点：起点压在悬浮条上，这一笔会被我们自己吃掉，抖音收不到。
+        if ([self vetoFloatBarAt:a step:st]) {
+            usleep((useconds_t)(interval * 1000));
+            return;
+        }
         double ms = st[@"ms"] ? [st[@"ms"] doubleValue] : 400;
         TDswipe(a, b, MAX(120.0, ms * msScale) / 1000.0);
         usleep((useconds_t)(interval * 1000));
@@ -368,6 +454,10 @@ static CGPoint TDJitter(CGPoint p, double r) {
             }
         }
         if (pts.count >= 2) {
+            if ([self vetoFloatBarAt:[pts.firstObject CGPointValue] step:st]) {
+                usleep((useconds_t)(interval * 1000));
+                return;
+            }
             double ms = st[@"ms"] ? [st[@"ms"] doubleValue] : 500;
             TDgesture(pts, MAX(120.0, ms * msScale) / 1000.0);
         }

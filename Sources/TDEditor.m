@@ -2393,7 +2393,19 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
         done(YES);
     }];
 
-    return [UISwipeActionsConfiguration configurationWithActions:@[del, ins]];
+    // 回放总从第 0 步起，想单独验中间某一步（或者接着上次被停的地方）就卡在这儿：
+    // 从这一行开始跑，前面几步跳过。
+    UIContextualAction *run =
+        [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
+                                                title:@"从此跑"
+                                              handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
+        typeof(self) ss = ws;
+        if (ss) [ss tryRunFromStep:ip.row];
+        done(YES);
+    }];
+    run.backgroundColor = [UIColor colorWithRed:0.10 green:0.52 blue:0.85 alpha:1];
+
+    return [UISwipeActionsConfiguration configurationWithActions:@[del, ins, run]];
 }
 
 - (BOOL)tableView:(UITableView *)tv canEditRowAtIndexPath:(NSIndexPath *)ip { return ip.section == 0; }
@@ -2573,9 +2585,23 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
 }
 
 - (void)tryRun {
+    [self tryRunFromStep:0];
+}
+
+/// 从第 stepIdx 步开始跑（0 起）。前面几步跳过，第二轮以后照样从头。
+- (void)tryRunFromStep:(NSInteger)stepIdx {
     if (_script.steps.count == 0) return;
+    if (stepIdx < 0) stepIdx = 0;
+    if (stepIdx >= (NSInteger)_script.steps.count) stepIdx = (NSInteger)_script.steps.count - 1;
+    NSInteger plan = [_script planIndexForStepIndex:stepIdx];
+
+    NSString *msg = stepIdx == 0
+        ? @"3 秒后开始，现在切到抖音。\n按这条脚本自己的循环 / 判断设置跑。"
+        : [NSString stringWithFormat:@"3 秒后开始，现在切到抖音。\n从第 %ld 步开始（前面 %ld 步跳过）。",
+                                     (long)stepIdx + 1, (long)stepIdx];
+
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"试运行"
-                                                              message:@"3 秒后开始，现在切到抖音。\n按这条脚本自己的循环 / 判断设置跑。"
+                                                              message:msg
                                                        preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"开始" style:UIAlertActionStyleDefault
                                        handler:^(UIAlertAction *x) {
@@ -2584,7 +2610,7 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
                        dispatch_get_main_queue(), ^{
             typeof(self) ss = ws;
             if (!ss) return;
-            [[TDEngine shared] playScript:ss.script];
+            [[TDEngine shared] playScript:ss.script fromStep:plan];
             TDFloatRefresh();
         });
     }]];

@@ -152,7 +152,24 @@ static void TDApplyBallPosition(UIWindow *w) {
 
 #pragma mark - 状态刷新
 
-/// 面板顶上那行状态：空闲 / 运行中（第几轮） / 录制中
+/// 面板顶上那行状态：空闲 / 运行中（第几轮第几步） / 录制中
+static NSTimer *gHeadTimer = nil;
+
+static void TDFloatRefreshHead(void);
+
+/// 回放时 0.5s 刷一次头部：脚步在走、数字就应该在动。
+/// 停在第 1 步不动 = 被什么打断了，一眼就看出来。
+static void TDFloatStartHeadTimer(void) {
+    if (gHeadTimer) return;
+    gHeadTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+        if (![TDEngine shared].running) {
+            [t invalidate];
+            gHeadTimer = nil;
+        }
+        TDFloatRefreshHead();
+    }];
+}
+
 static void TDFloatRefreshHead(void) {
     if (!gLogHead) return;
     TDEngine *e = [TDEngine shared];
@@ -163,7 +180,15 @@ static void TDFloatRefreshHead(void) {
         state = @"录制中";
         c = [UIColor colorWithRed:0.85 green:0.45 blue:0.02 alpha:1];
     } else if (e.running) {
-        state = [NSString stringWithFormat:@"运行中 · 第 %ld 轮", (long)MAX(1, e.loopsDone)];
+        // 把「跑到第几步」写出来：一直停在第 1 步 = 被什么东西打断了，
+        // 数字往前走 = 正常按顺序跑，用不着猜。
+        NSInteger i = e.curStep, n = e.planCount;
+        if (i >= 0 && n > 0) {
+            state = [NSString stringWithFormat:@"运行中 · 第 %ld 轮 · %ld/%ld 步",
+                                               (long)MAX(1, e.loopsDone), (long)i + 1, (long)n];
+        } else {
+            state = [NSString stringWithFormat:@"运行中 · 第 %ld 轮", (long)MAX(1, e.loopsDone)];
+        }
         c = [UIColor colorWithRed:0.06 green:0.52 blue:0.25 alpha:1];
     } else {
         state = @"空闲";
@@ -184,7 +209,15 @@ void TDFloatRefresh(void) {
 
     // ● 录制球：没录时暗红，录制中亮红 —— 点一次开始、再点一次结束，
     // 和音量上/下是同一个开关，两条路都指向 TDRecorder，不会打架。
+    //
+    // 回放期间这颗球直接「点不动」（userInteractionEnabled = NO）：
+    // 回放的注入触摸落点如果压在这颗球上，它会被当成真手指按下 →
+    // 一路开始穿透录制，用户看到的就是「点 ▶ 变成了录制」。
+    // 位置不能改（手指记的是位置），能从根上掐断的就是这一行。
     if (gRecView) {
+        BOOL lockedByPlay = (e.running && !r.recording);
+        gRecView.userInteractionEnabled = !lockedByPlay;
+        gRecView.alpha = lockedByPlay ? 0.32 : 1.0;
         gRecLabel.text = @"●";
         if (r.recording) {
             gRecView.backgroundColor = [UIColor colorWithRed:1.00 green:0.26 blue:0.26 alpha:0.98];
@@ -221,6 +254,7 @@ void TDFloatRefresh(void) {
         gStopView.alpha = 0.45;
     }
     TDFloatRefreshHead();
+    if (e.running) TDFloatStartHeadTimer();
 }
 
 #pragma mark - 日志面板内容
@@ -357,7 +391,11 @@ static void TDFloatDoStart(void) {
     TDEngine *e = [TDEngine shared];
 
     if (r.recording) { TDFloatFinishRecording(); TDFloatRefresh(); return; }
-    if (e.running) return;
+    if (e.running) {
+        TDLog(@"已经在跑了（■ 停止，日志窗里能看到跑到哪一步）");
+        TDFloatRefresh();
+        return;
+    }
 
     TDScript *s = [[TDScriptStore shared] selectedScript];
     if (!s || s.steps.count == 0) {
@@ -394,13 +432,23 @@ static void TDFloatToggleRecord(void) {
 }
 
 /// 穿透录制：蒙版不接触摸，触摸直通抖音，靠监听抄真实触摸。
-/// 这是「边操作边录」的那个入口 —— 长按 ▶。
+/// 这是「边操作边录」的那个入口 —— 点 ●。
 static void TDFloatStartLiveRecord(void) {
     TDRecorder *r = [TDRecorder shared];
     TDEngine *e = [TDEngine shared];
 
     if (r.recording) { TDFloatFinishRecording(); TDFloatRefresh(); return; }
-    if (e.running) [e stop];
+
+    // 回放中按 ● 一律不理会。
+    // 以前这里是「先停回放再开始录」，但回放的触摸落点偶尔就压在 ● 上，
+    // 于是用户看到的怪事是「播着播着变成录制了」，脚本还被顺带掐断 ——
+    // 下回再点 ▶ 又从第 0 步起，看着像「每次都从头跑」。
+    // 录制本来就要在空闲态开始，正在跑就明确拒绝，别偷偷接管。
+    if (e.running) {
+        TDLog(@"正在回放，● 不响应 —— 先按 ■ 停下来再录");
+        TDFloatRefresh();
+        return;
+    }
 
     if (![r startLive]) {
         TDLog(@"穿透录制起不来：%@", [r status]);
@@ -565,6 +613,11 @@ static void TDFloatStartLiveRecord(void) {
 }
 
 - (void)confirmPointRecord {
+    if ([TDEngine shared].running) {
+        TDLog(@"正在回放，先按 ■ 停掉再录");
+        TDFloatRefresh();
+        return;
+    }
     UIAlertController *a = [UIAlertController
         alertControllerWithTitle:@"全屏取点录制？"
                          message:@"这一层会盖住抖音（点不动），只适合坐在那儿手工标点。\n"

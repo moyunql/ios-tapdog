@@ -746,6 +746,9 @@ static NSString *gStatus = @"就绪（全屏取点）";
 - (void)cancel {
     if (!self.recording) return;
     [self teardown];
+    // 录兜底动作时挂的回调要跟着一起作废，否则下一次普通录制
+    // 也会被塞进「判断」里（而且不会新建脚本）。
+    self.onStepsReady = nil;
     _liveSteps = nil;
     TDLog(@"已取消录制，没有保存");
     [[NSNotificationCenter defaultCenter] postNotificationName:TDDataChangedNotification object:nil];

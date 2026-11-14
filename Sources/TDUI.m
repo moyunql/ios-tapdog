@@ -1584,6 +1584,7 @@ static NSString *TDCalibModeName(NSInteger m) {
     }
     // 录制要等倒计时结束才开始，否则倒计时这段时间的操作会被录进去
     _pendingRecord = YES;
+    [self cancelCountdown];     // 上一次没走完的倒计时（比如刚点了播放又改主意）作废
     [self startCountdown];
 }
 
@@ -1600,15 +1601,26 @@ static NSString *TDCalibModeName(NSInteger m) {
         return;
     }
     _pendingRecord = NO;
+    [self cancelCountdown];     // 倒计时中途改主意点播放 → 重来一遍，意图以最后一次为准
     [self startCountdown];
 }
 
 - (void)onStop {
+    // 停止必须把挂着的倒计时一起掐掉。
+    // 以前只停了引擎和录制，3 秒的 _countTimer 还在跑：时间一到 fire() 照旧执行，
+    // 于是「我明明点了停止，过两秒它自己开始录/自己开始跑了」。
+    _pendingRecord = NO;
+    [self cancelCountdown];
     [self stopLiveCounter];
     [[TDEngine shared] stop];
     if ([TDRecorder shared].recording) [self finishRecording];
     [self refreshButtons];
     TDFloatRefresh();
+}
+
+- (void)cancelCountdown {
+    if (_countTimer) { [_countTimer invalidate]; _countTimer = nil; }
+    _mask.hidden = YES;
 }
 
 - (void)startCountdown {
@@ -1639,7 +1651,9 @@ static NSString *TDCalibModeName(NSInteger m) {
 }
 
 - (void)fire {
-    if (_pendingRecord) {
+    BOOL wasRecord = _pendingRecord;
+    _pendingRecord = NO;        // 意图只用一次，别让它挂到下一次
+    if (wasRecord) {
         TDRecorder *r = [TDRecorder shared];
         // 走穿透模式：蒙版不拦触摸，用户在抖音里真操作，边刷边录。
         // 以前那套「全屏取点」抖音会被挡住，看不到翻页成没成。
@@ -1679,6 +1693,7 @@ static NSString *TDCalibModeName(NSInteger m) {
 
 - (void)finishRecording {
     [self stopLiveCounter];
+    _pendingRecord = NO;
     TDRecorder *r = [TDRecorder shared];
     if (!r.recording) return;
     NSInteger n = r.eventCount;

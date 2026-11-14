@@ -261,6 +261,8 @@ void TDSetScaleHint(NSString * _Nullable tplName, double scale);
 - (NSString *)summary;                        // "12 步 · 0:35"
 - (NSTimeInterval)duration;                   // 估算总时长（秒）
 - (NSArray<NSDictionary *> *)engineSteps;     // 把 gap 展开成 wait
+/// 第 idx 步在 engineSteps 里的下标（gap>30 会在前面插一个 wait，两边序号不一样）
+- (NSInteger)planIndexForStepIndex:(NSInteger)idx;
 + (NSString *)describeStep:(NSDictionary *)st;
 
 - (BOOL)failsafeEnabled;
@@ -316,6 +318,13 @@ UIViewController *TDCreateScriptEditVC(TDScript *script);
 + (instancetype)shared;
 @property (nonatomic, readonly) BOOL running;
 @property (nonatomic, readonly) NSInteger loopsDone;
+/// 上一次被用户停在第几步（0 起，-1 = 上一轮正常跑完 / 没跑过）
+@property (nonatomic, readonly) NSInteger stoppedStep;
+/// 当前跑到 plan 的第几步（0 起，-1 = 不在步骤里）；planCount = 这一轮总共几步
+@property (nonatomic, readonly) NSInteger curStep;
+@property (nonatomic, readonly) NSInteger planCount;
+/// 从第几步开始跑（0 起）。悬浮球 ▶ 默认用 0，主界面可以选择「接着上次」。
+- (void)playScript:(TDScript *)script fromStep:(NSInteger)startIndex;
 @property (nonatomic, copy, nullable) NSString *jetsamStatus;
 @property (nonatomic, copy, nullable) void (^logHandler)(NSString *msg);
 @property (nonatomic, copy, nullable) void (^onFinish)(void);

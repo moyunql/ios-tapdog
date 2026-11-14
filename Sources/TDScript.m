@@ -94,6 +94,17 @@ static NSString *TDScriptsPath(void) {
     return out;
 }
 
+- (NSInteger)planIndexForStepIndex:(NSInteger)idx {
+    if (idx <= 0) return 0;
+    NSInteger plan = 0;
+    NSInteger n = MIN(idx, (NSInteger)_steps.count);
+    for (NSInteger i = 0; i < n; i++) {
+        if ([_steps[i][@"gap"] doubleValue] > 30) plan++;   // engineSteps 会在它前面插 wait
+        plan++;
+    }
+    return plan;
+}
+
 + (NSString *)describeStep:(NSDictionary *)st {
     NSString *t = st[@"t"];
     if ([t isEqualToString:@"tap"])   return [NSString stringWithFormat:@"点击 (%.0f, %.0f)",
