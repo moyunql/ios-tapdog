@@ -190,8 +190,13 @@ static TDMatch *TDFindCore(UIImage *tpl, CGRect roi, double threshold,
     if (!screen) return nil;
 
     if (gShotCacheOn) {
-        gLastShot = screen;                 // 后一张覆盖前一张，不留历史
-        gLastShotPx = screen.size;
+        // 统一在主线程写：识图跑在引擎的后台队列，编辑页是在主线程读。
+        // 直接在后台线程换指针，主线程可能读到「刚被释放的那一张」—— 所以要串起来。
+        UIImage *keep = screen;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            gLastShot = keep;               // 后一张覆盖前一张，不留历史
+            gLastShotPx = keep.size;
+        });
     }
 
     int sw = 0, sh = 0;
