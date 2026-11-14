@@ -493,8 +493,31 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
         });
+        // openURL 这条在后台常被系统忽略（实测只有自己 active 时才灵），
+        // 所以再补一条 LSApplicationWorkspace 强拉：按 bundle id 直接开。
+        // 之前远程调试时「open snssdk1128:// 没反应」就是缺这一条。
+        NSString *bid = [cmd[@"bid"] isKindOfClass:[NSString class]] ? cmd[@"bid"] : nil;
+        if (bid.length == 0) {
+            if ([u hasPrefix:@"snssdk1128"]) bid = @"com.ss.iphone.ugc.Aweme";
+            else if ([u hasPrefix:@"tapdog"]) bid = @"com.local.tapdog";
+        }
+        if (bid.length) {
+            Class wsCls = NSClassFromString(@"LSApplicationWorkspace");
+            if (wsCls) {
+                id (*m0)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+                void (*m1)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
+                id ws = m0(wsCls, sel_registerName("defaultWorkspace"));
+                if (ws) m1(ws, sel_registerName("openApplicationWithBundleID:"), bid);
+            }
+        }
         TDLog(@"远程调试：打开 %@", u);
         return @{@"ok": @1, @"msg": [NSString stringWithFormat:@"open %@", u]};
+    }
+
+    // 注入链路体检：senderID / 监听到的真实事件 / 回显 / 权限 / 签名，
+    // 一条命令看全。之前的「点了没反应」全靠猜，现在有数字可对。
+    if ([c isEqualToString:@"diag"]) {
+        return @{@"ok": @1, @"msg": TDHIDDiagReport()};
     }
 
     if ([c isEqualToString:@"paste"]) {
