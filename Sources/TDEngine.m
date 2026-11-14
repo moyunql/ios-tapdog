@@ -146,6 +146,7 @@ static BOOL TDCommentPanelOpen(NSString **hit) {
     BOOL _inFailsafe;           // 正在跑兜底动作（防止兜底里再套兜底）
     NSInteger _fbIndex;         // 兜底动作跑到第几步（只为日志）
     NSInteger _fsPos;           // 判断的位置：0 当场 / 1 每轮开始 / 2 每轮末尾
+    BOOL _abortRound;           // 本轮作废（步骤自己判断继续跑下去只会更乱）
 }
 
 + (instancetype)shared {
@@ -364,6 +365,7 @@ static CGPoint TDJitter(CGPoint p, double r) {
         NSInteger round = 0;
         NSInteger from = firstFrom;
         while (self->_running && self->_gen == gen) {
+            self->_abortRound = NO;         // 新一轮，作废标志清干净
             // 判断放在「脚本开始」：开跑之前先看一眼画面，
             // 图不在就直接做兜底动作，然后再按原样跑主脚本。
             if (self->_fsPos == 1) { @autoreleasepool { [self failsafeGate:@"脚本开始"]; } }
@@ -371,6 +373,9 @@ static CGPoint TDJitter(CGPoint p, double r) {
 
             for (NSInteger i = from; i < (NSInteger)plan.count; i++) {
                 if (!self->_running || self->_gen != gen) break;
+                // 上一步说「这条视频废了」：剩下的点赞、上划都别做。
+                // 以前不管这个，评论跳过后点赞照样点在直播卡上，日志还报「成功」。
+                if (self->_abortRound) { self->_abortRound = NO; break; }
                 self->_curIndex = i;
                 @autoreleasepool { [self execStep:plan[i]]; }
             }
@@ -593,6 +598,7 @@ static CGPoint TDJitter(CGPoint p, double r) {
     if ([t isEqualToString:@"like"]) {
         double x = st[@"x"] ? [st[@"x"] doubleValue] : 379;
         double y = st[@"y"] ? [st[@"y"] doubleValue] : 328;
+        BOOL pageOK = (st[@"x"] != nil);      // 手写了坐标就照点，不校验
         // 心形就在评论气泡正上方 74pt。同一竖列一起浮动，所以拿评论气泡的
         // 模板反推心形位置，比另做一套心形模板省事，也不怕「已赞变红」。
         {
@@ -601,8 +607,15 @@ static CGPoint TDJitter(CGPoint p, double r) {
             if (ct) {
                 TDMatch *m = TDfindImageSmartInRect(ct, @"tpl_comment", 0.70,
                                                     CGRectMake(330, 240, 84, 440), NULL);
-                if (m) { x = m.point.x; y = m.point.y - 69; }
+                if (m) { x = m.point.x; y = m.point.y - 69; pageOK = YES; }
             }
+        }
+        // 认不出评论图标 = 压根不是普通视频页（直播卡、广告落地页、别的 App）。
+        // 这时候按默认坐标点下去，点到什么全凭运气，日志还会因为那块区域正好
+        // 是红的而报「成功」—— 实测在直播卡上白报了两轮。
+        if (!pageOK) {
+            [self logMsg:@"%@ 点赞：认不出评论图标，不像视频页，跳过", [self stepTag:st]];
+            return;
         }
         CGRect box = CGRectMake(x - 15, y - 15, 30, 30);
         double l = 0, c = 0, red0 = 0, d = 0;
@@ -671,15 +684,20 @@ static CGPoint TDJitter(CGPoint p, double r) {
             UIImage *liveTpl = [UIImage imageWithContentsOfFile:
                                 [dirL stringByAppendingPathComponent:@"tpl_live.png"]];
             if (liveTpl) {
-                // 连着几张直播卡也常见（推荐流会一次推一串），最多划三次。
-                for (int i = 0; i < 3; i++) {
+                // 连着几张直播卡是常态：这台机器的推荐流一次能刷出一串直播 + 汽车广告，
+                // 实测连划三条还是直播。给到六条，再不行才认栽放弃本轮。
+                for (int i = 0; i < 6; i++) {
                     TDMatch *lm = TDfindImageSmartInRect(liveTpl, @"tpl_live", 0.80,
                                                          CGRectMake(0, 470, 300, 230), NULL);
                     if (!lm) break;
                     [self logMsg:@"%@ 认出直播卡（相似度 %.2f），划走这条", tag, lm.score];
                     TDswipe(CGPointMake(207, 600), CGPointMake(207, 160), 0.26);
-                    usleep(1600 * 1000);
-                    if (i == 2) { [self logMsg:@"%@ 连着三条都是直播，本轮跳过", tag]; return; }
+                    usleep(1800 * 1000);
+                    if (i == 5) {
+                        [self logMsg:@"%@ 连划六条还是直播，本轮作废", tag];
+                        self->_abortRound = YES;      // 后面的点赞不要去点直播卡
+                        return;
+                    }
                 }
             }
         }
