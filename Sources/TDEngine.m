@@ -106,32 +106,27 @@ static BOOL TDHitsFloatBar(CGPoint p) {
 /// 「下一步」那种灰按钮、视频里的字幕，都不会出现「条评论」这三个字。
 static BOOL TDCommentPanelOpen(NSString **hit) {
     if (hit) *hit = nil;
-    NSArray *lines = TDocrLines(TDscreenshot());
-    for (NSDictionary *ln in lines) {
-        NSString *sv = ln[@"s"];
-        if (![sv isKindOfClass:[NSString class]] || sv.length == 0) continue;
-        if ([sv containsString:@"条评论"] || [sv containsString:@"期待你的评论"] ||
-            [sv containsString:@"大家都在搜"] || [sv containsString:@"留下你的精彩评论"]) {
-            if (hit) *hit = sv;
-            return YES;
-        }
+
+    // 纯像素判据，不上 OCR。
+    //
+    // 曾经用 OCR 找「条评论」三个字来判面板开没开 —— 稳是稳，但这台机器上
+    // Vision 一调就崩（signal 11，栈里连续五层 CoreImage），缩图也压不住，
+    // 于是脚本跑到这一步必死。改用像素后脚本里不再有任何 Vision 调用。
+    //
+    // 判据来自离线实测（拿历史截图量的）：
+    //   面板打开  y300-340 亮度 207 / 彩度 0 ，y660-680 亮度 207
+    //   视频页    y300-340 亮度 100 / 彩度 0 ，y660-680 亮度 114
+    // 两处都要白才算开 —— 只判一处的话，碰上白底视频会误判成面板。
+    double l1 = 0, c1 = 0, r1 = 0, d1 = 0;
+    double l2 = 0, c2 = 0, r2 = 0, d2 = 0;
+    BOOL white1 = TDregionStats(CGRectMake(0, 300, 414, 40), &l1, &c1, &r1, &d1)
+                  && l1 > 175 && c1 < 18;
+    BOOL white2 = TDregionStats(CGRectMake(0, 660, 414, 20), &l2, &c2, &r2, &d2)
+                  && l2 > 175 && c2 < 18;
+    if (hit) {
+        *hit = [NSString stringWithFormat:@"上白 %.0f/彩%.0f 下白 %.0f/彩%.0f", l1, c1, l2, c2];
     }
-    // OCR 一行都没认出来 = OCR 这条腿没跑通（缩图太狠、识别失败、内存紧都算），
-    // 这时不能直接判「面板没开」，否则每次都白点。退回像素判据 ——
-    // 离线用历史截图量过：面板打开的浅色底，y300-340 亮度 207 / 彩度 0，
-    // 视频页只有 100 左右；两处都白才算开，免得碰上白底视频误判。
-    if (lines.count == 0) {
-        double l1 = 0, c1 = 0, r1 = 0, d1 = 0;
-        double l2 = 0, c2 = 0, r2 = 0, d2 = 0;
-        BOOL white1 = TDregionStats(CGRectMake(0, 300, 414, 40), &l1, &c1, &r1, &d1)
-                      && l1 > 175 && c1 < 18;
-        if (white1 && TDregionStats(CGRectMake(0, 660, 414, 20), &l2, &c2, &r2, &d2)
-                      && l2 > 175 && c2 < 18) {
-            if (hit) *hit = @"像素判据（OCR 没结果）";
-            return YES;
-        }
-    }
-    return NO;
+    return white1 && white2;
 }
 
 @implementation TDEngine {
@@ -689,13 +684,13 @@ static CGPoint TDJitter(CGPoint p, double r) {
         NSString *hit = nil;
         BOOL open = TDCommentPanelOpen(&hit);
         if (!open) {
-            [self logMsg:@"%@ 面板没开（OCR 没看到评论字样），再点一次", tag];
+            [self logMsg:@"%@ 面板没开（像素判据没见白底），再点一次", tag];
             TDtap(bubble.x, bubble.y);
             usleep(1800 * 1000);
             open = TDCommentPanelOpen(&hit);
         }
         if (!open) { [self logMsg:@"%@ 评论面板打不开，这条跳过", tag]; return; }
-        [self logMsg:@"%@ 面板已开（OCR：「%@」）", tag, hit ?: @"?"];
+        [self logMsg:@"%@ 面板已开（%@）", tag, hit ?: @"像素判据"];
 
         // 2) 点一下输入条把键盘叫起来。
         //    「键盘起来了」的证据 = 底部这行冒出「图片」小图标（没弹键盘时只有 @ 和表情）。
@@ -776,46 +771,58 @@ static CGPoint TDJitter(CGPoint p, double r) {
         // 8) 贴话术：切前台写剪贴板 → 切回抖音 → ⌘A 全选 → ⌘V。
         //    键盘还弹着就别再点输入框了（会点到键盘上），光标本来就在里面。
         BOOL kbdNow = (mp2 != nil);
+
+        // 「发送」这一小块的红色占比：空输入框时它是灰的（实测 0.00），有字才变红。
+        // 这个位置随键盘/缩略图会上下浮动，所以框给宽一点，只认红色比例。
+        CGRect sendRect = CGRectMake(330, 382, 84, 38);
+        double sL0 = 0, sC0 = 0, redEmpty = 0, sD0 = 0;
+        TDregionStats(sendRect, &sL0, &sC0, &redEmpty, &sD0);
+        (void)sL0; (void)sC0; (void)sD0;
+
         BOOL wrote = TDPasteIntoOtherApp(txt, app, !kbdNow, CGPointMake(ix, iy), YES);
         usleep(900 * 1000);
 
-        // 9) 校验文字落进去了：OCR 找文案前 4 个字。
-        //    挂了 3 张缩略图之后编辑区整体上移，靠「某块区域有黑字」这种亮度判据
-        //    会漂；OCR 直接看字，位置变了也认得出。
-        NSString *probe = txt.length > 4 ? [txt substringToIndex:4] : txt;
+        // 9) 校验文字真的进了输入框 —— 只认「发送由灰变红」。
+        //
+        // 为什么不用 OCR：这台机器上 Vision 一调就崩（signal 11，栈在 CoreImage），
+        // 缩到 700 宽也照崩，所以脚本里一行 OCR 都不许有。
+        // 为什么不用「输入框里有黑字」：挂了三张缩略图之后那片区域本来就是深的，
+        // 缩略图会把判据骗过去。
+        // 用什么：空输入框时「发送」是灰的，有字才变红。判据取「贴之前 / 贴之后」
+        // 两次红色占比的差，阈值就不必写死（背景亮度会漂，差值不漂）。
+        double redNow = 0, sL1 = 0, sC1 = 0, sD1 = 0;
         BOOL landed = NO;
-        for (int i = 0; i < 6 && !landed; i++) {
-            for (NSDictionary *ln in TDocrLines(TDscreenshot())) {
-                NSString *sv = ln[@"s"];
-                if ([sv isKindOfClass:[NSString class]] && sv.length &&
-                    [sv containsString:probe]) { landed = YES; break; }
+        for (int i = 0; i < 8 && !landed; i++) {
+            if (TDregionStats(sendRect, &sL1, &sC1, &redNow, &sD1)) {
+                if (redNow > redEmpty + 0.05 || redNow > 0.20) landed = YES;
             }
-            if (!landed) usleep(400 * 1000);
+            if (!landed) usleep(380 * 1000);
         }
         if (!wrote || !landed) {
-            [self logMsg:@"%@ 文字没落进输入框（剪贴板%@，OCR%@看到「%@」），不发送",
-                          tag, wrote ? @"✓" : @"✗", landed ? @"" : @"没", probe];
+            [self logMsg:@"%@ 文字没落进输入框（剪贴板%@，发送红 %.2f→%.2f 没变），不发送",
+                          tag, wrote ? @"✓" : @"✗", redEmpty, redNow];
             closePanel();
             return;                          // 绝不发空评论
         }
-        [self logMsg:@"%@ 文案已落进编辑框：%@", tag, txt];
+        [self logMsg:@"%@ 文案已落进输入框（发送由灰变红 %.2f→%.2f）：%@", tag, redEmpty, redNow, txt];
 
         // 10) 发送
         TDtap(sx, sy);
-        usleep(2400 * 1000);
+        usleep(1400 * 1000);
 
-        // 11) 校验：面板里应该看得到刚发出去的文案
-        BOOL seen = NO;
-        NSString *key = txt.length > 6 ? [txt substringToIndex:6] : txt;
-        for (int i = 0; i < 2 && !seen; i++) {
-            NSArray *lines = TDocrLines(TDscreenshot());
-            for (NSDictionary *ln in lines) {
-                NSString *str = [ln[@"s"] isKindOfClass:[NSString class]] ? ln[@"s"] : @"";
-                if (str.length && [str containsString:key]) { seen = YES; break; }
+        // 11) 校验发出去了：发送键退回灰色（输入框被清空），面板还在。
+        //    这个判据和上一步是同一块区域、同一个量，正反两端都能验。
+        BOOL sent = NO;
+        double redAfter = redNow;
+        for (int i = 0; i < 6 && !sent; i++) {
+            double l9 = 0, c9 = 0, d9 = 0;
+            if (TDregionStats(sendRect, &l9, &c9, &redAfter, &d9)) {
+                if (redAfter < redNow - 0.05 || redAfter < redEmpty + 0.05) sent = YES;
             }
-            if (!seen) usleep(700 * 1000);
+            if (!sent) { usleep(420 * 1000); TDtap(sx, sy); }   // 没发出去就再点一次
         }
-        [self logMsg:@"%@ 评论%@：%@", tag, seen ? @"已发出" : @"未确认（OCR 没看到）", txt];
+        [self logMsg:@"%@ 评论%@（发送红 %.2f→%.2f）：%@",
+                      tag, sent ? @"已发出" : @"未确认", redNow, redAfter, txt];
 
         // 12) 返回（下拉收面板）
         closePanel();

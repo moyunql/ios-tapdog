@@ -108,6 +108,21 @@ extern UIViewController *TDCreateMainVC(void);
 - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)opt {
     TDInstallCrashLogger();
 
+    // 上一次崩在哪：crash.log 里有「崩溃前的日志」，启动时直接搬进日志缓冲区。
+    // 这样远程一个 status 就能看到现场，不用再单独发命令（App 崩着的时候
+    // 任何命令都送不进去，等于看不到）。
+    {
+        NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        NSString *txt = [NSString stringWithContentsOfFile:[dir stringByAppendingPathComponent:@"crash.log"]
+                                                 encoding:NSUTF8StringEncoding error:NULL];
+        if (txt.length) {
+            NSString *tail = txt.length > 2200 ? [txt substringFromIndex:txt.length - 2200] : txt;
+            TDlogRingAppend("\n===== 上次崩溃 =====\n");
+            TDlogRingAppend(tail.UTF8String);
+            TDlogRingAppend("\n===== 上次崩溃结束 =====\n");
+        }
+    }
+
     // 内置识图模板（点赞 / 评论 / 收藏）落到 Documents，模板库里开箱就能选。
     // 必须早于任何界面构建：编辑页一打开就会扫模板列表。
     TDInstallBuiltinTemplates();
