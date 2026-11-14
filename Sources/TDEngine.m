@@ -661,6 +661,29 @@ static CGPoint TDJitter(CGPoint p, double r) {
         };
         double l = 0, c = 0, r = 0, d = 0;
 
+        // 0) 直播卡直接划走。
+        //    推荐流里混着「直播 / 直播预告」卡：这张卡右侧没有点赞、评论那一竖排
+        //    图标，点评论按钮只会点到画面上，接着就是「面板打不开」白跑一轮
+        //    （实测连撞三条，五轮里只成两轮就栽在这）。认左下角「直播中」标签，
+        //    认出就上划换一条，本轮不发评论也不点赞。
+        {
+            NSString *dirL = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+            UIImage *liveTpl = [UIImage imageWithContentsOfFile:
+                                [dirL stringByAppendingPathComponent:@"tpl_live.png"]];
+            if (liveTpl) {
+                // 连着几张直播卡也常见（推荐流会一次推一串），最多划三次。
+                for (int i = 0; i < 3; i++) {
+                    TDMatch *lm = TDfindImageSmartInRect(liveTpl, @"tpl_live", 0.80,
+                                                         CGRectMake(0, 470, 300, 230), NULL);
+                    if (!lm) break;
+                    [self logMsg:@"%@ 认出直播卡（相似度 %.2f），划走这条", tag, lm.score];
+                    TDswipe(CGPointMake(207, 600), CGPointMake(207, 160), 0.26);
+                    usleep(1600 * 1000);
+                    if (i == 2) { [self logMsg:@"%@ 连着三条都是直播，本轮跳过", tag]; return; }
+                }
+            }
+        }
+
         // 1) 定位评论气泡再点。
         //    右侧这一竖排图标会随视频文案长短整体上下浮动（文案三行时比一行
         //    低 20pt），写死坐标迟早点空。用模板找，找不到才退回默认坐标。
@@ -689,7 +712,14 @@ static CGPoint TDJitter(CGPoint p, double r) {
             usleep(1800 * 1000);
             open = TDCommentPanelOpen(&hit);
         }
-        if (!open) { [self logMsg:@"%@ 评论面板打不开，这条跳过", tag]; return; }
+        if (!open) {
+            // 打不开就别赖在这一条上：以前是直接 return，下一轮还点同一个位置，
+            // 连撞三条全废。上划换一条（若其实面板开着，这一下正好是下拉关掉它）。
+            [self logMsg:@"%@ 评论面板打不开，划走这条", tag];
+            TDswipe(CGPointMake(207, 600), CGPointMake(207, 160), 0.26);
+            usleep(1500 * 1000);
+            return;
+        }
         [self logMsg:@"%@ 面板已开（%@）", tag, hit ?: @"像素判据"];
 
         // 2) 点一下输入条把键盘叫起来。

@@ -55,7 +55,8 @@ static NSDictionary<NSString *, NSString *> *TDBuiltinNames(void) {
               @"tpl_lib_star.png":    @"收藏",
               @"tpl_paste.png":       @"粘贴气泡",
               @"tpl_comment.png":     @"评论气泡（当前像素）",
-              @"tpl_pic.png":         @"评论里的「图片」按钮"};
+              @"tpl_pic.png":         @"评论里的「图片」按钮",
+              @"tpl_live.png":        @"直播卡「直播中」标签"};
     }
     return m;
 }
