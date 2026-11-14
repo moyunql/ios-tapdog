@@ -1,4 +1,5 @@
 #import "TD.h"
+#import <objc/message.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -222,6 +223,79 @@ static CGPoint TDPasteBottomAnchor(void) {
 
 /// 写剪贴板 + 立刻回读。返回 NO 说明要么没写进去，要么被系统同步吃了 ——
 /// 这两种情况在「粘贴出来的还是上一句」时很难分清，所以直接把它记进日志。
+#pragma mark - 往别的 App 里落字
+
+// 系统只在 App 处于 active 时接受剪贴板写入：后台写入被整条丢弃
+// （实测四种写法 changeCount 都是 0→0，回读全空）。所以「往抖音里喂中文」
+// 必须自己先切到前台写一次，再切回抖音发 ⌘V。
+// 代价是屏幕会闪一下（App 切换），但这是唯一稳的路。
+
+static BOOL TDwaitActive(int ticks) {          // 每 tick 200ms
+    for (int i = 0; i < ticks; i++) {
+        usleep(200 * 1000);
+        if ((NSInteger)[UIApplication sharedApplication].applicationState == 0) return YES;
+    }
+    return NO;
+}
+
+BOOL TDForegroundSelf(int *via) {
+    if (via) *via = 0;
+    // 路一：自己的 URL scheme
+    NSURL *u = [NSURL URLWithString:@"tapdog://"];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:nil];
+    });
+    if (TDwaitActive(13)) { if (via) *via = 1; return YES; }
+
+    // 路二：LSApplicationWorkspace 强拉。实测后台 openURL 开自己会被忽略，这条能成。
+    Class wsCls = NSClassFromString(@"LSApplicationWorkspace");
+    if (wsCls) {
+        id (*msgSend0)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+        void (*msgSend1)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
+        id ws = msgSend0(wsCls, sel_registerName("defaultWorkspace"));
+        if (ws) {
+            msgSend1(ws, sel_registerName("openApplicationWithBundleID:"), @"com.local.tapdog");
+            if (TDwaitActive(18)) { if (via) *via = 2; return YES; }
+        }
+    }
+    return NO;
+}
+
+/// 写剪贴板并把文字粘进「另一个 App」的输入框。
+/// appURL 为空 = 不切 App（就在当前前台 App 里粘）。
+/// tapAnchor = 切回去之后先点一下 anchor 把光标放进输入框（键盘没弹时必须点）。
+/// clearFirst = 粘之前先 ⌘A 全选，粘贴会整段覆盖，不会越贴越长。
+BOOL TDPasteIntoOtherApp(NSString *text, NSString *appURL, BOOL tapAnchor,
+                         CGPoint anchor, BOOL clearFirst) {
+    if (text.length == 0) return NO;
+
+    int via = 0;
+    BOOL front = TDForegroundSelf(&via);
+    BOOL wrote = front ? TDPasteCopyToClipboard(text) : NO;
+    TDLog(@"落字：自前台 方式=%d 剪贴板=%@", via, wrote ? @"已写入" : @"写入失败");
+    if (!wrote) return NO;
+    usleep(250 * 1000);
+
+    if (appURL.length) {
+        NSURL *back = [NSURL URLWithString:appURL];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[UIApplication sharedApplication] openURL:back options:@{} completionHandler:nil];
+        });
+        usleep(1700 * 1000);
+    }
+    if (tapAnchor) {
+        TDtap(anchor.x, anchor.y);
+        usleep(560 * 1000);
+    }
+    if (clearFirst) {
+        TDsendCmdA();          // ⌘A 全选
+        usleep(240 * 1000);
+    }
+    TDsendCmdV();              // ⌘V 粘贴
+    usleep(200 * 1000);
+    return YES;
+}
+
 BOOL TDPasteCopyToClipboard(NSString *text) {
     if (text.length == 0) return NO;
     void (^put)(void) = ^{

@@ -324,7 +324,7 @@ static BOOL TDuploadShot(CGFloat maxW, CGFloat quality) {
 
 /// 用 Vision 认字，返回 [{s,x,y,w,h}]（屏幕点）。远程看不见「字」的时候，
 /// 靠它找「评论」「说点什么」「发送」这类按钮，比反复截猜坐标靠谱得多。
-static NSArray<NSDictionary *> *TDocr(UIImage *img) {
+NSArray<NSDictionary *> *TDocrLines(UIImage *img) {
     if (!img.CGImage) return @[];
     NSMutableArray *out = [NSMutableArray array];
     VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCGImage:img.CGImage options:@{}];
@@ -400,41 +400,6 @@ static NSDictionary *TDstateDict(void) {
 /// 命令在后台串行队列上执行；只有 openURL 那条自己 dispatch_async 回主线程。
 /// 网络（上传截图/状态）和计算（OCR/识图）绝不能占主线程 —— 会被 watchdog 杀掉。
 /// 返回值：ok / msg，另有 shot=1 表示「执行完再传一张截图」。
-// ---------------------------------------------------------------------------
-// 把自己拉回前台
-//
-// 系统只在 App 处于 active 时接受剪贴板写入；后台调用一律丢弃（实测四种写法
-// changeCount 都是 0→0，回读全空）。所以「往别的 App 里喂中文」必须先让自己
-// 前台一次。两条路：自己的 URL scheme，和 LSApplicationWorkspace 强制激活。
-static BOOL TDwaitActive(int ticks) {           // 每 tick 200ms
-    for (int i = 0; i < ticks; i++) {
-        usleep(200 * 1000);
-        if ((NSInteger)[UIApplication sharedApplication].applicationState == 0) return YES;
-    }
-    return NO;
-}
-
-static BOOL TDForegroundSelf(int *via) {        // via: 1=scheme 2=LSWorkspace 0=没成功
-    if (via) *via = 0;
-    NSURL *u = [NSURL URLWithString:@"tapdog://"];
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:nil];
-    });
-    if (TDwaitActive(13)) { if (via) *via = 1; return YES; }
-
-    Class wsCls = NSClassFromString(@"LSApplicationWorkspace");
-    if (wsCls) {
-        id (*msgSend0)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
-        void (*msgSend1)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
-        id ws = msgSend0(wsCls, sel_registerName("defaultWorkspace"));
-        if (ws) {
-            msgSend1(ws, sel_registerName("openApplicationWithBundleID:"), @"com.local.tapdog");
-            if (TDwaitActive(18)) { if (via) *via = 2; return YES; }
-        }
-    }
-    return NO;
-}
-
 static NSDictionary *TDexecCommand(NSDictionary *cmd) {
     NSString *c = [cmd[@"c"] isKindOfClass:[NSString class]] ? cmd[@"c"] : @"";
 
@@ -533,56 +498,52 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
     }
 
     if ([c isEqualToString:@"paste"]) {
-        // 系统只在「自己在前台」时接受剪贴板写入：后台写会静默丢弃
-        // （回读立刻就是旧值，症状是粘出上一次的内容）。
-        // 所以这里自己切到前台写、再切回目标 App 发 Cmd+V，一条命令走完。
+        // 自前台写剪贴板 → 切回目标 App → 点输入框 → ⌘A → ⌘V，一条命令走完
         NSString *s = [cmd[@"s"] isKindOfClass:[NSString class]] ? cmd[@"s"] : @"";
         if (s.length == 0) return @{@"ok": @0, @"msg": @"文本为空"};
         NSString *app = [cmd[@"app"] isKindOfClass:[NSString class]] ? cmd[@"app"] : @"snssdk1128://";
         BOOL needTap = [cmd[@"tap"] boolValue];
         CGPoint at = CGPointMake([cmd[@"x"] doubleValue], [cmd[@"y"] doubleValue]);
-        NSURL *back = [NSURL URLWithString:app];
-
-        // 切回前台要经过 inactive 才到 active，固定睡一段时间常常踩在 inactive 上，
-        // 写剪贴板还是会被丢。所以改成轮询 state，真到 active 才下笔。
-        BOOL selfFirst = cmd[@"self"] ? [cmd[@"self"] boolValue] : YES;
-        BOOL written = NO;
-        NSInteger st = -1;
-        int via = 0;
-        if (selfFirst) {
-            BOOL front = TDForegroundSelf(&via);
-            st = (NSInteger)[UIApplication sharedApplication].applicationState;
-            if (front) written = TDPasteCopyToClipboard(s);
-            TDLog(@"粘贴：自前台 方式=%d 前台=%@ 写剪贴板=%@ state=%ld",
-                  via, front ? @"是" : @"否", written ? @"是" : @"否", (long)st);
-        } else {
-            written = TDPasteCopyToClipboard(s);
-            st = (NSInteger)[UIApplication sharedApplication].applicationState;
+        BOOL ok = TDPasteIntoOtherApp(s, app, needTap && at.x > 0 && at.y > 0, at,
+                                      [cmd[@"clear"] boolValue]);
+        // 调试用：不切 App、只写剪贴板看看写得进去不
+        if (![cmd[@"self"] boolValue] && cmd[@"self"]) {
+            ok = TDPasteCopyToClipboard(s);
         }
-        usleep(250 * 1000);
-
-        // 3) 切回目标 App
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [[UIApplication sharedApplication] openURL:back options:@{} completionHandler:nil];
-        });
-        usleep(1700 * 1000);
-
-        // 4) 需要时先点一下把光标放进输入框（键盘已弹出时不要点，会点偏）
-        if (needTap && at.x > 0 && at.y > 0) {
-            TDtap(at.x, at.y);
-            usleep(560 * 1000);
-        }
-        // 5) ⌘A 全选：粘贴直接覆盖旧内容，不会越贴越长
-        if ([cmd[@"clear"] boolValue]) {
-            TDsendCmdA();
-            usleep(220 * 1000);
-        }
-        TDsendCmdV();
-        TDLog(@"粘贴：已切回 %@ 并发 Cmd+V", app);
-        return @{@"ok": @1,
-                 @"msg": [NSString stringWithFormat:@"paste 方式=%d 写%@ state=%ld",
-                          via, written ? @"✓" : @"✗", (long)st],
+        return @{@"ok": @1, @"msg": [NSString stringWithFormat:@"paste 剪贴板%@ state=%ld",
+                                     ok ? @"✓" : @"✗",
+                                     (long)[UIApplication sharedApplication].applicationState],
                  @"shot": @1};
+    }
+
+    if ([c isEqualToString:@"putscript"]) {
+        // PC 上拼好的脚本推进来：{c:"putscript", name, steps:[…], loop:{on,count,gap}}
+        // 调试脚本时不用在手机上一步步点，改一版推一版。
+        NSString *name = [cmd[@"name"] isKindOfClass:[NSString class]] ? cmd[@"name"] : @"远程脚本";
+        NSArray *steps = [cmd[@"steps"] isKindOfClass:[NSArray class]] ? cmd[@"steps"] : @[];
+        TDScriptStore *store = [TDScriptStore shared];
+        TDScript *target = nil;
+        for (TDScript *sc in store.scripts) {
+            if ([sc.name isEqualToString:name]) { target = sc; break; }
+        }
+        if (!target) {
+            target = [store createScript];
+            target.name = name;
+        }
+        [target.steps removeAllObjects];
+        for (id st in steps) {
+            if ([st isKindOfClass:[NSDictionary class]]) [target.steps addObject:[st mutableCopy]];
+        }
+        if ([cmd[@"loop"] isKindOfClass:[NSDictionary class]]) {
+            target.loop = [cmd[@"loop"] mutableCopy];
+        }
+        NSInteger idx = (NSInteger)[store.scripts indexOfObjectIdenticalTo:target];
+        if (idx >= 0) store.selected = idx;
+        [store save];
+        TDLog(@"远程调试：写入脚本「%@」%lu 步", name, (unsigned long)target.steps.count);
+        return @{@"ok": @1, @"msg": [NSString stringWithFormat:@"脚本「%@」已写入 %lu 步%s",
+                                     name, (unsigned long)target.steps.count,
+                                     idx >= 0 ? "，已选中" : ""]};
     }
 
     if ([c isEqualToString:@"run"] || [c isEqualToString:@"stop"]) {
@@ -671,7 +632,7 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
         // 缩小再认：Vision 对分辨率不敏感，1242×2208 缩到 700 宽，速度快几倍。
         // 上一版直接把整屏原图丢给它在主线程认，直接触发 watchdog 把 App 杀了。
         UIImage *shot = TDshotScaled(700);
-        NSArray *lines = TDocr(shot);
+        NSArray *lines = TDocrLines(shot);
         NSData *d = [NSJSONSerialization dataWithJSONObject:lines options:0 error:NULL];
         TDput(@"ocr.json", d);
         NSString *flat = [[lines valueForKey:@"s"] componentsJoinedByString:@" | "];

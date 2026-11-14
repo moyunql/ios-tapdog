@@ -416,10 +416,18 @@ static CGPoint TDJitter(CGPoint p, double r) {
             [self logMsg:@"%@ 要粘贴，但评论池是空的（去脚本编辑页加几条话术）", [self stepTag:st]];
             return;
         }
-        CGPoint anchor = [self pasteAnchorFor:st];
-        TDPasteTextAt(txt, anchor);
+        // 有 x/y 就用脚本给的锚点；没有就退回「上一次点击的落点」
+        CGPoint anchor = st[@"x"]
+            ? CGPointMake([st[@"x"] doubleValue], [st[@"y"] doubleValue])
+            : [self pasteAnchorFor:st];
+        BOOL tapAnchor = st[@"tap"] ? [st[@"tap"] boolValue] : (anchor.x > 0 && anchor.y > 0);
+        BOOL clearFirst = st[@"clear"] ? [st[@"clear"] boolValue] : YES;
+        // 走「自前台写剪贴板 → 切回 app → ⌘A → ⌘V」：抖音那种自定义输入框
+        // 没有「粘贴」菜单，只有这条能进去。
+        BOOL ok = TDPasteIntoOtherApp(txt, st[@"app"], tapAnchor, anchor, clearFirst);
         NSString *show = txt.length > 12 ? [[txt substringToIndex:12] stringByAppendingString:@"…"] : txt;
-        [self logMsg:@"粘贴%@（%@）：%@", fromPool ? @"（池随机）" : @"", TDPasteMethodDesc(), show];
+        [self logMsg:@"%@ 粘贴%@：%@（剪贴板%@）", [self stepTag:st], fromPool ? @"（池随机）" : @"",
+                      show, ok ? @"✓" : @"✗"];
         usleep((useconds_t)(interval * 1000));
         return;
     }
@@ -467,6 +475,124 @@ static CGPoint TDJitter(CGPoint p, double r) {
             double ms = st[@"ms"] ? [st[@"ms"] doubleValue] : 500;
             TDgesture(pts, MAX(120.0, ms * msScale) / 1000.0);
         }
+        usleep((useconds_t)(interval * 1000));
+        return;
+    }
+
+    // 点赞：先看心是白的还是红的，红了就跳过 —— 保证重复跑不会把赞取消掉
+    if ([t isEqualToString:@"like"]) {
+        double x = st[@"x"] ? [st[@"x"] doubleValue] : 387;
+        double y = st[@"y"] ? [st[@"y"] doubleValue] : 333;
+        CGRect box = CGRectMake(x - 15, y - 15, 30, 30);
+        double l = 0, c = 0, red0 = 0, d = 0;
+        if (!TDregionStats(box, &l, &c, &red0, &d)) {
+            [self logMsg:@"%@ 点赞：读不到画面，跳过", [self stepTag:st]];
+            return;
+        }
+        if (red0 > 0.12) {
+            [self logMsg:@"%@ 点赞：已经是红的（%.2f），跳过", [self stepTag:st], red0];
+            return;
+        }
+        TDtap(x, y);
+        usleep(1300 * 1000);                 // 等红心动画走完再判，早了会误判
+        double red1 = 0;
+        TDregionStats(box, &l, &c, &red1, &d);
+        // 用「变红多少」而不是「红不红」：视频本身偏红也不会误判
+        if (red1 > 0.12 || red1 > red0 + 0.06) {
+            [self logMsg:@"%@ 点赞：成功（红 %.2f→%.2f）", [self stepTag:st], red0, red1];
+        } else {
+            [self logMsg:@"%@ 点赞：点完没变红（%.2f→%.2f），不重试（重试会把已赞的取消）",
+                          [self stepTag:st], red0, red1];
+        }
+        usleep((useconds_t)(interval * 1000));
+        return;
+    }
+
+    // 评论（带可选本机图片）：一条龙，每一步都校验，任一环不过就不发送
+    if ([t isEqualToString:@"comment"]) {
+        NSString *tag = [self stepTag:st];
+        double cx = st[@"cx"] ? [st[@"cx"] doubleValue] : 387;
+        double cy = st[@"cy"] ? [st[@"cy"] doubleValue] : 394;
+        double ix = st[@"ix"] ? [st[@"ix"] doubleValue] : 150;
+        double iy = st[@"iy"] ? [st[@"iy"] doubleValue] : 713;
+        double bx = st[@"bx"] ? [st[@"bx"] doubleValue] : 30;
+        double by = st[@"by"] ? [st[@"by"] doubleValue] : 405;
+        double sx = st[@"sx"] ? [st[@"sx"] doubleValue] : 375;
+        double sy = st[@"sy"] ? [st[@"sy"] doubleValue] : 405;
+        NSString *app = [st[@"app"] isKindOfClass:[NSString class]] ? st[@"app"] : @"snssdk1128://";
+        NSString *txt = [st[@"text"] isKindOfClass:[NSString class]] ? st[@"text"] : nil;
+        if (txt.length == 0) txt = TDCommentPick();
+        if (txt.length == 0) { [self logMsg:@"%@ 评论池是空的", tag]; return; }
+        BOOL withImg = st[@"img"] ? [st[@"img"] boolValue] : YES;
+        NSArray *cells = [st[@"cells"] isKindOfClass:[NSArray class]] ? st[@"cells"] : nil;
+
+        // 1) 开评论面板
+        TDtap(cx, cy);
+        usleep(1500 * 1000);
+        double l = 0, c = 0, r = 0, d = 0;
+        BOOL open = TDregionStats(CGRectMake(120, 666, 180, 12), &l, &c, &r, &d)
+                    && l > 190 && l < 247 && c < 16;
+        if (!open) {
+            [self logMsg:@"%@ 评论面板没开（底部亮度 %.0f），再点一次", tag, l];
+            TDtap(cx, cy);
+            usleep(1600 * 1000);
+            open = TDregionStats(CGRectMake(120, 666, 180, 12), &l, &c, &r, &d)
+                   && l > 190 && l < 247 && c < 16;
+        }
+        if (!open) { [self logMsg:@"%@ 评论面板打不开（亮度 %.0f），这条跳过", tag, l]; return; }
+
+        // 2) 落字：切前台写剪贴板 → 切回抖音 → 点输入框 → ⌘A → ⌘V
+        BOOL wrote = TDPasteIntoOtherApp(txt, app, YES, CGPointMake(ix, iy), YES);
+        usleep(900 * 1000);
+
+        // 3) 校验文字真进去了（键盘弹起后输入框在 y≈327..361，正文是黑的，占位符是灰的）
+        BOOL landed = NO;
+        for (int i = 0; i < 8 && !landed; i++) {
+            double l2 = 0, c2 = 0, r2 = 0, d2 = 0;
+            if (TDregionStats(CGRectMake(36, 328, 210, 34), &l2, &c2, &r2, &d2)) landed = (d2 > 0.010);
+            if (!landed) usleep(300 * 1000);
+        }
+        if (!wrote || !landed) {
+            [self logMsg:@"%@ 文字没落进输入框（剪贴板%@），不发送", tag, wrote ? @"✓" : @"✗"];
+            return;                          // 绝不发空评论
+        }
+
+        // 4) 挂一张本机图片
+        BOOL attached = NO;
+        if (withImg && cells.count) {
+            TDtap(bx, by);
+            usleep(1900 * 1000);
+            double l3 = 0, c3 = 0, r3 = 0, d3 = 0;
+            BOOL album = TDregionStats(CGRectMake(150, 55, 200, 18), &l3, &c3, &r3, &d3) && l3 > 225;
+            if (album) {
+                NSArray *p = cells[arc4random_uniform((uint32_t)cells.count)];
+                if ([p isKindOfClass:[NSArray class]] && p.count >= 2) {
+                    TDtap([p[0] doubleValue], [p[1] doubleValue]);
+                    usleep(1700 * 1000);
+                    attached = YES;
+                }
+            } else {
+                [self logMsg:@"%@ 相册没打开（顶部亮度 %.0f），这条不带图", tag, l3];
+            }
+        }
+
+        // 5) 发送
+        TDtap(sx, sy);
+        usleep(2200 * 1000);
+
+        // 6) 校验：面板里应该能看到刚发出去的文案（OCR）
+        BOOL seen = NO;
+        NSString *key = txt.length > 6 ? [txt substringToIndex:6] : txt;
+        for (int i = 0; i < 2 && !seen; i++) {
+            NSArray *lines = TDocrLines(TDscreenshot());
+            for (NSDictionary *ln in lines) {
+                NSString *str = [ln[@"s"] isKindOfClass:[NSString class]] ? ln[@"s"] : @"";
+                if (str.length && [str containsString:key]) { seen = YES; break; }
+            }
+            if (!seen) usleep(700 * 1000);
+        }
+        [self logMsg:@"%@ 评论%@%@：%@", tag, seen ? @"已发出" : @"未确认（OCR 没看到）",
+                      attached ? @"（带图）" : @"", txt];
         usleep((useconds_t)(interval * 1000));
         return;
     }

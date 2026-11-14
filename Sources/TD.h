@@ -151,6 +151,17 @@ BOOL TDPasteCopyToClipboard(NSString *text);
 
 /// 后台能否写剪贴板：几种写法各试一次，逐步回读（诊断用）
 NSArray<NSString *> *TDclipTryWrite(NSString *text);
+
+/// 把自己拉到前台（系统只让前台 App 写剪贴板）。via: 1=scheme 2=LSWorkspace 0=失败
+BOOL TDForegroundSelf(int *via);
+
+/// 写剪贴板并把文字粘进「另一个 App」的输入框。
+/// appURL 为空 = 不切 App；tapAnchor = 切回去后先点一下把光标放好；clearFirst = 先 ⌘A 全选
+BOOL TDPasteIntoOtherApp(NSString *text, NSString *appURL, BOOL tapAnchor,
+                         CGPoint anchor, BOOL clearFirst);
+
+/// OCR 整屏，返回 [{s,x,y,w,h,conf}]（x/y 是点坐标）
+NSArray<NSDictionary *> *TDocrLines(UIImage *img);
 /// 看一眼剪贴板现在是什么（最多 40 字）
 NSString *TDPasteClipboardText(void);
 void TDPasteSetHoldMs(double holdMs);
@@ -219,6 +230,10 @@ uint32_t TDcapturePixelFormat(void);
 size_t TDcaptureBytesPerRow(void);
 /// 屏幕点尺寸 / 像素尺寸 换算比
 CGFloat TDscreenScaleRatio(void);
+
+/// 取屏幕一块区域（点坐标）的像素统计：亮度 / 彩度 / 偏红占比 / 深色占比。
+/// 脚本里的「校验」全靠它 —— 点赞是不是红了、文字有没有落进输入框。
+BOOL TDregionStats(CGRect ptRect, double *lum, double *chroma, double *redRatio, double *darkRatio);
 
 #pragma mark - 识图（模板匹配）
 

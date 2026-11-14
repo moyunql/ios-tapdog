@@ -286,3 +286,65 @@ CGFloat TDscreenScaleRatio(void) {
     }
     return pt.width / gLastPixelSize.width;
 }
+
+#pragma mark - 区域像素统计
+
+/// 取屏幕上一块区域（点坐标）的像素统计，给「校验」用：
+///   lum     平均亮度 0~255
+///   chroma  平均彩度（max-min 通道差），判断「是不是灰的」
+///   redRatio 偏红像素占比（点赞红心）
+///   darkRatio 亮度 <100 的像素占比（黑字）
+/// 截屏本身已经按正确的 10 位拆位还原成 UIImage，所以这里读到的颜色是准的。
+BOOL TDregionStats(CGRect r, double *lum, double *chroma, double *redRatio, double *darkRatio) {
+    if (lum) *lum = 0;
+    if (chroma) *chroma = 0;
+    if (redRatio) *redRatio = 0;
+    if (darkRatio) *darkRatio = 0;
+
+    UIImage *img = TDscreenshot();
+    if (!img.CGImage) return NO;
+    CGFloat W = img.size.width, H = img.size.height;
+    if (W < 1 || H < 1) return NO;
+
+    // 点 → 像素
+    CGFloat k = W / MAX(1.0, [UIScreen mainScreen].bounds.size.width);
+    CGRect px = CGRectMake(r.origin.x * k, r.origin.y * k, r.size.width * k, r.size.height * k);
+    px = CGRectIntersection(px, CGRectMake(0, 0, W, H));
+    if (px.size.width < 1 || px.size.height < 1) return NO;
+
+    int w = (int)px.size.width, h = (int)px.size.height;
+    uint8_t *buf = calloc((size_t)w * h * 4, 1);
+    if (!buf) return NO;
+
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, (size_t)w * 4, cs,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) { free(buf); return NO; }
+
+    // 把区域平移到原点：先按左上角原点算，再补上 CG 的上下翻转
+    CGContextTranslateCTM(ctx, -px.origin.x, -(H - px.origin.y - px.size.height));
+    CGContextDrawImage(ctx, CGRectMake(0, 0, W, H), img.CGImage);
+    CGContextRelease(ctx);
+
+    double sumL = 0, sumC = 0;
+    long nRed = 0, nDark = 0;
+    for (int i = 0; i < w * h; i++) {
+        uint8_t *p = buf + (size_t)i * 4;
+        int R = p[0], G = p[1], B = p[2];
+        int mx = MAX(R, MAX(G, B)), mn = MIN(R, MIN(G, B));
+        double l = (R + G + B) / 3.0;
+        sumL += l;
+        sumC += (mx - mn);
+        if (R > 140 && R > G + 45 && R > B + 45) nRed++;
+        if (l < 100) nDark++;
+    }
+    free(buf);
+
+    double tot = (double)w * h;
+    if (lum) *lum = sumL / tot;
+    if (chroma) *chroma = sumC / tot;
+    if (redRatio) *redRatio = (double)nRed / tot;
+    if (darkRatio) *darkRatio = (double)nDark / tot;
+    return YES;
+}
