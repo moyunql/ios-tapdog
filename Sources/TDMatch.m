@@ -138,7 +138,7 @@ static UIImage *TDResizeImage(UIImage *img, CGFloat scale) {
 // ---------------------------------------------------------------------------
 
 static UIImage *gLastShot = nil;
-static CGSize gLastShotPx = CGSizeZero;
+static CGSize gLastShotPx = {0, 0};
 static volatile int32_t gShotCacheOn = 0;
 
 void TDSetShotCacheEnabled(BOOL on) { gShotCacheOn = on ? 1 : 0; }
