@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 // ---------------------------------------------------------------------------
 // 启动、崩溃捕获、前后台生命周期
@@ -35,6 +36,20 @@ static void TDSignalHandler(int sig) {
             char line[128];
             int n = snprintf(line, sizeof(line), "\n=== 崩溃 signal %d ===\n", sig);
             if (n > 0) write(fd, line, (size_t)n);
+
+            // 先把「崩溃前最后几行日志」写进去 —— 这比栈更有用：
+            // 栈只能说死在哪个系统库里，日志能说死在第几步、哪个动作上。
+            char *ring = (char *)malloc(8192);
+            if (ring) {
+                size_t rl = TDlogRingDump(ring, 8192);
+                if (rl > 0) {
+                    const char *hd = "--- 崩溃前的日志 ---\n";
+                    write(fd, hd, strlen(hd));
+                    write(fd, ring, rl);
+                    write(fd, "--- 栈 ---\n", strlen("--- 栈 ---\n"));
+                }
+                free(ring);
+            }
             void *frames[64];
             int cnt = backtrace(frames, 64);
             if (cnt > 0) backtrace_symbols_fd(frames, cnt, fd);

@@ -56,6 +56,10 @@ NSInteger TDHIDSampleSpace(void);
 /// 物理触摸监听状态、回显计数、关键权限是否真的在位。
 NSString *TDHIDDiagReport(void);
 
+/// 日志环形缓冲（崩溃现场用）：TDlogRingDump 按时间序拷出最近日志
+void TDlogRingAppend(const char *line);
+size_t TDlogRingDump(char *out, size_t cap);
+
 /// 注入通道开关：sender 0=不设 / 1=学到的 / 2=指定值；replayTap 是否用「克隆真实事件」
 void TDInjSetMode(NSInteger mode, uint64_t sid, BOOL replayTap);
 NSString *TDInjModeDesc(void);

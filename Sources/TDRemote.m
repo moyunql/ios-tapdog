@@ -326,6 +326,25 @@ static BOOL TDuploadShot(CGFloat maxW, CGFloat quality) {
 /// 靠它找「评论」「说点什么」「发送」这类按钮，比反复截猜坐标靠谱得多。
 NSArray<NSDictionary *> *TDocrLines(UIImage *img) {
     if (!img.CGImage) return @[];
+
+    // 原图直接喂 Vision 会把这台机器搞死。
+    //
+    // 实测：引擎里调 TDocrLines(TDscreenshot())，进程立刻 signal 11，
+    // 栈顶是 CoreImage 里的 memcpy —— A10 上把 1242×2208 的位图交给
+    // Vision，它内部还要再开几份同尺寸图，内存一紧就读到已释放的缓冲区。
+    // （远程 ocr 命令早就绕过这一条：它先缩到 700 宽。引擎这边漏了。）
+    // 中文识别对分辨率不敏感，缩到 700 宽既稳又快，坐标换算按实际像素算就没错。
+    const CGFloat kOcrMaxW = 700;
+    if (img.size.width > kOcrMaxW + 1) {
+        CGFloat k = kOcrMaxW / img.size.width;
+        CGSize sz = CGSizeMake(floor(img.size.width * k), floor(img.size.height * k));
+        UIGraphicsBeginImageContextWithOptions(sz, YES, 1.0);   // 不透明，省一条 alpha
+        [img drawInRect:CGRectMake(0, 0, sz.width, sz.height)];
+        UIImage *small = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        if (small && small.CGImage) img = small;
+    }
+
     NSMutableArray *out = [NSMutableArray array];
     VNImageRequestHandler *h = [[VNImageRequestHandler alloc] initWithCGImage:img.CGImage options:@{}];
     VNRecognizeTextRequest *req = [[VNRecognizeTextRequest alloc] init];
@@ -672,6 +691,44 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
                           name, m.point.x, m.point.y, m.score, m.maskHit],
                  @"x": @(lround(m.point.x)), @"y": @(lround(m.point.y)),
                  @"score": @(m.score), @"mask": @(m.maskHit), @"shot": @1};
+    }
+
+    // 走引擎同一条路做一次 OCR：整屏截图（不预先缩小）直接交给 TDocrLines。
+    // 专门用来验证「缩小」那层是否真的挡住了崩溃。
+    if ([c isEqualToString:@"ocrshot"]) {
+        NSDate *t0 = [NSDate date];
+        UIImage *img = TDscreenshot();
+        if (!img) return @{@"ok": @0, @"msg": @"截屏失败"};
+        CGSize px = CGSizeMake(CGImageGetWidth(img.CGImage), CGImageGetHeight(img.CGImage));
+        NSArray *lines = TDocrLines(img);
+        double ms = -[t0 timeIntervalSinceNow] * 1000.0;
+        NSString *flat = [[lines valueForKey:@"s"] componentsJoinedByString:@" | "];
+        return @{@"ok": @1,
+                 @"msg": [NSString stringWithFormat:@"整屏 %.0fx%.0f px → OCR %lu 行，耗时 %.0f ms",
+                          px.width, px.height, (unsigned long)lines.count, ms],
+                 @"text": flat.length > 900 ? [flat substringToIndex:900] : (flat ?: @""),
+                 @"shot": @0};
+    }
+
+    // 崩溃现场：crash.log 里现在带「崩溃前的日志」，直接读出来就能定位。
+    if ([c isEqualToString:@"crash"]) {
+        NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        NSString *path = [dir stringByAppendingPathComponent:@"crash.log"];
+        NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:NULL];
+        if (!txt.length) return @{@"ok": @1, @"msg": @"没有崩溃记录"};
+        NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:NULL];
+        NSInteger cap = cmd[@"tail"] ? [cmd[@"tail"] integerValue] : 2600;
+        NSString *tail = txt.length > cap ? [txt substringFromIndex:txt.length - cap] : txt;
+        return @{@"ok": @1,
+                 @"msg": [NSString stringWithFormat:@"crash.log %@ B · 尾部 %lu 字",
+                          attr[NSFileSize] ?: @"?", (unsigned long)tail.length],
+                 @"text": tail};
+    }
+
+    if ([c isEqualToString:@"crashclear"]) {
+        NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        [[NSFileManager defaultManager] removeItemAtPath:[dir stringByAppendingPathComponent:@"crash.log"] error:NULL];
+        return @{@"ok": @1, @"msg": @"crash.log 已清空"};
     }
 
     if ([c isEqualToString:@"ocr"]) {

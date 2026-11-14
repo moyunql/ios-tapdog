@@ -2,6 +2,9 @@
 #include <math.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <time.h>
+#include <string.h>
+#include <pthread.h>
 
 // ---------------------------------------------------------------------------
 // 配置 + 回放引擎
@@ -154,11 +157,82 @@ static BOOL TDCommentPanelOpen(NSString **hit) {
 - (NSString *)jetsamStatus { return _jetsamStatus; }
 - (void)setJetsamStatus:(NSString *)s { _jetsamStatus = [s copy]; }
 
+// ---------------------------------------------------------------------------
+// 日志环形缓冲：崩溃时唯一能带走现场的东西
+//
+// 为什么需要：日志原本只会 dispatch 到主队列显示，进程一崩就全丢了 ——
+// 上次崩溃只知道「跑完第 0 步就没了」，具体死在哪一行无从判断，只能靠猜。
+// 这里用一块固定大小的静态缓冲区，每次 logMsg 同步写一份（不经过任何队列），
+// 崩溃处理器进去把它整块写进 crash.log，于是「最后一条日志」就是现场。
+// 固定大小 + 覆盖写，不会因为日志多而吃内存。
+// ---------------------------------------------------------------------------
+#define kTDRingCap 8192
+static char gRing[kTDRingCap];
+static int  gRingLen = 0;          // 已用字节（到顶后一直等于 cap）
+static int  gRingPos = 0;          // 下一个写入位置
+static pthread_mutex_t gRingLock = PTHREAD_MUTEX_INITIALIZER;
+
+void TDlogRingAppend(const char *line) {
+    if (!line) return;
+    size_t n = strlen(line);
+    if (n == 0) return;
+    if (n > kTDRingCap - 1) { line += n - (kTDRingCap - 1); n = kTDRingCap - 1; }
+    pthread_mutex_lock(&gRingLock);
+    for (size_t i = 0; i < n; i++) {
+        gRing[gRingPos] = line[i];
+        gRingPos = (gRingPos + 1) % kTDRingCap;
+    }
+    gRing[gRingPos] = 0;
+    if (gRingLen < kTDRingCap - 1) gRingLen += (int)n;
+    if (gRingLen > kTDRingCap - 1) gRingLen = kTDRingCap - 1;
+    pthread_mutex_unlock(&gRingLock);
+}
+
+// 按时间顺序取出全部内容；返回实际长度
+size_t TDlogRingDump(char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    pthread_mutex_lock(&gRingLock);
+    int len = gRingLen;
+    if (len > (int)cap - 1) {
+        // 只留最后 cap-1 个字符
+        int skip = len - (int)cap + 1;
+        for (int i = 0; i < (int)cap - 1; i++) {
+            int idx = (gRingPos - (len - skip) + i + kTDRingCap * 2) % kTDRingCap;
+            out[i] = gRing[idx];
+        }
+        len = (int)cap - 1;
+        out[len] = 0;
+        pthread_mutex_unlock(&gRingLock);
+        return (size_t)len;
+    }
+    int start = (gRingPos - len + kTDRingCap * 2) % kTDRingCap;
+    for (int i = 0; i < len; i++) out[i] = gRing[(start + i) % kTDRingCap];
+    out[len] = 0;
+    pthread_mutex_unlock(&gRingLock);
+    return (size_t)len;
+}
+
 - (void)logMsg:(NSString *)fmt, ... {
     va_list ap;
     va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
+    // 先同步进环形缓冲：崩溃时主队列上那些还没显示的就全丢了，这里不会。
+    {
+        time_t now = time(NULL);
+        struct tm tmv;
+        localtime_r(&now, &tmv);
+        char hhmmss[16];
+        strftime(hhmmss, sizeof(hhmmss), "%H:%M:%S", &tmv);
+        const char *body = s.UTF8String ?: "";
+        size_t need = strlen(body) + 32;
+        char *one = (char *)malloc(need);
+        if (one) {
+            snprintf(one, need, "[%s] %s\n", hhmmss, body);
+            TDlogRingAppend(one);
+            free(one);
+        }
+    }
     void (^h)(NSString *) = self.logHandler;
     NSArray *taps = gLogTaps.count ? [gLogTaps copy] : nil;
     if (h || taps.count) {
