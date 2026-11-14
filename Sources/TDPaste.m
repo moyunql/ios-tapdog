@@ -305,7 +305,8 @@ NSDictionary *TDclipDiagnose(void) {
         UIPasteboard *pb = [UIPasteboard generalPasteboard];
         d[@"readMain"] = pb.string.length ? pb.string : @"(nil)";
         d[@"items"] = @(pb.numberOfItems);
-        d[@"types"] = pb.types.count ? [pb.types componentsJoinedByString:@","] : @"(空)";
+        d[@"types"] = pb.pasteboardTypes.count
+            ? [pb.pasteboardTypes componentsJoinedByString:@","] : @"(空)";
     });
     UIPasteboard *pb2 = [UIPasteboard generalPasteboard];   // 后台线程再读一次
     d[@"readBg"] = pb2.string.length ? pb2.string : @"(nil)";
