@@ -79,6 +79,17 @@ extern UIViewController *TDCreateMainVC(void);
 
 @implementation TDAppDelegate
 
+// openURL 回调：Info.plist 里有 LSSupportsOpeningDocumentsInPlace 时，系统要求
+// delegate 必须实现这个方法，否则一收到 URL 就直接抛 NSInternalInconsistencyException。
+// 实测表现就是「远程调一次 open tapdog:// ，App 立刻闪退」，查了半天才在崩溃日志里看到。
+// 实现里什么都不用做，收到就返回 YES，App 正常回到前台即可。
+- (BOOL)application:(UIApplication *)app
+            openURL:(NSURL *)url
+            options:(NSDictionary<UIApplicationOpenURLOptionsKey, id> *)options {
+    TDLog(@"openURL：%@", url.absoluteString);
+    return YES;
+}
+
 - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)opt {
     TDInstallCrashLogger();
 

@@ -305,6 +305,13 @@ NSString *TDInjectVariantDesc(void) {
 
 static void TDApplyInjectOptions(IOHIDEventRef hand) {
     uint64_t sid = 0;
+    // 远程开关优先：明确要求「不设 sender」时，变体表算出来的值一律不用。
+    if (TDSenderForDispatch() == 0 && [[NSUserDefaults standardUserDefaults]
+                                       objectForKey:kSenderModeKey] != nil) {
+        if (TDInjectBuiltInOn()) IOHIDEventSetIntegerValue(hand, kIOHIDEventFieldIsBuiltIn, 1);
+        if (TDInjectBKSDigitizerInfoOn()) TDApplyBKSDigitizerInfo(hand);
+        return;
+    }
     switch (TDInjectVariantCurrent()) {
         case TDInjectVariantHardSender:
             sid = kTDDefaultSenderID;
@@ -521,6 +528,14 @@ NSString *TDInjectTouchPhysicsDesc(void) {
             (double)gPressPressure, (double)gPressRadius,
             (double)gPressQuality, (double)gPressDensity];
 }
+
+#define kSenderModeKey  @"tdSenderMode"     // 0 不设 / 1 学到的 / 2 指定
+#define kSenderHexKey   @"tdSenderHex"
+#define kReplayTapKey   @"tdReplayTap"      // 1 = tap 走「克隆真实事件」
+
+// 注入开关的实现在后面（要等 gSampleSender 定义），这里先声明。
+static uint64_t TDSenderForDispatch(void);
+static BOOL TDReplayTapEnabled(void);
 
 // mask: kIOHIDDigitizerEvent* 位组合；touch: 当前是否接触屏幕
 static void TDEmit(uint32_t mask, BOOL touch, CGFloat x, CGFloat y, uint32_t identity) {
@@ -901,12 +916,66 @@ static void TDReplayOne(IOHIDEventRef tmpl, CGFloat x, CGFloat y, BOOL down) {
     IOHIDEventSetIntegerValue(e, kIOHIDEventFieldDigitizerTouch, 1);
     IOHIDEventSetIntegerValue(e, kIOHIDEventFieldDigitizerRange, 1);
 
-    if (gSampleSender) IOHIDEventSetSenderID(e, gSampleSender);
+    uint64_t sid0 = TDSenderForDispatch();
+    if (sid0) IOHIDEventSetSenderID(e, sid0);
     if (TDInjectBKSDigitizerInfoOn()) TDApplyBKSDigitizerInfo(e);
 
     IOHIDEventSystemClientRef c = TDClientForDispatch();
     if (c) IOHIDEventSystemClientDispatchEvent(c, e);
     CFRelease(e);
+}
+
+// ---------------------------------------------------------------------------
+// 注入通道开关（远程可调）
+//
+// 为什么要有：真机上「点了完全没反应」有三种完全不同的原因，而现象一模一样——
+//   ① senderID 不对（学到的那个不一定是触摸屏的数字转换器）
+//   ② 事件字段不合法（自拼的事件缺字段）
+//   ③ 克隆真实事件那条路上，样本事件不能再被 dispatch（会出错甚至把进程搞死）
+// 之前只能靠改代码重装一轮试一个猜法，一轮八分钟。现在把三个维度做成开关，
+// 一条命令切一组，几秒钟扫完。
+// ---------------------------------------------------------------------------
+static NSInteger gSenderMode = -1;
+static uint64_t  gSenderExplicit = 0;
+
+static void TDInjLoad(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    gSenderMode = [d objectForKey:kSenderModeKey] ? [d integerForKey:kSenderModeKey] : 1;
+    NSString *hx = [d stringForKey:kSenderHexKey];
+    if (hx.length) gSenderExplicit = strtoull(hx.UTF8String, NULL, 0);
+}
+
+static uint64_t TDSenderForDispatch(void) {
+    if (gSenderMode < 0) TDInjLoad();
+    if (gSenderMode == 0) return 0;              // 不设：让系统按默认处理
+    if (gSenderMode == 2) return gSenderExplicit;
+    return gSampleSender;                        // 学到的
+}
+
+void TDInjSetMode(NSInteger mode, uint64_t sid, BOOL replayTap) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    gSenderMode = mode;
+    gSenderExplicit = sid;
+    [d setInteger:mode forKey:kSenderModeKey];
+    [d setObject:[NSString stringWithFormat:@"0x%llx", sid] forKey:kSenderHexKey];
+    [d setBool:replayTap forKey:kReplayTapKey];
+    [d synchronize];
+}
+
+NSString *TDInjModeDesc(void) {
+    if (gSenderMode < 0) TDInjLoad();
+    NSString *m = gSenderMode == 0 ? @"不设sender"
+                : (gSenderMode == 2 ? [NSString stringWithFormat:@"指定0x%llx", gSenderExplicit]
+                                    : [NSString stringWithFormat:@"学到0x%llx", (unsigned long long)gSampleSender]);
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    BOOL re = [d objectForKey:kReplayTapKey] ? [d boolForKey:kReplayTapKey] : YES;
+    return [NSString stringWithFormat:@"%@ / tap走%@", m, re ? @"克隆" : @"自拼"];
+}
+
+static BOOL TDReplayTapEnabled(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if ([d objectForKey:kReplayTapKey] == nil) return YES;
+    return [d boolForKey:kReplayTapKey];
 }
 
 void TDHIDReplayTap(CGPoint p) {
@@ -952,7 +1021,7 @@ void TDtap(CGFloat x, CGFloat y) {
     // 学到过真实触摸时优先走「真实事件副本」这条路：
     // 物理事件的字段（senderID、quality、pressure、display 信息…）全都齐，
     // 系统不会当成伪造输入丢掉；我们自己拼的那份永远缺东西。
-    if (TDHIDSampleReady() && TDUseRealEvents()) {
+    if (TDHIDSampleReady() && TDUseRealEvents() && TDReplayTapEnabled()) {
         TDHIDReplayTap(CGPointMake(x, y));
         TDShowFeedback(x, y);
         return;
@@ -1381,6 +1450,7 @@ NSString *TDHIDSampleGeometry(void) {
 
 NSString *TDHIDDiagReport(void) {
     NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"通道 %@\n", TDInjModeDesc()];
     [s appendFormat:@"客户端  admin:%@ 普通:%@\n",
         TDhidClient() ? @"ok" : @"nil", TDPlainClient() ? @"ok" : @"nil"];
 

@@ -514,6 +514,23 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
         return @{@"ok": @1, @"msg": [NSString stringWithFormat:@"open %@", u]};
     }
 
+    // 注入通道切换：sender 从哪来（不设 / 学到的 / 指定）+ tap 走哪条投递路径。
+    // 现象都一样（点了没反应）但原因完全不同，靠这个几秒钟扫完组合。
+    if ([c isEqualToString:@"injmode"]) {
+        NSInteger m = cmd[@"s"] ? [cmd[@"s"] integerValue] : 1;
+        uint64_t sid = 0;
+        if (cmd[@"sid"]) {
+            NSString *hx = [cmd[@"sid"] description];
+            sid = strtoull(hx.UTF8String, NULL, 0);
+        }
+        BOOL re = cmd[@"re"] ? ([cmd[@"re"] intValue] != 0) : YES;
+        TDInjSetMode(m, sid, re);
+        gCmdCount++;
+        TDputJSON(@"ack.json", @{@"id": cmd[@"id"] ?: @"", @"ok": @1,
+                                 @"msg": TDInjModeDesc(), @"ts": @(now)});
+        return;
+    }
+
     // 注入链路体检：senderID / 监听到的真实事件 / 回显 / 权限 / 签名，
     // 一条命令看全。之前的「点了没反应」全靠猜，现在有数字可对。
     if ([c isEqualToString:@"diag"]) {

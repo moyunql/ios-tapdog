@@ -55,6 +55,10 @@ NSInteger TDHIDSampleSpace(void);
 /// 一次性报告：客户端能否建立、HID 服务数、探到的 senderID、
 /// 物理触摸监听状态、回显计数、关键权限是否真的在位。
 NSString *TDHIDDiagReport(void);
+
+/// 注入通道开关：sender 0=不设 / 1=学到的 / 2=指定值；replayTap 是否用「克隆真实事件」
+void TDInjSetMode(NSInteger mode, uint64_t sid, BOOL replayTap);
+NSString *TDInjModeDesc(void);
 /// 内核眼里的签名状态（platform 标志 / euid / csflags）。
 /// entitlements 里有权限 ≠ 内核会放行，这一项是把两者分开看的唯一手段。
 NSString *TDCodeSignReport(void);
