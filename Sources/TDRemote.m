@@ -525,10 +525,7 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
         }
         BOOL re = cmd[@"re"] ? ([cmd[@"re"] intValue] != 0) : YES;
         TDInjSetMode(m, sid, re);
-        gCmdCount++;
-        TDputJSON(@"ack.json", @{@"id": cmd[@"id"] ?: @"", @"ok": @1,
-                                 @"msg": TDInjModeDesc(), @"ts": @(now)});
-        return;
+        return @{@"ok": @1, @"msg": TDInjModeDesc()};
     }
 
     // 注入链路体检：senderID / 监听到的真实事件 / 回显 / 权限 / 签名，

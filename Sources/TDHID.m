@@ -303,6 +303,14 @@ NSString *TDInjectVariantDesc(void) {
     return s;
 }
 
+#define kSenderModeKey  @"tdSenderMode"     // 0 不设 / 1 学到的 / 2 指定
+#define kSenderHexKey   @"tdSenderHex"
+#define kReplayTapKey   @"tdReplayTap"      // 1 = tap 走「克隆真实事件」
+
+// 注入开关的实现在后面（要等 gSampleSender 定义），这里先声明。
+static uint64_t TDSenderForDispatch(void);
+static BOOL TDReplayTapEnabled(void);
+
 static void TDApplyInjectOptions(IOHIDEventRef hand) {
     uint64_t sid = 0;
     // 远程开关优先：明确要求「不设 sender」时，变体表算出来的值一律不用。
@@ -528,14 +536,6 @@ NSString *TDInjectTouchPhysicsDesc(void) {
             (double)gPressPressure, (double)gPressRadius,
             (double)gPressQuality, (double)gPressDensity];
 }
-
-#define kSenderModeKey  @"tdSenderMode"     // 0 不设 / 1 学到的 / 2 指定
-#define kSenderHexKey   @"tdSenderHex"
-#define kReplayTapKey   @"tdReplayTap"      // 1 = tap 走「克隆真实事件」
-
-// 注入开关的实现在后面（要等 gSampleSender 定义），这里先声明。
-static uint64_t TDSenderForDispatch(void);
-static BOOL TDReplayTapEnabled(void);
 
 // mask: kIOHIDDigitizerEvent* 位组合；touch: 当前是否接触屏幕
 static void TDEmit(uint32_t mask, BOOL touch, CGFloat x, CGFloat y, uint32_t identity) {
