@@ -235,6 +235,10 @@ CGFloat TDscreenScaleRatio(void);
 /// 脚本里的「校验」全靠它 —— 点赞是不是红了、文字有没有落进输入框。
 BOOL TDregionStats(CGRect ptRect, double *lum, double *chroma, double *redRatio, double *darkRatio);
 
+/// 键盘弹没弹（看编辑区右下有没有红色「发送」）。
+/// 抖音键盘一起，整排按钮就从 y≈695 挪到 y≈400，点错位置全跑偏。
+BOOL TDkeyboardUp(void);
+
 #pragma mark - 识图（模板匹配）
 
 @class TDMatch;
@@ -563,6 +567,17 @@ extern NSString * const TDDataChangedNotification;
 /// AppDelegate 启动时调用一次：建球 + 交给 SpringBoard 托管
 void TDFloatInstall(void);
 void TDFloatSetVisible(BOOL on);
+
+/// 回放期间把悬浮条临时停到屏幕最顶上，跑完 TDFloatUnpark 归位。
+/// 不隐藏：藏了用户就没法中途按 ■ 停止脚本。
+void TDFloatParkTop(void);
+void TDFloatUnpark(void);
+
+/// 脚本回放期间的急停开关：上膛后按「音量减」即停止脚本。
+/// 音量已为 0 时再按无效（系统音量不再变化），所以这只是备用手法，
+/// 主要手段仍是悬浮条上的 ■ 停止。
+void TDVolumeStopInstall(void);
+void TDVolumeStopArm(BOOL on);
 BOOL TDFloatVisible(void);
 /// 引擎/录制状态变了以后调它，球会换颜色和文字
 void TDFloatRefresh(void);

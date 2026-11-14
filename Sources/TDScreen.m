@@ -348,3 +348,18 @@ BOOL TDregionStats(CGRect r, double *lum, double *chroma, double *redRatio, doub
     if (darkRatio) *darkRatio = (double)nDark / tot;
     return YES;
 }
+
+#pragma mark - 键盘态判断
+
+/// 键盘弹没弹？—— 看「发送」按钮：抖音的发送是 #FE2C55 的红底白字，
+/// 只在键盘弹起（编辑态）时出现在编辑区右下。无键盘时输入条右侧只有
+/// 图片/@/表情三个灰线图标，一点红都没有，所以拿红色占比判最稳。
+///
+/// 为什么要判：键盘弹起会把编辑区顶高，整排按钮从 y≈695 挪到 y≈400，
+/// 点错位置就全跑偏（曾经因此点了键盘打字、发了半截评论）。
+BOOL TDkeyboardUp(void) {
+    double l = 0, c = 0, red = 0, d = 0;
+    // 扫右侧一条竖带，覆盖「发送」可能出现的所有高度（编辑区高度随缩略图数变化）
+    if (!TDregionStats(CGRectMake(342, 270, 72, 210), &l, &c, &red, &d)) return NO;
+    return red > 0.008;
+}

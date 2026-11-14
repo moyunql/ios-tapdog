@@ -874,6 +874,35 @@ void TDFloatSetVisible(BOOL on) {
     }
 }
 
+/// 脚本回放期间把悬浮条临时停到屏幕最顶上。
+///
+/// 为什么不是「隐藏」：藏起来用户就没法中途按 ■ 停止了，脚本卡住只能杀 App。
+/// 为什么是「最顶上」：悬浮条 164×74，本来浮在左上角，正好盖住评论编辑区的
+/// 「图片」按钮 (28,396) 和相册第一行的选图圆圈 (79/183,386) —— 脚本连按钮
+/// 都点不到。挪到顶部中间 (y≈26..100) 后，视频页那只盖住「直播/团购」标签，
+/// 评论面板盖住「大家都在搜」横幅，相册盖住相册名 —— 这三处脚本都不点。
+static CGRect gParkSaved = CGRectZero;
+static BOOL gParked = NO;
+
+void TDFloatParkTop(void) {
+    if (!gBallWindow || gBallWindow.hidden || gParked) return;
+    gParkSaved = gBallWindow.frame;
+    CGRect sb = [UIScreen mainScreen].bounds;
+    CGFloat w = gBallWindow.frame.size.width, h = gBallWindow.frame.size.height;
+    gBallWindow.frame = CGRectMake((sb.size.width - w) / 2.0, 26, w, h);
+    TDHUDRegisterWindow(gBallWindow);       // 窗口动了要重新托管给 SpringBoard
+    TDFloatPlaceLogWindow();
+    gParked = YES;
+}
+
+void TDFloatUnpark(void) {
+    if (!gBallWindow || !gParked) return;
+    gBallWindow.frame = gParkSaved;
+    TDHUDRegisterWindow(gBallWindow);
+    TDFloatPlaceLogWindow();
+    gParked = NO;
+}
+
 BOOL TDFloatVisible(void) { return gBallWindow && !gBallWindow.hidden; }
 
 /// 悬浮条在屏幕上占的那块地方（屏幕坐标）。

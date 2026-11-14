@@ -216,6 +216,11 @@ static CGPoint TDJitter(CGPoint p, double r) {
     _running = YES;
     _gen++;
     NSUInteger gen = _gen;
+    // 悬浮条 164×74 浮在左上角，正好盖住评论编辑区的「图片」按钮和相册的选图
+    // 圆圈。回放期间挪到屏幕最顶上（不隐藏 —— 用户要能按 ■ 随时停），跑完归位。
+    dispatch_async(dispatch_get_main_queue(), ^{ TDFloatParkTop(); });
+    // 音量减 = 急停（悬浮条在顶部是主要手段，这是闭着眼也能摸到的备用）
+    TDVolumeStopArm(YES);
     // 回放期间把每次识图的整屏画面留一份：编辑页的「框选区域」拿它当底图，
     // 否则在编辑页里只能截到我们自己的界面，框了也没意义。
     TDSetShotCacheEnabled(YES);
@@ -293,6 +298,9 @@ static CGPoint TDJitter(CGPoint p, double r) {
         // 收尾就关掉：留在内存里的最后一张才是「抖音画面」，
         // 再开着的话，App 里的试识别会把这张换成我们自己的界面。
         TDSetShotCacheEnabled(NO);
+        // 悬浮条归位（回放期间停到顶部过），急停卸膛
+        dispatch_async(dispatch_get_main_queue(), ^{ TDFloatUnpark(); });
+        TDVolumeStopArm(NO);
         [self logMsg:@"结束，跑了 %ld 轮", (long)round];
         void (^f)(void) = self.onFinish;
         if (f) dispatch_async(dispatch_get_main_queue(), ^{ f(); });
@@ -481,8 +489,8 @@ static CGPoint TDJitter(CGPoint p, double r) {
 
     // 点赞：先看心是白的还是红的，红了就跳过 —— 保证重复跑不会把赞取消掉
     if ([t isEqualToString:@"like"]) {
-        double x = st[@"x"] ? [st[@"x"] doubleValue] : 387;
-        double y = st[@"y"] ? [st[@"y"] doubleValue] : 333;
+        double x = st[@"x"] ? [st[@"x"] doubleValue] : 379;
+        double y = st[@"y"] ? [st[@"y"] doubleValue] : 328;
         CGRect box = CGRectMake(x - 15, y - 15, 30, 30);
         double l = 0, c = 0, red0 = 0, d = 0;
         if (!TDregionStats(box, &l, &c, &red0, &d)) {
@@ -509,33 +517,36 @@ static CGPoint TDJitter(CGPoint p, double r) {
     }
 
     // 评论（带本机多图）：按固定顺序一条龙，每一步都校验，任一环不过就不发送。
-    //   点评论 → 点图片 → 点「多选」→ 点前几张图右上角圆圈 → 点下一步
-    //   → 粘贴评论池话术 → 发送 → 校验 → 关面板
+    //   点评论气泡 → 点输入框(弹键盘) → 点图片 → 点「多选」→ 点前几张图的圆圈
+    //   → 点「下一步」→ ⌘A+⌘V 贴池里的话术 → 发送 → 校验 → 关面板
+    //
+    // 为什么要先点输入框：评论面板刚打开、键盘没弹的时候，底部输入条上只有
+    // 「@」和「表情」两个图标，压根没有图片按钮；键盘一弹，编辑区顶上来，
+    // 图片/@/表情/发送 才排成一行出现。顺序搞反就点进 @ 面板了。
     if ([t isEqualToString:@"comment"]) {
         NSString *tag = [self stepTag:st];
         double cx = st[@"cx"] ? [st[@"cx"] doubleValue] : 387;   // 评论气泡
         double cy = st[@"cy"] ? [st[@"cy"] doubleValue] : 394;
-        double mx = st[@"mx"] ? [st[@"mx"] doubleValue] : 30;    // 输入条上的「图片」（键盘收起时）
-        double my = st[@"my"] ? [st[@"my"] doubleValue] : 706;
+        double ix = st[@"ix"] ? [st[@"ix"] doubleValue] : 150;   // 无键盘时的输入条
+        double iy = st[@"iy"] ? [st[@"iy"] doubleValue] : 695;
+        double mx = st[@"mx"] ? [st[@"mx"] doubleValue] : 30;    // 键盘弹起后的「图片」
+        double my = st[@"my"] ? [st[@"my"] doubleValue] : 405;
         double ux = st[@"ux"] ? [st[@"ux"] doubleValue] : 368;   // 相册右上「多选」
         double uy = st[@"uy"] ? [st[@"uy"] doubleValue] : 47;
         double nx = st[@"nx"] ? [st[@"nx"] doubleValue] : 110;   // 「下一步」
         double ny = st[@"ny"] ? [st[@"ny"] doubleValue] : 707;
-        double ix = st[@"ix"] ? [st[@"ix"] doubleValue] : 150;   // 输入框
-        double iy = st[@"iy"] ? [st[@"iy"] doubleValue] : 713;
         double sx = st[@"sx"] ? [st[@"sx"] doubleValue] : 375;   // 发送
-        double sy = st[@"sy"] ? [st[@"sy"] doubleValue] : 406;
-        NSString *app = [st[@"app"] isKindOfClass:[NSString class]] ? st[@"app"] : @"snssdk1128://";
+        double sy = st[@"sy"] ? [st[@"sy"] doubleValue] : 396;
+        NSString *app = [st[@"app"] isKindOfClass:[NSString class]] ? st[@"app"] : @\"snssdk1128://\";
         NSString *txt = [st[@"text"] isKindOfClass:[NSString class]] ? st[@"text"] : nil;
         if (txt.length == 0) txt = TDCommentPick();
-        if (txt.length == 0) { [self logMsg:@"%@ 评论池是空的（先加几条话术）", tag]; return; }
-        // 要点哪几张图的圆圈（默认第一行第 2/3/4 张，左数第一张被悬浮条压着点不到）
+        if (txt.length == 0) { [self logMsg:@\"%@ 评论池是空的（先加几条话术）\", tag]; return; }
         NSArray *cells = [st[@"cells"] isKindOfClass:[NSArray class]] ? st[@"cells"]
-                          : @[@[@183, @179], @[@289, @179], @[@392, @179]];
+                          : @[@[@155, @386], @[@259, @386], @[@362, @386]];
 
-        void (^closePanel)(void) = ^{
-            TDswipe(CGPointMake(207, 250), CGPointMake(207, 700), 0.30);
-            usleep(900 * 1000);
+        void (^closePanel)(void) = ^{\
+            TDswipe(CGPointMake(207, 250), CGPointMake(207, 700), 0.30);\
+            usleep(900 * 1000);\
         };
         double l = 0, c = 0, r = 0, d = 0;
 
@@ -543,84 +554,101 @@ static CGPoint TDJitter(CGPoint p, double r) {
         TDtap(cx, cy);
         usleep(1500 * 1000);
         BOOL open = TDregionStats(CGRectMake(120, 668, 180, 12), &l, &c, &r, &d)
-                    && l > 185 && l < 247 && c < 16;
+                    && l > 185 && l < 250 && c < 18;
         if (!open) {
-            [self logMsg:@"%@ 评论面板没开（%.0f），再点一次", tag, l];
+            [self logMsg:@\"%@ 评论面板没开（%.0f），再点一次\", tag, l];
             TDtap(cx, cy);
             usleep(1600 * 1000);
             open = TDregionStats(CGRectMake(120, 668, 180, 12), &l, &c, &r, &d)
-                   && l > 185 && l < 247 && c < 16;
+                   && l > 185 && l < 250 && c < 18;
         }
-        if (!open) { [self logMsg:@"%@ 评论面板打不开，这条跳过", tag]; return; }
+        if (!open) { [self logMsg:@\"%@ 评论面板打不开，这条跳过\", tag]; return; }
 
-        // 2) 点「图片」→ 相册
+        // 2) 点一下输入条，把键盘叫起来（图片按钮只有键盘弹起后才在）
+        if (!TDkeyboardUp()) {
+            TDtap(ix, iy);
+            usleep(1100 * 1000);
+        }
+        if (!TDkeyboardUp()) {
+            [self logMsg:@\"%@ 键盘没起来（找不到红色发送），这条跳过\", tag];
+            closePanel();
+            return;
+        }
+
+        // 3) 点「图片」→ 相册
         TDtap(mx, my);
         usleep(2100 * 1000);
         double l2 = 0, c2 = 0, r2 = 0, d2 = 0;
         BOOL album = TDregionStats(CGRectMake(150, 52, 200, 20), &l2, &c2, &r2, &d2) && l2 > 225;
         if (!album) {
-            [self logMsg:@"%@ 相册没打开（%.0f），再点一次", tag, l2];
+            [self logMsg:@\"%@ 相册没打开（%.0f），再点一次\", tag, l2];
             TDtap(mx, my);
             usleep(2100 * 1000);
             album = TDregionStats(CGRectMake(150, 52, 200, 20), &l2, &c2, &r2, &d2) && l2 > 225;
         }
-        if (!album) { [self logMsg:@"%@ 相册打不开，这条跳过", tag]; closePanel(); return; }
+        if (!album) { [self logMsg:@\"%@ 相册打不开，这条跳过\", tag]; closePanel(); return; }
 
-        // 3) 切多选：单选模式下点格子会直接返回，点不到多个
+        // 4) 切多选：单选模式下点格子会直接返回，选不到多张
         TDtap(ux, uy);
         usleep(1200 * 1000);
 
-        // 4) 挨个点圆圈（点格子本体只会进预览页）
+        // 5) 挨个点格子选图（多选模式下点格子本体就是勾选，不必精确点小圆圈）
+        NSInteger picked = 0;
         for (NSArray *pt in cells) {
             if (![pt isKindOfClass:[NSArray class]] || pt.count < 2) continue;
             TDtap([pt[0] doubleValue], [pt[1] doubleValue]);
+            picked++;
             usleep(750 * 1000);
         }
+        if (picked == 0) { [self logMsg:@\"%@ 没给要选哪几张图，这条跳过\", tag]; closePanel(); return; }
 
-        // 5) 下一步
+        // 6) 下一步
         TDtap(nx, ny);
         usleep(2000 * 1000);
 
-        // 6) 校验：缩略图真的挂上了（那一块不再是灰底，彩度会明显上来）
+        // 7) 校验：缩略图真的挂上了（那块不再是纯灰底，彩度会明显上来）
         double l3 = 0, c3 = 0, r3 = 0, d3 = 0;
-        BOOL hasImg = TDregionStats(CGRectMake(36, 326, 140, 36), &l3, &c3, &r3, &d3) && c3 > 14;
-        if (!hasImg) { [self logMsg:@"%@ 图片没挂上（彩度 %.0f），这条跳过", tag, c3]; closePanel(); return; }
+        BOOL hasImg = TDregionStats(CGRectMake(36, 320, 150, 46), &l3, &c3, &r3, &d3) && c3 > 12;
+        if (!hasImg) { [self logMsg:@\"%@ 图片没挂上（彩度 %.0f），这条跳过\", tag, c3]; closePanel(); return; }
 
-        // 7) 粘贴话术：切前台写剪贴板 → 切回抖音 → 点输入框 → ⌘A → ⌘V
-        BOOL wrote = TDPasteIntoOtherApp(txt, app, YES, CGPointMake(ix, iy), YES);
+        // 8) 贴话术：切前台写剪贴板 → 切回抖音 → ⌘A 全选 → ⌘V。
+        //    键盘还弹着就别再点输入框了（会点到键盘上），光标本来就在里面。
+        BOOL kbdNow = TDkeyboardUp();
+        BOOL wrote = TDPasteIntoOtherApp(txt, app, !kbdNow,
+                                        CGPointMake(ix, iy), YES);
         usleep(900 * 1000);
 
-        // 8) 校验文字落进去了（挂了图之后正文在 y≈266..294，黑字；占位符是灰的）
+        // 9) 校验文字落进去了（编辑区里有黑字 = 真的贴上了）
         BOOL landed = NO;
         for (int i = 0; i < 8 && !landed; i++) {
             double l4 = 0, c4 = 0, r4 = 0, d4 = 0;
-            if (TDregionStats(CGRectMake(36, 266, 210, 28), &l4, &c4, &r4, &d4)) landed = (d4 > 0.010);
+            if (TDregionStats(CGRectMake(40, 262, 230, 44), &l4, &c4, &r4, &d4)) landed = (d4 > 0.008);
             if (!landed) usleep(320 * 1000);
         }
         if (!wrote || !landed) {
-            [self logMsg:@"%@ 文字没落进输入框（剪贴板%@），不发送", tag, wrote ? @"✓" : @"✗"];
+            [self logMsg:@\"%@ 文字没落进输入框（剪贴板%@），不发送\", tag, wrote ? @\"✓\" : @\"✗\"];
             closePanel();
-            return;
+            return;                          // 绝不发空评论
         }
 
-        // 9) 发送
+        // 10) 发送
         TDtap(sx, sy);
         usleep(2400 * 1000);
 
-        // 10) 校验：面板里应该看得到刚发出去的文案
+        // 11) 校验：面板里应该看得到刚发出去的文案
         BOOL seen = NO;
         NSString *key = txt.length > 6 ? [txt substringToIndex:6] : txt;
         for (int i = 0; i < 2 && !seen; i++) {
             NSArray *lines = TDocrLines(TDscreenshot());
             for (NSDictionary *ln in lines) {
-                NSString *str = [ln[@"s"] isKindOfClass:[NSString class]] ? ln[@"s"] : @"";
+                NSString *str = [ln[@"s"] isKindOfClass:[NSString class]] ? ln[@"s"] : @\"\";
                 if (str.length && [str containsString:key]) { seen = YES; break; }
             }
             if (!seen) usleep(700 * 1000);
         }
-        [self logMsg:@"%@ 评论%@：%@", tag, seen ? @"已发出" : @"未确认（OCR 没看到）", txt];
+        [self logMsg:@\"%@ 评论%@：%@\", tag, seen ? @\"已发出\" : @\"未确认（OCR 没看到）\", txt];
 
-        // 11) 返回（下拉收面板）
+        // 12) 返回（下拉收面板）
         closePanel();
         usleep((useconds_t)(interval * 1000));
         return;
