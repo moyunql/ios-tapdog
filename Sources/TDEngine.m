@@ -684,13 +684,25 @@ static CGPoint TDJitter(CGPoint p, double r) {
             UIImage *liveTpl = [UIImage imageWithContentsOfFile:
                                 [dirL stringByAppendingPathComponent:@"tpl_live.png"]];
             if (liveTpl) {
-                // 连着几张直播卡是常态：这台机器的推荐流一次能刷出一串直播 + 汽车广告，
-                // 实测连划三条还是直播。给到六条，再不行才认栽放弃本轮。
+                // 「直播中」这张小标签只有 80x40，日志里连着报出 0.82~0.96 一堆命中，
+                // 但用户当场指出那些页面其实是普通视频 —— 小模板在别的粉色元素上
+                // 很容易假阳性。所以加一道硬判据：直播卡右侧没有点赞/评论那一竖排
+                // 图标。**认得出评论图标就一定是视频页**，标签再像也不划走。
+                NSString *dirC = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+                UIImage *ctC = [UIImage imageWithContentsOfFile:[dirC stringByAppendingPathComponent:@"tpl_comment.png"]];
+                // 连着几张直播卡是常态（一次能刷出一串），给到六条再认栽。
                 for (int i = 0; i < 6; i++) {
-                    TDMatch *lm = TDfindImageSmartInRect(liveTpl, @"tpl_live", 0.80,
+                    TDMatch *lm = TDfindImageSmartInRect(liveTpl, @"tpl_live", 0.88,
                                                          CGRectMake(0, 470, 300, 230), NULL);
                     if (!lm) break;
-                    [self logMsg:@"%@ 认出直播卡（相似度 %.2f），划走这条", tag, lm.score];
+                    TDMatch *cm = ctC ? TDfindImageSmartInRect(ctC, @"tpl_comment", 0.70,
+                                                              CGRectMake(330, 240, 84, 440), NULL) : nil;
+                    if (cm) {
+                        [self logMsg:@"%@ 有「直播中」字样但认出评论图标（%.2f），按普通视频处理",
+                                      tag, cm.score];
+                        break;
+                    }
+                    [self logMsg:@"%@ 认出直播卡（标 %.2f，无评论图标），划走这条", tag, lm.score];
                     TDswipe(CGPointMake(207, 600), CGPointMake(207, 160), 0.26);
                     usleep(1800 * 1000);
                     if (i == 5) {
