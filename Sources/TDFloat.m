@@ -881,7 +881,7 @@ void TDFloatSetVisible(BOOL on) {
 /// 「图片」按钮 (28,396) 和相册第一行的选图圆圈 (79/183,386) —— 脚本连按钮
 /// 都点不到。挪到顶部中间 (y≈26..100) 后，视频页那只盖住「直播/团购」标签，
 /// 评论面板盖住「大家都在搜」横幅，相册盖住相册名 —— 这三处脚本都不点。
-static CGRect gParkSaved = CGRectZero;
+static CGRect gParkSaved;
 static BOOL gParked = NO;
 
 void TDFloatParkTop(void) {
