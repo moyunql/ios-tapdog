@@ -187,8 +187,14 @@ extern UIViewController *TDCreateMainVC(void);
             TDLog(@"回到 App，取点已结束并保存");
         }
         if ([TDEngine shared].running) {
-            [[TDEngine shared] stop];
-            TDLog(@"回到 App，已停止回放");
+            // 例外：脚本自己为了写剪贴板把本 App 拉到了前台。
+            // 这不是「用户回来了」，停掉的话脚本贴完字就没了（以前就栽在这）。
+            if (TDPasteSelfBusy()) {
+                TDLog(@"回到 App（脚本自己贴字，不停回放）");
+            } else {
+                [[TDEngine shared] stop];
+                TDLog(@"回到 App，已停止回放");
+            }
         }
         // 回放中途被打断时，最后一次 up 可能没发出去 —— 手指会一直「按着」，
         // 表现为整个屏幕连人手都点不动。回来先把它抬起来。

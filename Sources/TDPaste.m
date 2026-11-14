@@ -3,6 +3,17 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+// 「脚本自己在贴字」窗口期，见 TD.h 里的说明。
+// 用时间戳而不是布尔：didBecomeActive 是异步投到主队列的，粘贴函数跑完把标志
+// 清掉之后那次回调可能才轮到执行 —— 布尔会被它看见「已经结束」而误停脚本。
+// 留 4 秒尾巴，回调再慢也落在这个窗口里。
+static CFAbsoluteTime gTDselfStamp = 0;
+BOOL TDPasteSelfBusy(void) {
+    if (gTDselfStamp <= 0) return NO;
+    return (CFAbsoluteTimeGetCurrent() - gTDselfStamp) < 4.5;
+}
+void TDPasteSetSelfBusy(BOOL busy) { gTDselfStamp = CFAbsoluteTimeGetCurrent(); (void)busy; }
+
 // ---------------------------------------------------------------------------
 // 评论池 + 粘贴
 //
@@ -238,6 +249,45 @@ static BOOL TDwaitActive(int ticks) {          // 每 tick 200ms
     return NO;
 }
 
+/// 已知 App 的 bundleID。切回去要用它，别用 URL scheme。
+static NSString *TDBundleIDForAppURL(NSString *url) {
+    if (url.length == 0) return nil;
+    if ([url hasPrefix:@"snssdk1128"]) return @"com.ss.iphone.ugc.Aweme";   // 抖音
+    if ([url hasPrefix:@"tapdog"])     return @"com.local.tapdog";
+    return nil;
+}
+
+/// 把另一个 App 拉到前台。
+/// 优先 bundleID（只是把已在后台运行的 App 提上来，不走 URL 路由，
+/// 页面状态原样保留 —— 评论区开着就还是评论区）；
+/// 认不出 bundleID 才退回 openURL scheme（scheme 可能把 App 导航到首页）。
+static BOOL TDForegroundAppURL(NSString *appURL) {
+    if (appURL.length == 0) return NO;
+    NSString *bid = TDBundleIDForAppURL(appURL);
+    if (bid.length) {
+        Class wsCls = NSClassFromString(@"LSApplicationWorkspace");
+        if (wsCls) {
+            id (*msgSend0)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+            void (*msgSend1)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
+            id ws = msgSend0(wsCls, sel_registerName("defaultWorkspace"));
+            if (ws) {
+                msgSend1(ws, sel_registerName("openApplicationWithBundleID:"), bid);
+                for (int i = 0; i < 12; i++) {          // 最多等 2.4s
+                    usleep(200 * 1000);
+                    if ([UIApplication sharedApplication].applicationState
+                        == UIApplicationStateBackground) return YES;
+                }
+            }
+        }
+    }
+    NSURL *back = [NSURL URLWithString:appURL];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[UIApplication sharedApplication] openURL:back options:@{} completionHandler:nil];
+    });
+    usleep(1700 * 1000);
+    return YES;
+}
+
 BOOL TDForegroundSelf(int *via) {
     if (via) *via = 0;
     // 路一：自己的 URL scheme
@@ -270,19 +320,20 @@ BOOL TDPasteIntoOtherApp(NSString *text, NSString *appURL, BOOL tapAnchor,
     if (text.length == 0) return NO;
 
     int via = 0;
+    // 进前台这件事会被 AppDelegate 的 didBecomeActive 看见，它会顺手停引擎。
+    // 先亮明身份，全程结束后再熄。
+    TDPasteSetSelfBusy(YES);
     BOOL front = TDForegroundSelf(&via);
+    TDPasteSetSelfBusy(YES);   // 自前台可能等了好几秒，重新刷一次窗口
     BOOL wrote = front ? TDPasteCopyToClipboard(text) : NO;
     TDLog(@"落字：自前台 方式=%d 剪贴板=%@", via, wrote ? @"已写入" : @"写入失败");
-    if (!wrote) return NO;
+    if (!wrote) { TDPasteSetSelfBusy(NO); return NO; }
     usleep(250 * 1000);
 
     if (appURL.length) {
-        NSURL *back = [NSURL URLWithString:appURL];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [[UIApplication sharedApplication] openURL:back options:@{} completionHandler:nil];
-        });
-        usleep(1700 * 1000);
+        TDForegroundAppURL(appURL);
     }
+    TDPasteSetSelfBusy(YES);   // 刷新窗口：切回目标 App 也是一次回到前台
     if (tapAnchor) {
         TDtap(anchor.x, anchor.y);
         usleep(560 * 1000);
@@ -293,6 +344,7 @@ BOOL TDPasteIntoOtherApp(NSString *text, NSString *appURL, BOOL tapAnchor,
     }
     TDsendCmdV();              // ⌘V 粘贴
     usleep(200 * 1000);
+    TDPasteSetSelfBusy(NO);
     return YES;
 }
 

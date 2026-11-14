@@ -163,6 +163,13 @@ NSArray<NSString *> *TDclipTryWrite(NSString *text);
 /// 把自己拉到前台（系统只让前台 App 写剪贴板）。via: 1=scheme 2=LSWorkspace 0=失败
 BOOL TDForegroundSelf(int *via);
 
+/// 「脚本自己把本 App 拉前台」的窗口期。
+/// 贴字必须先回前台写剪贴板，而回到前台会触发 didBecomeActive —— 那里为了
+/// 防「用户在 App 界面上被乱点」会停引擎，结果脚本刚贴完字就把自己停了。
+/// 这个标志就是告诉那次 didBecomeActive：是我自己，别停。
+BOOL TDPasteSelfBusy(void);
+void TDPasteSetSelfBusy(BOOL busy);
+
 /// 写剪贴板并把文字粘进「另一个 App」的输入框。
 /// appURL 为空 = 不切 App；tapAnchor = 切回去后先点一下把光标放好；clearFirst = 先 ⌘A 全选
 BOOL TDPasteIntoOtherApp(NSString *text, NSString *appURL, BOOL tapAnchor,

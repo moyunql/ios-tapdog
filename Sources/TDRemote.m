@@ -553,6 +553,30 @@ static NSDictionary *TDexecCommand(NSDictionary *cmd) {
         return @{@"ok": @1, @"msg": TDHIDDiagReport()};
     }
 
+    // 量一块区域的颜色：脚本里所有「面板开没开 / 发送变没变红 / 下一步有没有」
+    // 都靠这几条读数判，调阈值时不用一遍遍改代码重装。
+    //   {c:"probe", r:[x,y,w,h]}            量一块
+    //   {c:"probe", rs:[[x,y,w,h],…]}       一次量几块
+    // 返回：亮(0-255) 彩(饱和度) 红(红色像素占比) 暗(暗像素占比)
+    if ([c isEqualToString:@"probe"]) {
+        NSArray *rs = cmd[@"rs"];
+        if (![rs isKindOfClass:[NSArray class]]) {
+            rs = cmd[@"r"] ? @[cmd[@"r"]] : @[];
+        }
+        NSMutableArray *out = [NSMutableArray array];
+        for (NSArray *r in rs) {
+            if (![r isKindOfClass:[NSArray class]] || r.count < 4) continue;
+            double l = 0, ch = 0, rd = 0, dk = 0;
+            BOOL ok = TDregionStats(CGRectMake([r[0] doubleValue], [r[1] doubleValue],
+                                               [r[2] doubleValue], [r[3] doubleValue]),
+                                    &l, &ch, &rd, &dk);
+            [out addObject:[NSString stringWithFormat:@"(%@,%@ %@x%@) %@ 亮%.0f 彩%.0f 红%.2f 暗%.2f",
+                            r[0], r[1], r[2], r[3], ok ? @"" : @"取不到",
+                            l, ch, rd, dk]];
+        }
+        return @{@"ok": @1, @"msg": out.count ? [out componentsJoinedByString:@"\n"] : @"没给矩形"};
+    }
+
     if ([c isEqualToString:@"paste"]) {
         // 自前台写剪贴板 → 切回目标 App → 点输入框 → ⌘A → ⌘V，一条命令走完
         NSString *s = [cmd[@"s"] isKindOfClass:[NSString class]] ? cmd[@"s"] : @"";

@@ -760,11 +760,17 @@ static CGPoint TDJitter(CGPoint p, double r) {
 
         // 7) 回到编辑框：缩略图挂上了，键盘可能被收起 —— 用「图片」图标判断，
         //    没弹就再点一下输入条。贴文案前必须让它重新弹起来。
+        //    点一次不够：相册关掉→缩略图重排→键盘上推，这一串动画 1.3 秒常常没走完，
+        //    所以给三个候选点轮流试，每轮只判「图片」图标有没有回来。
         TDMatch *mp2 = picTpl ? TDfindImageSmartInRect(picTpl, @"tpl_pic", 0.72, picROI, NULL) : nil;
         if (!mp2) {
-            TDtap(ix, iy);
-            usleep(1300 * 1000);
-            mp2 = picTpl ? TDfindImageSmartInRect(picTpl, @"tpl_pic", 0.72, picROI, NULL) : nil;
+            NSArray *again = @[@[@150, @690], @[@150, @700], @[@207, @695]];
+            for (NSArray *pt in again) {
+                TDtap([pt[0] doubleValue], [pt[1] doubleValue]);
+                usleep(1600 * 1000);
+                mp2 = picTpl ? TDfindImageSmartInRect(picTpl, @"tpl_pic", 0.72, picROI, NULL) : nil;
+                if (mp2) break;
+            }
         }
         [self logMsg:@"%@ 缩略图已挂上，键盘%@", tag, mp2 ? @"已弹起" : @"没起来"];
 
