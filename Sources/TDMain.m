@@ -110,6 +110,10 @@ extern UIViewController *TDCreateMainVC(void);
     // 监听不跑就收不到按键，只能退回音量 KVO 兜底。
     TDKeysInstall();
 
+    // 远程调试通道：把截图/状态/日志写到中转站，从上面取命令执行。
+    // 开关默认开，关了这里就什么都不做（连线程都不起）。
+    TDRemoteStart();
+
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(didEnterBackground)
                                                  name:UIApplicationDidEnterBackgroundNotification

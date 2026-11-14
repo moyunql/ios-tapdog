@@ -475,6 +475,22 @@ NSString *TDBypassJetsam(void);
 
 NSString *TDSandboxStatus(void);
 
+#pragma mark - 远程调试通道
+
+// 用自建服务器中转：设备把截图 / 状态 / 日志写上去，再从上面取命令执行。
+// 开关默认打开（中转站是作者自己的服务器）；关掉就完全不上传任何东西。
+BOOL TDRemoteEnabled(void);
+void TDRemoteSetEnabled(BOOL on);
+/// 启动轮询线程（幂等）。AppDelegate 启动时调一次即可。
+void TDRemoteStart(void);
+/// 设置页那行状态：已连上 / 上行几秒前 / 执行了几条 / 最近错误
+NSString *TDRemoteStatus(void);
+/// 立刻传一张原尺寸截图 + 一次状态（不等定时器）
+void TDRemoteKick(void);
+/// 中转站根地址，形如 http://1.2.3.4:39888/agent
+void TDRemoteSetBase(NSString * _Nullable base);
+NSString *TDRemoteBase(void);
+
 /// 上一次崩溃的堆栈（没有则返回空字符串）
 NSString *TDcrashLogText(void);
 void TDcrashLogClear(void);

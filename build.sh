@@ -30,6 +30,7 @@ libs=(
   -framework AVFoundation
   -framework MediaPlayer
   -framework PhotosUI
+  -framework Vision
   -framework CoreFoundation
   -Wl,-undefined,dynamic_lookup
   -Wl,-headerpad_max_install_names

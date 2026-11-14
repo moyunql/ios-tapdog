@@ -15,9 +15,9 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.19.0</string>
+	<string>1.20.0</string>
 	<key>CFBundleVersion</key>
-	<string>47</string>
+	<string>48</string>
 	<key>MinimumOSVersion</key>
 	<string>15.0</string>
 	<key>CFBundleSupportedPlatforms</key>
@@ -54,6 +54,16 @@
 	</array>
 	<key>UIStatusBarStyle</key>
 	<string>UIStatusBarStyleDarkContent</string>
+	<!-- 远程调试通道走的是自建服务器的 http 明文接口（默认 211.154.18.252:39888）。
+	     ATS 默认会把明文请求直接拦掉。这里整体放开：中转站地址是可以自己改的，
+	     只钉一个域名的话换个 IP 就连不上了，而这是自签给本机用的工具，不走商店审核。 -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<!-- 界面整体是白底黑字，强制 Light：不然系统深色模式下系统控件（键盘、分段控件、
 	     弹窗）会变深色，和白底撞在一起。 -->
 	<key>UIUserInterfaceStyle</key>

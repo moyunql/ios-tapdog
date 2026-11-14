@@ -1371,6 +1371,10 @@ static NSString *TDCalibModeName(NSInteger m) {
 
 #pragma mark - 主界面
 
+// 主表要用到（实现在文件末尾的「远程调试」段）
+@interface TDRemoteVC : UITableViewController
+@end
+
 @interface TDMainVC : UIViewController <UITableViewDataSource, UITableViewDelegate>
 @end
 
@@ -1719,7 +1723,7 @@ static NSString *TDCalibModeName(NSInteger m) {
 }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    return s == 0 ? [TDScriptStore shared].scripts.count : 4;
+    return s == 0 ? [TDScriptStore shared].scripts.count : 5;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
@@ -1751,12 +1755,17 @@ static NSString *TDCalibModeName(NSInteger m) {
             c.textLabel.text = @"注入自检";
             c.detailTextLabel.text = [NSString stringWithFormat:@"点得动吗 · 已注入 %ld 次",
                                       (long)TDInjectCount()];
-        } else {
+        } else if (ip.row == 3) {
             TDConfig *cfg = [TDConfig shared];
             c.textLabel.text = @"全局默认 / 点击偏移";
             c.detailTextLabel.text = [NSString stringWithFormat:@"%@ · 偏移 ±%.0fpt（脚本里设了循环就以脚本为准）",
                                       cfg.loopCount == 0 ? @"无限循环" : [NSString stringWithFormat:@"循环 %ld 次", (long)cfg.loopCount],
                                       cfg.jitterPx];
+        } else {
+            c.textLabel.text = @"远程调试";
+            c.detailTextLabel.text = TDRemoteEnabled()
+                ? [NSString stringWithFormat:@"开着 · %@", TDRemoteStatus()]
+                : @"关着";
         }
         c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     }
@@ -1788,8 +1797,10 @@ static NSString *TDCalibModeName(NSInteger m) {
                                                 animated:YES completion:nil];
     } else if (ip.row == 2) {
         [self.navigationController pushViewController:[TDSelfTestVC new] animated:YES];
-    } else {
+    } else if (ip.row == 3) {
         [self editSettings];
+    } else {
+        [self.navigationController pushViewController:[TDRemoteVC new] animated:YES];
     }
 }
 
@@ -1828,6 +1839,105 @@ static NSString *TDCalibModeName(NSInteger m) {
         [tv reloadData];
         [self refreshButtons];
     }
+}
+
+@end
+
+#pragma mark - 远程调试
+
+@implementation TDRemoteVC {
+    UISwitch *_sw;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"远程调试";
+    self.tableView.backgroundColor = TD_BG;
+    self.tableView.separatorColor = TD_LINE;
+
+    _sw = [[UISwitch alloc] init];
+    _sw.onTintColor = TD_GREEN;
+    _sw.on = TDRemoteEnabled();
+    [_sw addTarget:self action:@selector(toggleSwitch:)
+  forControlEvents:UIControlEventValueChanged];
+}
+
+- (void)toggleSwitch:(UISwitch *)s {
+    TDRemoteSetEnabled(s.isOn);
+    [self.tableView reloadData];
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 2; }
+
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
+    return s == 0 ? @"通道" : @"手动";
+}
+
+- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
+    if (s != 0) return nil;
+    return @"开着的时候，每 10 秒把状态（版本 / 屏幕 / 引擎 / 最近日志）写一份到中转站；"
+            "截图只在你按「立即上传截图」或者远端要求时才传。"
+            "内容只发到你下面填的地址，关掉开关立刻停止。";
+}
+
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
+    return s == 0 ? 2 : 2;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    UITableViewCell *c = [tv dequeueReusableCellWithIdentifier:@"r"];
+    if (!c) c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
+                                          reuseIdentifier:@"r"];
+    c.backgroundColor = TD_CARD;
+    c.textLabel.textColor = TD_TEXT;
+    c.detailTextLabel.textColor = TD_DIM;
+    c.detailTextLabel.numberOfLines = 3;
+    c.accessoryView = nil;
+    c.accessoryType = UITableViewCellAccessoryNone;
+
+    if (ip.section == 0 && ip.row == 0) {
+        c.textLabel.text = @"远程调试通道";
+        c.detailTextLabel.text = @"截图 / 日志 / 命令都走自己的服务器中转";
+        c.accessoryView = _sw;
+    } else if (ip.section == 0) {
+        c.textLabel.text = @"当前状态";
+        c.detailTextLabel.text = TDRemoteStatus();
+    } else if (ip.row == 0) {
+        c.textLabel.text = @"立即上传截图";
+        c.detailTextLabel.text = @"传一张原尺寸的当前画面过去";
+    } else {
+        c.textLabel.text = @"中转站";
+        c.detailTextLabel.text = TDRemoteBase();
+    }
+    return c;
+}
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+    if (ip.section == 0) { [tv reloadData]; return; }
+
+    if (ip.row == 0) {
+        TDRemoteKick();
+        [tv reloadData];
+        return;
+    }
+
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"中转站地址"
+                                                              message:@"PHP 文件接口所在目录，例如 http://1.2.3.4:39888/agent"
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *t) {
+        t.text = TDRemoteBase();
+        t.keyboardType = UIKeyboardTypeURL;
+        t.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        t.autocorrectionType = UITextAutocorrectionTypeNo;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction *x) {
+        TDRemoteSetBase(a.textFields[0].text);
+        [self.tableView reloadData];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 @end
