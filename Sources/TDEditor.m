@@ -53,7 +53,8 @@ static NSDictionary<NSString *, NSString *> *TDBuiltinNames(void) {
         m = @{@"tpl_lib_like.png":    @"点赞",
               @"tpl_lib_comment.png": @"评论",
               @"tpl_lib_star.png":    @"收藏",
-              @"tpl_paste.png":       @"粘贴气泡"};
+              @"tpl_paste.png":       @"粘贴气泡",
+              @"tpl_comment.png":     @"评论气泡（当前像素）"};
     }
     return m;
 }

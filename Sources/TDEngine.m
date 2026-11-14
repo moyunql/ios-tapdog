@@ -490,7 +490,18 @@ static CGPoint TDJitter(CGPoint p, double r) {
     // 点赞：先看心是白的还是红的，红了就跳过 —— 保证重复跑不会把赞取消掉
     if ([t isEqualToString:@"like"]) {
         double x = st[@"x"] ? [st[@"x"] doubleValue] : 379;
-        double y = st[@"y"] ? [st[@"y"] doubleValue] : 328;
+        double y = st[@"y"] ? [st[@"y"] doubleValue] : 343;
+        // 心形就在评论气泡正上方 74pt。同一竖列一起浮动，所以拿评论气泡的
+        // 模板反推心形位置，比另做一套心形模板省事，也不怕「已赞变红」。
+        {
+            NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+            UIImage *ct = [UIImage imageWithContentsOfFile:[dir stringByAppendingPathComponent:@"tpl_comment.png"]];
+            if (ct) {
+                TDMatch *m = TDfindImageSmartInRect(ct, @"tpl_comment", 0.70,
+                                                    CGRectMake(330, 240, 84, 440), NULL);
+                if (m) { x = m.point.x; y = m.point.y - 74; }
+            }
+        }
         CGRect box = CGRectMake(x - 15, y - 15, 30, 30);
         double l = 0, c = 0, red0 = 0, d = 0;
         if (!TDregionStats(box, &l, &c, &red0, &d)) {
@@ -550,8 +561,25 @@ static CGPoint TDJitter(CGPoint p, double r) {
         };
         double l = 0, c = 0, r = 0, d = 0;
 
-        // 1) 点评论气泡，等面板起来
-        TDtap(cx, cy);
+        // 1) 定位评论气泡再点。
+        //    右侧这一竖排图标会随视频文案长短整体上下浮动（文案三行时比一行
+        //    低 20pt），写死坐标迟早点空。用模板找，找不到才退回默认坐标。
+        CGPoint bubble = CGPointMake(cx, cy);
+        {
+            NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+            UIImage *ct = [UIImage imageWithContentsOfFile:[dir stringByAppendingPathComponent:@"tpl_comment.png"]];
+            if (ct) {
+                TDMatch *m = TDfindImageSmartInRect(ct, @"tpl_comment", 0.70,
+                                                    CGRectMake(330, 240, 84, 440), NULL);
+                if (m) {
+                    bubble = m.point;
+                    [self logMsg:@"%@ 评论气泡认在 (%.0f,%.0f)，相似度 %.2f", tag, bubble.x, bubble.y, m.score];
+                } else {
+                    [self logMsg:@"%@ 没认出评论气泡，用默认坐标 (%.0f,%.0f)", tag, cx, cy];
+                }
+            }
+        }
+        TDtap(bubble.x, bubble.y);
         usleep(1500 * 1000);
         BOOL open = TDregionStats(CGRectMake(120, 668, 180, 12), &l, &c, &r, &d)
                     && l > 185 && l < 250 && c < 18;
