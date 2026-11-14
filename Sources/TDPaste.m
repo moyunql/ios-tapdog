@@ -11,17 +11,23 @@
 //   0) Cmd+V         HID 键盘事件。工程上最干净，但这台机器的键盘通道对非平台进程
 //                    是关着的：事件看着发出去了，前台 App 一个都没收到。
 //   1) 长按 + 点菜单  长按输入框 → 系统弹出「拷贝/粘贴」编辑菜单 → 点「粘贴」。
-//   2) 长按 + 识图    同上，但用识图找「粘贴」两个字（需要 tpl_paste.png 模板）。
-//   3) 双击 + 点菜单  双击输入框同样会弹编辑菜单，而且不会触发放大镜 / 顺手选中
-//                    一大片文字，对空输入框比长按更温和 —— 长按不弹菜单就换这个。
+//   2) 长按 + 识图    同上，但用识图找「粘贴」气泡（内置模板 tpl_paste.png）。
+//   3) 双击 + 点菜单  双击输入框弹编辑菜单 → 按偏移点「粘贴」。
+//   4) 双击 + 识图    双击弹菜单 → 识图找「粘贴」气泡再点（默认）。
 //
-// 注意四点：
-//   1) 写剪贴板到系统可见有一小段延迟，写完立刻落字会贴到上一条旧内容（150ms 够）。
-//   2) UIPasteboard 归 UI 侧管，统一回主线程写，免得偶发「写进去了但同步不出去」。
-//   3) 长按/点菜单都会改「上次落点」，粘贴结束要把它还回去，否则连着贴两次会按
-//      上一次菜单的位置去长按。
+// 为什么默认是「双击 + 识图」：本机实测长按只会弹放大镜 / 不弹菜单，
+// 双击才稳定出「粘贴」气泡；气泡位置又跟着光标和键盘高度飘，所以干脆不猜坐标，
+// 直接截屏认「黑底白字『粘贴』」这个小气泡（模板从用户截图里裁的，就在图库内置项里）。
+//
+// 注意五点：
+//   1) 写剪贴板到系统可见有一小段延迟，写完立刻落字会贴到上一条旧内容（160ms 够）。
+//   2) UIPasteboard 归 UI 侧管，统一回主线程读写，写完立刻回读校验一次。
+//   3) 双击/点菜单都会改「上次落点」，粘贴结束要把它还回去，否则连着贴两次会按
+//      上一次菜单的位置去双击。
 //   4) 长按之前先单击一下锚点。脚本里点的是底部「写下你的评论」，那一下只是把
 //      输入框叫出来，焦点不一定在框里；不先点一下就拿不到编辑菜单的「粘贴」。
+//   5) 识图认到的位置必须离输入框不远（气泡一定在输入框上方），否则当误认丢掉，
+//      退回「按偏移点」。
 // ---------------------------------------------------------------------------
 
 static NSString *TDPoolPath(void) {
@@ -90,11 +96,13 @@ NSString *TDCommentPick(void) {
 // 菜单点了就走了系统 pasteboard，和 Cmd+V 效果一样，但全程是触摸注入，
 // 已经验证过能用（脚本里的点击就是它）。
 //
-// 菜单弹在哪儿：长按点的正上方大约 62pt（iOS 编辑菜单跟着光标走）。
-// 屏幕底部输入框、键盘在下面的时候，菜单一定在输入框上方，所以默认 dy = -62。
+// 菜单弹在哪儿：双击点的正上方 40~50pt（iOS 编辑菜单跟着光标走）。
+// 屏幕底部输入框、键盘在下面的时候，菜单一定在输入框上方，所以默认 dy = -46。
+// 但默认那条路是识图，这个偏移只是「认不出来时」的兜底，所以不必调得多准。
 // 每台机器/每个 App 的间距可能差几 pt，所以给了「偏移」可以在评论池页现场调。
 
 static NSString * const kPasteMethodKey = @"tdPasteMethod";
+static NSString * const kPasteVerKey    = @"tdPasteVer";
 static NSString * const kPasteMenuDXKey = @"tdPasteMenuDX";
 static NSString * const kPasteMenuDYKey = @"tdPasteMenuDY";
 static NSString * const kPasteHoldKey   = @"tdPasteHoldMs";
@@ -103,30 +111,38 @@ static NSString * const kPasteAnchorAX  = @"tdPasteAnchorAX";
 static NSString * const kPasteAnchorAY  = @"tdPasteAnchorAY";
 static NSString * const kPasteTplName   = @"tpl_paste.png";
 
+/// 设置版本：v1.17 起默认改成「双击 + 识图」，老安装里存的方式/偏移一并作废
+/// （旧默认是长按 + dy=-62，那套在本机根本没验证通过过，留着只会误导）。
+static const NSInteger kPasteVerNow = 2;
+
 NSInteger TDPasteMethod(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    if ([d objectForKey:kPasteMethodKey] == nil) return 1;   // 默认：长按 + 点菜单
+    if ([d integerForKey:kPasteVerKey] < kPasteVerNow) return 4;
     NSInteger m = [d integerForKey:kPasteMethodKey];
-    return (m < 0 || m > 3) ? 1 : m;
+    return (m < 0 || m > 4) ? 4 : m;
 }
 
 void TDSetPasteMethod(NSInteger m) {
-    if (m < 0 || m > 3) m = 1;
-    [[NSUserDefaults standardUserDefaults] setInteger:m forKey:kPasteMethodKey];
+    if (m < 0 || m > 4) m = 4;
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setInteger:m forKey:kPasteMethodKey];
+    [d setInteger:kPasteVerNow forKey:kPasteVerKey];
 }
 
 NSString *TDPasteMethodDesc(void) {
     switch (TDPasteMethod()) {
         case 0:  return @"Cmd+V";
-        case 2:  return @"长按 + 识图「粘贴」";
+        case 1:  return @"长按 + 点菜单";
+        case 2:  return @"长按 + 识图粘贴";
         case 3:  return @"双击 + 点菜单";
-        default: return @"长按 + 点菜单";
+        default: return @"双击 + 识图粘贴";
     }
 }
 
 CGPoint TDPasteMenuOffset(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    if ([d objectForKey:kPasteMenuDXKey] == nil) return CGPointMake(0, -62);
+    if ([d integerForKey:kPasteVerKey] < kPasteVerNow) return CGPointMake(0, -46);
+    if ([d objectForKey:kPasteMenuDXKey] == nil) return CGPointMake(0, -46);
     return CGPointMake((CGFloat)[d doubleForKey:kPasteMenuDXKey],
                        (CGFloat)[d doubleForKey:kPasteMenuDYKey]);
 }
@@ -136,6 +152,7 @@ void TDPasteSetMenuOffset(CGFloat dx, CGFloat dy) {
     if (dy > -12) dy = -12;      // 往上一点才有意义，贴在手指下面肯定不对
     [d setDouble:dx forKey:kPasteMenuDXKey];
     [d setDouble:dy forKey:kPasteMenuDYKey];
+    [d setInteger:kPasteVerNow forKey:kPasteVerKey];
 }
 
 double TDPasteHoldMs(void) {
@@ -200,12 +217,71 @@ static CGPoint TDPasteBottomAnchor(void) {
     return CGPointMake(sb.width / 2.0 + off.x, sb.height + off.y);
 }
 
-static void TDPasteWriteClipboard(NSString *text) {
+#pragma mark - 剪贴板
+
+/// 写剪贴板 + 立刻回读。返回 NO 说明要么没写进去，要么被系统同步吃了 ——
+/// 这两种情况在「粘贴出来的还是上一句」时很难分清，所以直接把它记进日志。
+BOOL TDPasteCopyToClipboard(NSString *text) {
+    if (text.length == 0) return NO;
     void (^put)(void) = ^{
         [UIPasteboard generalPasteboard].string = text;
     };
     if ([NSThread isMainThread]) put();
     else dispatch_sync(dispatch_get_main_queue(), put);
+
+    NSString *back = [UIPasteboard generalPasteboard].string;
+    return [back isEqualToString:text];
+}
+
+NSString *TDPasteClipboardText(void) {
+    __block NSString *s = nil;
+    void (^get)(void) = ^{ s = [UIPasteboard generalPasteboard].string; };
+    if ([NSThread isMainThread]) get();
+    else dispatch_sync(dispatch_get_main_queue(), get);
+    if (s.length > 40) s = [[s substringToIndex:40] stringByAppendingString:@"…"];
+    return s ?: @"";
+}
+
+#pragma mark - 识图找「粘贴」
+
+/// 截屏找「粘贴」气泡，认到了就点。找到返回 YES。
+/// 模板优先用 Documents 里那份（用户可以在图库换掉），没有就用 bundle 里的内置图。
+static BOOL TDPasteTapPasteBubble(CGPoint near, double threshold) {
+    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    UIImage *tpl = [UIImage imageWithContentsOfFile:
+                    [(dir ?: NSTemporaryDirectory()) stringByAppendingPathComponent:kPasteTplName]];
+    if (!tpl) {
+        NSString *src = [[NSBundle mainBundle] pathForResource:@"tpl_paste"
+                                                        ofType:@"png"
+                                                   inDirectory:@"tpl"];
+        if (src) tpl = [UIImage imageWithContentsOfFile:src];
+    }
+    if (!tpl) {
+        TDLog(@"粘贴：没找到「粘贴」模板（tpl_paste.png）→ 按偏移点");
+        return NO;
+    }
+
+    // 菜单弹出有动画，一次认不到不代表没有：隔 300ms 再认，最多三次
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt) usleep(300 * 1000);
+        TDMatch *m = TDfindImageSmart(tpl, kPasteTplName, threshold, NULL);
+        if (!m) continue;
+
+        // 气泡一定在输入框上方不远处。认到屏幕别处的「白字黑底」（视频字幕之类）就当误认。
+        BOOL nearOK = fabs(m.point.x - near.x) < 220 &&
+                      m.point.y < near.y + 60 && m.point.y > 30;
+        if (!nearOK) {
+            TDLog(@"粘贴：识图认出「粘贴」但在 (%.0f,%.0f)，离输入框 (%.0f,%.0f) 太远 → 当误认",
+                  m.point.x, m.point.y, near.x, near.y);
+            continue;
+        }
+        TDtap(m.point.x, m.point.y);
+        TDLog(@"粘贴：识图点到「粘贴」气泡 (%.0f,%.0f) 相似度 %.2f · 尺度 %.2f",
+              m.point.x, m.point.y, m.score, m.scale);
+        return YES;
+    }
+    TDLog(@"粘贴：三次都没认出「粘贴」气泡（阈值 %.2f）→ 按偏移点", threshold);
+    return NO;
 }
 
 /// 在 anchor 处粘贴一条文本。anchor 只是「上次落点」的候选，
@@ -213,7 +289,10 @@ static void TDPasteWriteClipboard(NSString *text) {
 void TDPasteTextAt(NSString *text, CGPoint anchor) {
     if (text.length == 0) return;
 
-    TDPasteWriteClipboard(text);
+    if (!TDPasteCopyToClipboard(text)) {
+        TDLog(@"粘贴：剪贴板回读和要贴的内容不一致（系统可能还没同步完）");
+    }
+    TDLog(@"粘贴：剪贴板已写入 %lu 字", (unsigned long)text.length);
 
     NSInteger method = TDPasteMethod();
     CGPoint a = anchor;
@@ -228,59 +307,48 @@ void TDPasteTextAt(NSString *text, CGPoint anchor) {
         }
     }
 
-    usleep(150 * 1000);     // 等剪贴板同步出去，太急会贴到旧内容
+    usleep(160 * 1000);     // 等剪贴板同步出去，太急会贴到旧内容
 
     if (method == 0) {
         TDsendCmdV();
         return;
     }
 
-    // 长按和点菜单都会改「上次落点」，跑完要还回去 ——
-    // 否则一条脚本里连着两次粘贴，第二次会按上次菜单的位置去长按。
+    // 双击和点菜单都会改「上次落点」，跑完要还回去 ——
+    // 否则一条脚本里连着两次粘贴，第二次会按上次菜单的位置去双击。
     BOOL hadKeep = TDLastTapPointReady();
     CGPoint keep = TDLastTapPoint();
 
-    if (method == 3) {
-        // 双击：间隔必须短（>300ms 系统就不认成双击了），800ms 后菜单一定出来了
+    BOOL dbl = (method == 3 || method == 4);
+    if (dbl) {
+        // 双击：两下间隔必须短（>300ms 系统就不认成双击了）
         TDtap(a.x, a.y);
         usleep(85 * 1000);
         TDtap(a.x, a.y);
-        usleep(680 * 1000);
-        TDLog(@"粘贴：双击 (%.0f,%.0f) 等菜单", a.x, a.y);
+        usleep(760 * 1000);     // 等编辑菜单浮出来（双击比长按慢一点）
     } else {
         // 先单击拿焦点：脚本里点「评论」只是把输入框叫出来，光标不一定在框里；
         // 没有焦点时长按只会弹放大镜，不会给「粘贴」菜单。
         TDtap(a.x, a.y);
         usleep(230 * 1000);
         TDlongPress(a.x, a.y, MAX(0.5, TDPasteHoldMs() / 1000.0));
-        usleep(720 * 1000);     // 等编辑菜单浮出来
+        usleep(760 * 1000);
     }
 
-    if (method == 2) {
-        NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-        UIImage *tpl = [UIImage imageWithContentsOfFile:
-                        [(dir ?: NSTemporaryDirectory()) stringByAppendingPathComponent:kPasteTplName]];
-        if (tpl) {
-            TDMatch *m = TDfindImageSmart(tpl, kPasteTplName, 0.70, NULL);
-            if (m) {
-                TDtap(m.point.x, m.point.y);
-                TDLog(@"粘贴：识图点到「粘贴」（%.2f）", m.score);
-                usleep(150 * 1000);
-                if (hadKeep) TDSetLastTapPoint(keep);
-                return;
-            }
-            TDLog(@"粘贴：菜单里没认出「粘贴」→ 按偏移点（菜单偏移可调）");
-        } else {
-            TDLog(@"粘贴：还没 %@ 模板（截一张菜单截图框出「粘贴」存成它）→ 按偏移点", kPasteTplName);
-        }
+    BOOL done = NO;
+    if (method == 2 || method == 4) {
+        done = TDPasteTapPasteBubble(a, 0.62);
     }
 
-    CGPoint off = TDPasteMenuOffset();
-    TDtap(a.x + off.x, a.y + off.y);
-    TDLog(@"粘贴：%@ (%.0f,%.0f)［%@］→ 点菜单 (%.0f,%.0f)",
-          method == 3 ? @"双击" : @"长按", a.x, a.y, TDPasteAnchorDesc(),
-          a.x + off.x, a.y + off.y);
-    usleep(150 * 1000);
+    if (!done) {
+        CGPoint off = TDPasteMenuOffset();
+        TDtap(a.x + off.x, a.y + off.y);
+        TDLog(@"粘贴：%@ (%.0f,%.0f)［%@］→ 按偏移点菜单 (%.0f,%.0f)",
+              dbl ? @"双击" : @"长按", a.x, a.y, TDPasteAnchorDesc(),
+              a.x + off.x, a.y + off.y);
+    }
+
+    usleep(180 * 1000);
     if (hadKeep) TDSetLastTapPoint(keep);
 }
 

@@ -40,20 +40,27 @@ static NSString *TDTplPath(NSString *name) {
     return [TDDocsDir() stringByAppendingPathComponent:name ?: @""];
 }
 
-// 内置模板（点赞 / 评论 / 收藏）
+// 内置模板（点赞 / 评论 / 收藏 / 粘贴气泡）
 //
 // build.sh 把 Resources/tpl 打进 bundle 的 tpl/ 目录，这里在每次启动时补拷到 Documents：
 // 只在「文件不存在」且「没被用户主动删过」时拷 —— 首次安装能开箱即用，
 // 用户真不想要就删，删了记进黑名单，不会再被塞回来。
 // 文件名前缀 tpl_lib_ 是标记：库里显示中文名、排最前。
+// tpl_paste.png 是「粘贴」气泡（黑底白字），给粘贴步骤的识图用，不是给识别目标用的。
 static NSDictionary<NSString *, NSString *> *TDBuiltinNames(void) {
     static NSDictionary *m = nil;
     if (!m) {
         m = @{@"tpl_lib_like.png":    @"点赞",
               @"tpl_lib_comment.png": @"评论",
-              @"tpl_lib_star.png":    @"收藏"};
+              @"tpl_lib_star.png":    @"收藏",
+              @"tpl_paste.png":       @"粘贴气泡"};
     }
     return m;
+}
+
+/// 粘贴专用的那张图：不进「检查哪张图」那种目标选择列表
+static BOOL TDTplIsPaste(NSString *file) {
+    return [file isEqualToString:@"tpl_paste.png"];
 }
 
 BOOL TDTplIsBuiltin(NSString *file) {
@@ -88,7 +95,7 @@ void TDInstallBuiltinTemplates(void) {
         if (!src) continue;
         if ([fm copyItemAtPath:src toPath:dst error:NULL]) copied++;
     }
-    if (copied > 0) TDLog(@"内置识图模板已装入 %ld 个（点赞/评论/收藏）", (long)copied);
+    if (copied > 0) TDLog(@"内置识图模板已装入 %ld 个（点赞/评论/收藏/粘贴气泡）", (long)copied);
 }
 
 static NSArray<NSString *> *TDTemplateList(void) {
@@ -645,7 +652,8 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
     if (s == 2) return @"压力/半径默认关：之前实测这台机器只认「压力 0 / 半径 0.04」，开了可能点不动。";
     if (s == 1 && _kind == KPaste)
-        return @"「粘贴」是写剪贴板 + 发 Cmd+V，所以前面必须先有一步把评论框点开（获取焦点）。"
+        return @"「粘贴」= 写剪贴板 → 双击评论框 → 点系统菜单里的「粘贴」（默认还会识图找那个气泡）。"
+                "所以前面必须先有一步把评论框点开。"
                 "文本留空就用评论池里随机的一条 —— 话术池在脚本编辑页的「评论池」里维护。";
     if (s == 1 && _imgMode)
         return @"模板可以截屏框选，也可以从相册传一张截图；画面会变的（直播/视频）尽量框静态按钮。";
@@ -856,9 +864,8 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
     if (tf.tag == -1) _pasteText = [tf.text copy] ?: @"";
 }
 
-/// 现场试一次粘贴：把这句话写进剪贴板再发 Cmd+V。
-/// 让用户在抖音评论框里先点开输入框，回来按这个，看字有没有进去 ——
-/// 这一步能把「键盘通道通不通」和「脚本写错没错」彻底分开。
+/// 现场试一次粘贴：写好剪贴板，4 秒后切到抖音那边落字。
+/// 双击/长按都必须在目标 App 里做，在这个页面上按是没用的，所以统一延迟。
 - (void)tryPaste {
     [self.view endEditing:YES];
     NSString *txt = _pasteText.length ? _pasteText : TDCommentPick();
@@ -870,17 +877,39 @@ static NSDictionary *RowNum(TDField f, NSString *title, NSString *unit, BOOL dec
         [self presentViewController:a animated:YES completion:nil];
         return;
     }
-    TDPasteText(txt);
-    NSString *msg = [NSString stringWithFormat:
-                     @"已写好剪贴板，按「%@」发了一次：\n「%@」\n\n"
-                      "想在抖音里看效果：用「▶ 试运行整条脚本」，前面要有一步先点开评论框。\n"
-                      "「长按 + 点菜单 / 识图」这两种必须在抖音里做，在这里按不出效果。",
-                     TDPasteMethodDesc(), txt];
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"已尝试粘贴"
-                                                              message:msg
-                                                       preferredStyle:UIAlertControllerStyleAlert];
+
+    NSInteger m = TDPasteMethod();
+    if (m == 0) {
+        TDPasteText(txt);
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:@"已发了一次 Cmd+V"
+                             message:[NSString stringWithFormat:@"「%@」\n\n先切到抖音、点开输入框再发，否则字没地方落。", txt]
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+        return;
+    }
+
+    NSString *show = txt.length > 16 ? [[txt substringToIndex:16] stringByAppendingString:@"…"] : txt;
+    NSString *act = (m == 3 || m == 4) ? @"双击" : @"单击 + 长按";
+    NSString *how = (m == 2 || m == 4) ? @"识图认「粘贴」气泡再点它（认不到才按偏移点）"
+                                       : @"按偏移点「粘贴」";
+    __weak typeof(self) ws = self;
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"4 秒后落字"
+                         message:[NSString stringWithFormat:
+                                  @"「%@」\n\n现在切到抖音 → 点开评论框（光标在框里）→ 等 4 秒。\n\n"
+                                  @"动作：在%@上%@，然后 %@。",
+                                  show, TDPasteAnchorDesc(), act, how]
+                  preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        typeof(self) ss = ws;
+        if (ss) TDPasteTextAt(txt, TDLastTapPoint());
+    });
 }
 
 - (void)modeChanged:(UISegmentedControl *)seg {
@@ -1703,6 +1732,8 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
     }]];
 
     for (NSString *n in list) {
+        // 「粘贴气泡」是粘贴步骤自己用的，不该出现在「判断哪张图在不在」里
+        if (TDTplIsPaste(n)) continue;
         NSString *disp = TDTplDisplay(n);
         if ([n isEqualToString:cur]) disp = [disp stringByAppendingString:@"  ✓"];
         [a addAction:[UIAlertAction actionWithTitle:disp style:UIAlertActionStyleDefault
@@ -1841,6 +1872,7 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
     UIButton *_tryBtn;
     UIButton *_modeBtn;
     UIButton *_anchorBtn;
+    UIButton *_copyBtn;
 }
 
 - (void)viewDidLoad {
@@ -1857,7 +1889,7 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
 
     _hint = [[UILabel alloc] initWithFrame:CGRectZero];
     _hint.text = @"一行一条，回放时随机取一条。以 # 开头的行当备注。\n"
-                  @"下面两个按钮：粘贴方式（点切 / 长按调菜单偏移）、锚点（点切 / 长按调位置）。";
+                  @"底部：粘贴方式（点切 / 长按调偏移）、锚点（点切 / 长按调位置）、复制一条到剪贴板。";
     _hint.font = [UIFont systemFontOfSize:12];
     _hint.textColor = ED_DIM;
     _hint.numberOfLines = 2;
@@ -1912,6 +1944,19 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
         [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(onAnchorOffset:)]];
     [self.view addSubview:_anchorBtn];
     [self refreshAnchorBtn];
+
+    // 复制一条到剪贴板：回放时程序就是这么干的（写剪贴板 → 双击输入框 → 点「粘贴」）。
+    // 这个按钮只复制、不落字，用来确认「程序到底有没有把话术拷进剪贴板」。
+    _copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_copyBtn setTitleColor:ED_ACCENT forState:UIControlStateNormal];
+    _copyBtn.titleLabel.font = [UIFont systemFontOfSize:12.5];
+    _copyBtn.backgroundColor = ED_CARD;
+    _copyBtn.layer.cornerRadius = 10;
+    _copyBtn.layer.borderWidth = 1;
+    _copyBtn.layer.borderColor = ED_LINE.CGColor;
+    [_copyBtn addTarget:self action:@selector(onCopy) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_copyBtn];
+    [self refreshCopyBtn];
 }
 
 - (void)viewDidLayoutSubviews {
@@ -1927,27 +1972,59 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
     CGFloat tvTop = CGRectGetMaxY(_hint.frame) + 6;
     CGFloat barH = 46;
     CGFloat anchH = 34;
-    _tv.frame = CGRectMake(14, tvTop, w - 28, bottom - barH - anchH - 16 - tvTop);
+    CGFloat copyH = 32;
+    _tv.frame = CGRectMake(14, tvTop, w - 28,
+                           bottom - barH - anchH - copyH - 24 - tvTop);
 
     _tryBtn.frame = CGRectMake(14, bottom - barH - 4, 140, barH);
     _modeBtn.frame = CGRectMake(162, bottom - barH - 4, w - 176, barH);
     _anchorBtn.frame = CGRectMake(14, bottom - barH - anchH - 10, w - 28, anchH);
+    _copyBtn.frame = CGRectMake(14, bottom - barH - anchH - copyH - 18, w - 28, copyH);
 }
 
 - (void)refreshModeBtn {
     NSString *extra = @"";
     if (TDPasteMethod() != 0) {
         CGPoint off = TDPasteMenuOffset();
-        extra = [NSString stringWithFormat:@"  偏移 %.0f,%.0f", off.x, off.y];
+        extra = [NSString stringWithFormat:@"  兜底 %.0f,%.0f", off.x, off.y];
     }
     [_modeBtn setTitle:[NSString stringWithFormat:@"粘贴方式：%@%@\n（点切换 · 长按调偏移）",
                         TDPasteMethodDesc(), extra]
               forState:UIControlStateNormal];
 }
 
+- (void)refreshCopyBtn {
+    NSString *clip = TDPasteClipboardText();
+    NSString *show = clip.length ? clip : @"（空）";
+    _copyBtn.titleLabel.font = [UIFont systemFontOfSize:11.5];
+    _copyBtn.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [_copyBtn setTitle:[NSString stringWithFormat:@"复制一条到剪贴板 · 现在：%@", show]
+              forState:UIControlStateNormal];
+}
+
+- (void)onCopy {
+    [self.view endEditing:YES];
+    [self savePool];
+    NSString *txt = TDCommentPick();
+    if (txt.length == 0) {
+        [self alertTitle:@"池是空的" message:@"先写一条话术再试"];
+        return;
+    }
+    BOOL ok = TDPasteCopyToClipboard(txt);
+    [self refreshCopyBtn];
+    NSString *show = txt.length > 16 ? [[txt substringToIndex:16] stringByAppendingString:@"…"] : txt;
+    [self alertTitle:ok ? @"已复制进剪贴板" : @"复制后回读不一致"
+             message:[NSString stringWithFormat:
+                      @"「%@」\n\n剪贴板现在：%@\n\n"
+                      @"这个按钮只负责把字放进剪贴板（回放时程序也是先干这一步）。\n"
+                      @"要真落进评论框，还得靠「%@」那一下 —— 想手动验证就点左边「试粘贴」。",
+                      show, TDPasteClipboardText(), TDPasteMethodDesc()]];
+}
+
 - (void)onCycleMode {
-    // 0 → 1 → 2 → 3 → 0，四种方式轮着来（0 Cmd+V / 1 长按+点菜单 / 2 长按+识图 / 3 双击+点菜单）
-    NSInteger v = (TDPasteMethod() + 1) % 4;
+    // 0 → 1 → 2 → 3 → 4 → 0，五种方式轮着来
+    // 0 Cmd+V / 1 长按+点菜单 / 2 长按+识图 / 3 双击+点菜单 / 4 双击+识图（默认）
+    NSInteger v = (TDPasteMethod() + 1) % 5;
     TDSetPasteMethod(v);
     [self refreshModeBtn];
     TDLog(@"粘贴方式切到：%@", TDPasteMethodDesc());
@@ -2011,8 +2088,8 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
 
     UIAlertController *a = [UIAlertController
         alertControllerWithTitle:@"菜单偏移"
-                         message:@"长按输入框后系统弹出的「粘贴」菜单，相对长按点的位置。\n"
-                                  "默认 0 / -62（正上方 62pt）。点偏了就往上下左右调几 pt。"
+                         message:@"识图认不出「粘贴」气泡时，退回来按偏移点。\n"
+                                  "相对「双击/长按点」的位置，默认 0 / -46（正上方 46pt）。"
                   preferredStyle:UIAlertControllerStyleAlert];
     [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.placeholder = @"dx（左右，正数往右）";
@@ -2091,13 +2168,16 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
     }
 
     __weak typeof(self) ws = self;
-    NSString *act = (TDPasteMethod() == 3) ? @"双击" : @"单击 + 长按";
+    NSInteger m = TDPasteMethod();
+    NSString *act = (m == 3 || m == 4) ? @"双击" : @"单击 + 长按";
+    NSString *how = (m == 2 || m == 4) ? @"截屏认「粘贴」气泡再点它（认不到才按偏移点）"
+                                       : @"按菜单偏移点「粘贴」（默认正上方 46pt）";
     [self alertTitle:@"4 秒后落字"
              message:[NSString stringWithFormat:
                       @"「%@」\n\n切到抖音 → 点开评论框（光标在框里）→ 等 4 秒。\n\n"
-                      @"动作：在%@上%@，再点菜单里的「粘贴」。\n"
-                      @"没弹菜单就把锚点 ay 往大调，点偏了就调菜单偏移。",
-                      show, TDPasteAnchorDesc(), act]];
+                      @"动作：在%@上%@，然后 %@。\n"
+                      @"没弹菜单就把锚点 ay 往大调。",
+                      show, TDPasteAnchorDesc(), act, how]];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         typeof(self) ss = ws;
@@ -2226,8 +2306,8 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
         c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         switch (ip.row) {
             case 0:
-                c.textLabel.text = @"＋ 加一个事件（末尾）";
-                c.detailTextLabel.text = @"点击 / 长按 / 滑动 / 等待 / 识图 / 粘贴 · 想插中间就左滑某一行";
+                c.textLabel.text = @"＋ 加一个事件";
+                c.detailTextLabel.text = @"点击 / 长按 / 滑动 / 等待 / 识图 / 粘贴 · 能选加在第几步前or后";
                 break;
             case 1:
                 c.textLabel.text = @"▶ 试运行整条脚本";
@@ -2299,7 +2379,7 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
                                                 title:@"插入"
                                               handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
         typeof(self) ss = ws;
-        if (ss) [ss insertStepAfter:ip.row];
+        if (ss) [ss insertStepNear:ip.row];
         done(YES);
     }];
     ins.backgroundColor = ED_ACCENT;
@@ -2366,20 +2446,102 @@ static NSDictionary *TDDefaultFailsafeRnd(void) {
 }
 
 - (void)addStep {
-    __weak typeof(self) ws = self;
-    TDPresentKindSheet(self, @"加什么事件（加到末尾）", ^(NSInteger k) {
-        typeof(self) ss = ws;
-        if (ss) [ss insertStepAtIndex:(NSInteger)ss.script.steps.count kind:k];
-    });
+    NSInteger n = (NSInteger)_script.steps.count;
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"加事件"
+                                                              message:@"加在哪儿？"
+                                                       preferredStyle:UIAlertControllerStyleActionSheet];
+    [a addAction:[UIAlertAction actionWithTitle:n ? @"加到末尾" : @"加第一个事件"
+                                         style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction *x) {
+        [self askKindThenInsertAt:n title:@"加什么事件（加到末尾）"];
+    }]];
+    if (n > 0) {
+        [a addAction:[UIAlertAction actionWithTitle:@"插到某一步前面…"
+                                             style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *x) {
+            [self askAnchorIndexBefore:YES];
+        }]];
+        [a addAction:[UIAlertAction actionWithTitle:@"插到某一步后面…"
+                                             style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *x) {
+            [self askAnchorIndexBefore:NO];
+        }]];
+    }
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    a.popoverPresentationController.sourceView = self.view;
+    a.popoverPresentationController.sourceRect =
+        CGRectMake(self.view.bounds.size.width / 2, 200, 1, 1);
+    [self presentViewController:a animated:YES completion:nil];
 }
 
-- (void)insertStepAfter:(NSInteger)idx {
-    NSString *title = [NSString stringWithFormat:@"在第 %ld 步后面插入",
-                       (long)(idx + 1)];
+/// 左滑「插入」：先问插到这一行的前面还是后面
+- (void)insertStepNear:(NSInteger)row {
+    NSInteger n = (NSInteger)_script.steps.count;
+    if (row < 0 || row >= n) return;
+
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:[NSString stringWithFormat:@"第 %ld 步", (long)(row + 1)]
+                         message:@"新事件插在它前面还是后面？"
+                  preferredStyle:UIAlertControllerStyleActionSheet];
+    [a addAction:[UIAlertAction actionWithTitle:@"插到它前面" style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction *x) {
+        [self askKindThenInsertAt:row
+                            title:[NSString stringWithFormat:@"插到第 %ld 步前面", (long)(row + 1)]];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"插到它后面" style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction *x) {
+        [self askKindThenInsertAt:row + 1
+                            title:[NSString stringWithFormat:@"插到第 %ld 步后面", (long)(row + 1)]];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    a.popoverPresentationController.sourceView = self.view;
+    a.popoverPresentationController.sourceRect =
+        CGRectMake(self.view.bounds.size.width / 2, 200, 1, 1);
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+/// 问「第几步」：输入序号后用序号当锚点。序号是给人看的 1..n，内部转成 0 基下标。
+- (void)askAnchorIndexBefore:(BOOL)before {
+    NSInteger n = (NSInteger)_script.steps.count;
+    NSString *t = before ? @"插到第几步前面" : @"插到第几步后面";
+
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:t
+                         message:[NSString stringWithFormat:@"当前共 %ld 步，填 1~%ld。", (long)n, (long)n]
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"序号";
+        tf.text = @"1";
+        tf.keyboardType = UIKeyboardTypeNumberPad;
+        tf.textAlignment = NSTextAlignmentCenter;
+    }];
+    __weak UIAlertController *wa = a;
+    [a addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction *x) {
+        NSInteger idx = (NSInteger)[wa.textFields[0].text integerValue];
+        if (idx < 1) idx = 1;
+        if (idx > n) idx = n;
+        NSInteger pos = before ? idx - 1 : idx;
+        NSString *fmt = before ? @"插到第 %ld 步前面" : @"插到第 %ld 步后面";
+        NSString *title = [NSString stringWithFormat:fmt, (long)idx];
+        [self askKindThenInsertAt:pos title:title];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)askKindThenInsertAt:(NSInteger)pos title:(NSString *)title {
     __weak typeof(self) ws = self;
-    TDPresentKindSheet(self, title, ^(NSInteger k) {
+    // 上面那个「插哪儿」的 sheet 还在收起动画里，立刻接着弹类型列表会被系统吞掉，
+    // 所以隔一拍再弹。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
         typeof(self) ss = ws;
-        if (ss) [ss insertStepAtIndex:idx + 1 kind:k];
+        if (!ss) return;
+        TDPresentKindSheet(ss, title, ^(NSInteger k) {
+            typeof(self) s2 = ws;
+            if (s2) [s2 insertStepAtIndex:pos kind:k];
+        });
     });
 }
 

@@ -323,7 +323,7 @@ static CGPoint TDJitter(CGPoint p, double r) {
     }
 
     // 粘贴：把评论话术塞进「当前有焦点」的输入框。
-    // 取文本 → 写剪贴板 → 长按输入框弹菜单再点「粘贴」（或 Cmd+V，看设置）。
+    // 取文本 → 写剪贴板（写完回读校验）→ 双击输入框 → 识图点「粘贴」气泡（认不到按偏移点）。
     // 输入框位置取「上一次注入的落点」—— 也就是脚本里点评论框那一下。
     if ([t isEqualToString:@"paste"]) {
         NSString *txt = [st[@"text"] isKindOfClass:[NSString class]] ? [st[@"text"] copy] : nil;

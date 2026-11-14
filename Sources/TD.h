@@ -125,19 +125,25 @@ NSString *TDPasteVariantDesc(void);
 #pragma mark - 粘贴方式（Cmd+V 走不通时的替代方案）
 
 /// 这台机器实测：HID 键盘事件（Cmd+V）打不进抖音的评论框 —— 输入法那条通道
-/// 对非平台进程是关着的。所以粘贴改成四条路，评论池页可以现场切：
+/// 对非平台进程是关着的。所以粘贴改成五条路，评论池页可以现场切：
 ///   0 = Cmd+V（HID 键盘事件，老方案，留着）
-///   1 = 长按输入框 → 系统弹出编辑菜单 → 点菜单里的「粘贴」（全触摸注入，默认）
-///   2 = 长按弹菜单 → 用识图找「粘贴」两个字再点（需要模板 tpl_paste.png）
-///   3 = 双击输入框弹菜单 → 点「粘贴」（长按不弹菜单时换这条）
+///   1 = 长按输入框 → 系统弹出编辑菜单 → 点菜单里的「粘贴」
+///   2 = 长按弹菜单 → 用识图找「粘贴」气泡再点
+///   3 = 双击输入框弹菜单 → 按偏移点「粘贴」
+///   4 = 双击输入框弹菜单 → 用识图找「粘贴」气泡再点（默认；本机实测双击才弹菜单）
 NSInteger TDPasteMethod(void);
 void TDSetPasteMethod(NSInteger m);
 NSString *TDPasteMethodDesc(void);
 
-/// 方式 1/2 的菜单落点：相对长按点的偏移（点）。默认 dx=0 / dy=-62 = 落点正上方。
-/// 弹不出来/点偏了就在评论池页长按「粘贴方式」按钮现场调。
+/// 菜单落点：相对「双击/长按点」的偏移（点）。默认 dx=0 / dy=-46 = 输入框正上方。
+/// 识图那两种只在这个兜底时才用到；点偏了就在评论池页长按「粘贴方式」现场调。
 void TDPasteSetMenuOffset(CGFloat dx, CGFloat dy);
 CGPoint TDPasteMenuOffset(void);
+
+/// 把一条话术写进系统剪贴板，写完立刻回读校验（返回 YES = 真的进去了）。
+BOOL TDPasteCopyToClipboard(NSString *text);
+/// 看一眼剪贴板现在是什么（最多 40 字）
+NSString *TDPasteClipboardText(void);
 void TDPasteSetHoldMs(double holdMs);
 double TDPasteHoldMs(void);
 
@@ -157,7 +163,7 @@ CGPoint TDLastTapPoint(void);
 BOOL TDLastTapPointReady(void);
 void TDSetLastTapPoint(CGPoint p);
 
-/// 在 anchor 处粘贴一条文本（anchor 不合法就退回 Cmd+V）
+/// 写剪贴板 → 双击/长按输入框 → 点「粘贴」。anchor 不合法就退回 Cmd+V。
 void TDPasteTextAt(NSString *text, CGPoint anchor);
 
 #pragma mark - 评论池（话术）
