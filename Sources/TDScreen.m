@@ -349,6 +349,84 @@ BOOL TDregionStats(CGRect r, double *lum, double *chroma, double *redRatio, doub
     return YES;
 }
 
+/// 在一条水平带里找「红底按钮」的横向范围与纵向中心（都是点坐标）。
+///
+/// 为什么需要：相册底部那条「下一步(n)」是红底白字，但 iOS 的辅助触控
+/// 小白点常漂在它中间，按固定坐标点有一半的概率点到小白点上去——结果相册
+/// 关不掉、键盘起不来，整轮白跑。按红色像素列扫出按钮真实的 x 范围，
+/// 再挑「靠右但不出界」的点，就能稳稳避开中间那块圆点。
+///
+/// 返回 NO 表示这条带里没有成片的红（不是相册多选态）。
+BOOL TDredBandRange(CGRect band, double *xStart, double *xEnd, double *yCenter) {
+    if (xStart) *xStart = 0;
+    if (xEnd) *xEnd = 0;
+    if (yCenter) *yCenter = 0;
+
+    UIImage *img = TDscreenshot();
+    if (!img.CGImage) return NO;
+    CGFloat W = img.size.width, H = img.size.height;
+    if (W < 1 || H < 1) return NO;
+
+    CGFloat k = W / MAX(1.0, [UIScreen mainScreen].bounds.size.width);
+    CGRect px = CGRectMake(band.origin.x * k, band.origin.y * k,
+                           band.size.width * k, band.size.height * k);
+    px = CGRectIntersection(px, CGRectMake(0, 0, W, H));
+    if (px.size.width < 4 || px.size.height < 4) return NO;
+
+    int w = (int)px.size.width, h = (int)px.size.height;
+    uint8_t *buf = calloc((size_t)w * h * 4, 1);
+    int *colRed = calloc((size_t)w, sizeof(int));
+    int *rowRed = calloc((size_t)h, sizeof(int));
+    if (!buf || !colRed || !rowRed) { free(buf); free(colRed); free(rowRed); return NO; }
+
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, (size_t)w * 4, cs,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) { free(buf); free(colRed); free(rowRed); return NO; }
+    CGContextTranslateCTM(ctx, -px.origin.x, -(H - px.origin.y - px.size.height));
+    CGContextDrawImage(ctx, CGRectMake(0, 0, W, H), img.CGImage);
+    CGContextRelease(ctx);
+
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            uint8_t *p = buf + ((size_t)y * w + x) * 4;
+            int R = p[0], G = p[1], B = p[2];
+            if (R > 140 && R > G + 45 && R > B + 45) { colRed[x]++; rowRed[y]++; }
+        }
+    }
+    free(buf);
+
+    // 最长的一段连续「红列」。单列至少要有 30% 的行是红的，才算按钮本体，
+    // 否则按钮上下的零星红色（图标、缩略图边缘）会把范围撑歪。
+    int need = MAX(1, (int)(h * 0.30));
+    int bestLen = 0, bestStart = -1, curStart = -1;
+    for (int x = 0; x < w; x++) {
+        if (colRed[x] >= need) {
+            if (curStart < 0) curStart = x;
+        } else if (curStart >= 0) {
+            int len = x - curStart;
+            if (len > bestLen) { bestLen = len; bestStart = curStart; }
+            curStart = -1;
+        }
+    }
+    if (curStart >= 0) {
+        int len = w - curStart;
+        if (len > bestLen) { bestLen = len; bestStart = curStart; }
+    }
+
+    long totRed = 0, wy = 0;
+    for (int y = 0; y < h; y++) { wy += (long)y * rowRed[y]; totRed += rowRed[y]; }
+    free(colRed); free(rowRed);
+
+    if (bestStart < 0 || bestLen < 8) return NO;   // 太窄，不是按钮
+
+    if (xStart) *xStart = band.origin.x + bestStart / k;
+    if (xEnd)   *xEnd   = band.origin.x + (bestStart + bestLen) / k;
+    if (yCenter) *yCenter = band.origin.y + (totRed > 0 ? (double)wy / totRed : h / 2.0) / k;
+    return YES;
+}
+
 #pragma mark - 键盘态判断
 
 /// 键盘弹没弹？—— 看「发送」按钮：抖音的发送是 #FE2C55 的红底白字，

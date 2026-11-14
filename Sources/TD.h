@@ -254,6 +254,11 @@ BOOL TDregionStats(CGRect ptRect, double *lum, double *chroma, double *redRatio,
 /// 抖音键盘一起，整排按钮就从 y≈695 挪到 y≈400，点错位置全跑偏。
 BOOL TDkeyboardUp(void);
 
+/// 在一条水平带里找「红底按钮」的横向起止与纵向中心（点坐标）。
+/// 专治「下一步」被辅助触控小白点挡住：按红色像素列扫出按钮真实范围，
+/// 再挑靠右的点，避开中间那块圆点。返回 NO 表示这段没有成片的红。
+BOOL TDredBandRange(CGRect band, double *xStart, double *xEnd, double *yCenter);
+
 #pragma mark - 识图（模板匹配）
 
 @class TDMatch;

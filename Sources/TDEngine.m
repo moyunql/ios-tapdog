@@ -657,7 +657,7 @@ static CGPoint TDJitter(CGPoint p, double r) {
         double iy = st[@"iy"] ? [st[@"iy"] doubleValue] : 695;
         double ux = st[@"ux"] ? [st[@"ux"] doubleValue] : 373;   // 相册右上「多选」
         double uy = st[@"uy"] ? [st[@"uy"] doubleValue] : 46;
-        double nx = st[@"nx"] ? [st[@"nx"] doubleValue] : 207;   // 底部「下一步(n)」
+        double nx = st[@"nx"] ? [st[@"nx"] doubleValue] : 250;   // 底部「下一步(n)」，靠右避开小白点
         double ny = st[@"ny"] ? [st[@"ny"] doubleValue] : 697;
         double sx = st[@"sx"] ? [st[@"sx"] doubleValue] : 377;   // 键盘弹起后的「发送」
         double sy = st[@"sy"] ? [st[@"sy"] doubleValue] : 403;
@@ -765,8 +765,22 @@ static CGPoint TDJitter(CGPoint p, double r) {
             mp = picTpl ? TDfindImageSmartInRect(picTpl, @"tpl_pic", 0.72, picROI, NULL) : nil;
         }
         if (!mp) {
-            [self logMsg:@"%@ 键盘没起来（底部没出现「图片」按钮），这条跳过", tag];
+            // 输入条只点一个位置不够稳：辅助触控小白点常漂在中间，或者面板
+            // 收起动画还没走完，点下去就被吞了。三点轮流试（中/左/右）。
+            NSArray *cand = @[@[@140, @691], @[@250, @691], @[@330, @691]];
+            for (NSArray *pt in cand) {
+                TDtap([pt[0] doubleValue], [pt[1] doubleValue]);
+                usleep(1200 * 1000);
+                mp = picTpl ? TDfindImageSmartInRect(picTpl, @"tpl_pic", 0.72, picROI, NULL) : nil;
+                if (mp) break;
+            }
+        }
+        if (!mp) {
+            // 还是起不来就换一条，别赖在原地（原地不动下一轮照样撞同一堵墙）。
+            [self logMsg:@"%@ 键盘怎么点都不起来，划走换一条", tag];
             closePanel();
+            TDswipe(CGPointMake(207, 600), CGPointMake(207, 160), 0.26);
+            usleep(1500 * 1000);
             return;
         }
         [self logMsg:@"%@ 键盘已弹起，「图片」在 (%.0f,%.0f)", tag, mp.point.x, mp.point.y];
@@ -815,8 +829,38 @@ static CGPoint TDJitter(CGPoint p, double r) {
             return;
         }
         [self logMsg:@"%@ 已勾 %ld 张，点下一步", tag, (long)picked];
-        TDtap(nx, ny);
+
+        // 「下一步」不按死坐标点。两个原因：
+        //   ① 按钮文字宽度会变（「下一步(3)」「完成(3)」都见过）；
+        //   ② iOS 辅助触控的小白点常漂在屏幕这个位置，按中心 207 点，有一半
+        //      概率点是点在小白点上——相册关不掉、键盘起不来，整轮白跑。
+        // 所以扫底部这条红底按钮的红色像素列，拿到真实 x 范围，再挑「靠右 68%」
+        // 的点：既在按钮里，又躲开中间那块圆点。
+        double tx = nx, ty = ny;
+        double bx0 = 0, bx1 = 0, byc = 0;
+        if (TDredBandRange(CGRectMake(20, 684, 380, 36), &bx0, &bx1, &byc)) {
+            tx = bx0 + (bx1 - bx0) * 0.68;
+            ty = byc;
+            [self logMsg:@"%@ 下一步红条 x %.0f~%.0f，点 (%.0f, %.0f)", tag, bx0, bx1, tx, ty];
+        } else {
+            [self logMsg:@"%@ 没扫到红条范围，退回默认点 (%.0f, %.0f)", tag, tx, ty];
+        }
+        TDtap(tx, ty);
         usleep(2400 * 1000);
+
+        // 相册还开着 = 这一下没落到实处（点到小白点或按钮外）。换两个位置补点。
+        for (int i = 0; i < 2; i++) {
+            double la = 0, ca = 0, ra = 0, da = 0;
+            BOOL still = TDregionStats(CGRectMake(300, 36, 80, 20), &la, &ca, &ra, &da)
+                         && la > 170 && ca < 12;
+            if (!still) break;
+            double rx = (i == 0) ? (tx + 24)
+                                 : (bx1 > bx0 ? bx0 + (bx1 - bx0) * 0.86 : tx + 40);
+            if (bx1 > bx0) rx = MIN(rx, bx1 - 10);   // 别点到按钮外面
+            [self logMsg:@"%@ 相册还开着，换位置补点 (%.0f, %.0f)", tag, rx, ty];
+            TDtap(rx, ty);
+            usleep(1800 * 1000);
+        }
 
         // 7) 回到编辑框：缩略图挂上了，键盘可能被收起 —— 用「图片」图标判断，
         //    没弹就再点一下输入条。贴文案前必须让它重新弹起来。
@@ -824,7 +868,7 @@ static CGPoint TDJitter(CGPoint p, double r) {
         //    所以给三个候选点轮流试，每轮只判「图片」图标有没有回来。
         TDMatch *mp2 = picTpl ? TDfindImageSmartInRect(picTpl, @"tpl_pic", 0.72, picROI, NULL) : nil;
         if (!mp2) {
-            NSArray *again = @[@[@150, @690], @[@150, @700], @[@207, @695]];
+            NSArray *again = @[@[@140, @691], @[@250, @691], @[@330, @691]];
             for (NSArray *pt in again) {
                 TDtap([pt[0] doubleValue], [pt[1] doubleValue]);
                 usleep(1600 * 1000);
